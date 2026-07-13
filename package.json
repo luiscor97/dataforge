@@ -1,0 +1,15 @@
+{
+  "name": "dataforge-monorepo",
+  "private": true,
+  "version": "0.0.1-dev",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "desktop:dev": "pnpm --filter dataforge-desktop dev",
+    "desktop:build": "pnpm --filter dataforge-desktop build",
+    "desktop:typecheck": "pnpm --filter dataforge-desktop typecheck",
+    "desktop:tauri": "pnpm --filter dataforge-desktop tauri"
+  }
+}

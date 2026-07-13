@@ -1,0 +1,34 @@
+name: Feature request
+description: Propuesta de mejora o nueva capacidad
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problema que resuelve
+      description: Qué necesidad real cubre, con un caso de uso concreto.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Propuesta
+    validations:
+      required: true
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: ¿A qué milestone del roadmap pertenece?
+      description: El roadmap de RFC-0001 §45 se avanza por capacidades; las propuestas que adelantan tecnología de hitos futuros requieren RFC.
+      options:
+        - "0.1 Safe Inventory Core"
+        - "0.2 Structural Intelligence"
+        - "0.3 Similarity and Versioning"
+        - "0.4 Content Intelligence"
+        - "0.5 Media Intelligence"
+        - "0.6 Plugin Ecosystem"
+        - "0.7 Assisted Intelligence"
+        - "0.8+ / No lo sé"
+        - "Cambia garantías del RFC (requiere RFC nueva)"
+    validations:
+      required: true

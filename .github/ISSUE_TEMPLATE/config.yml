@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Vulnerabilidad de seguridad (canal privado)
+    url: https://github.com/luiscor/dataforge/blob/main/SECURITY.md
+    about: No reportes vulnerabilidades en issues públicos. Sigue el proceso de SECURITY.md.

@@ -1,0 +1,7 @@
+# Toolchain contract for DataForge contributors.
+# The channel is pinned to stable; the host triple is intentionally NOT pinned
+# so contributors may use MSVC (preferred on Windows) or the GNU fallback
+# documented in docs/adr/ADR-0011-windows-user-space-toolchain.md.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
