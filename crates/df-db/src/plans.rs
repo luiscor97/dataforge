@@ -779,6 +779,86 @@ pub fn record_verification_run(
     Ok(run_id)
 }
 
+/// A stored verification run and its findings, for reporting.
+#[derive(Debug, Clone)]
+pub struct VerificationRunRecord {
+    pub id: VerificationRunId,
+    pub plan_id: PlanId,
+    pub verdict: String,
+    pub checked: u64,
+    pub problems: u64,
+    pub warnings: u64,
+    pub started_at: df_domain::Timestamp,
+    pub finished_at: df_domain::Timestamp,
+    pub findings: Vec<VerificationFinding>,
+}
+
+/// The most recent verification run of a plan with its findings, if any.
+pub fn latest_verification_run(
+    db: &Db,
+    plan_id: PlanId,
+) -> DfResult<Option<VerificationRunRecord>> {
+    let row = db
+        .conn()
+        .query_row(
+            "SELECT id, verdict, checked, problems, warnings, started_at, finished_at
+             FROM verification_runs WHERE plan_id = ?1
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+            [plan_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_err)?;
+
+    let Some((id, verdict, checked, problems, warnings, started, finished)) = row else {
+        return Ok(None);
+    };
+    let run_id = VerificationRunId::from_str(&id)?;
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT kind, severity, subject, detail
+             FROM verification_findings WHERE verification_run_id = ?1
+             ORDER BY severity DESC, id",
+        )
+        .map_err(db_err)?;
+    let findings = stmt
+        .query_map([run_id.to_string()], |row| {
+            Ok(VerificationFinding {
+                kind: row.get(0)?,
+                severity: row.get(1)?,
+                subject: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    Ok(Some(VerificationRunRecord {
+        id: run_id,
+        plan_id,
+        verdict,
+        checked: checked as u64,
+        problems: problems as u64,
+        warnings: warnings as u64,
+        started_at: parse_stored_timestamp(&started)?,
+        finished_at: parse_stored_timestamp(&finished)?,
+        findings,
+    }))
+}
+
 /// Number of exact-duplicate sets recorded for a snapshot.
 pub fn duplicate_set_count(db: &Db, snapshot_id: SnapshotId) -> DfResult<u64> {
     let count: i64 = db

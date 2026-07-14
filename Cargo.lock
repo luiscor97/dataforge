@@ -769,6 +769,7 @@ dependencies = [
  "df-hash",
  "df-ledger",
  "df-planner",
+ "df-report",
  "df-scan",
  "df-verifier",
  "serde",
@@ -820,6 +821,25 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "df-report"
+version = "0.0.1-dev"
+dependencies = [
+ "chrono",
+ "df-db",
+ "df-domain",
+ "df-error",
+ "df-executor",
+ "df-hash",
+ "df-ledger",
+ "df-planner",
+ "df-scan",
+ "df-verifier",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

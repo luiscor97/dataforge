@@ -13,7 +13,7 @@ trazabilidad de cada decisión. El documento fundacional es
 
 Qué existe hoy (real, con pruebas):
 
-- Monorepo Rust (workspace de 12 crates) + pnpm.
+- Monorepo Rust (workspace de 13 crates) + pnpm.
 - Dominio: IDs tipados, `Project`, `SourceRoot`, `Snapshot`, `AuditEvent`,
   inventario (`PathOccurrence`, `ContentObject`, fingerprints) y la máquina
   de estados completa de RFC-0001 §11.
@@ -39,12 +39,17 @@ Qué existe hoy (real, con pruebas):
   cobertura, plan no manipulado, parciales, archivos no registrados y
   origen intacto; veredicto `COMPLETED`, `COMPLETED_WITH_WARNINGS` o
   `FAILED`.
+- Informes mínimos (`df-report`): exportación versionada del plan
+  (`plans/plan-NNNN.json`), del informe de verificación con manifiesto de
+  copia (`reports/verification-NNNN.json` + `.md` legible) y de la
+  evidencia de duplicados (`.csv`), con encabezado común versionado y
+  escritura atómica.
 - Ledger de auditoría append-only con encadenamiento SHA-256, verificación
   y eventos de todo el pipeline.
 - CLI `dataforge`: `project create/status`, `scan`, `hash`, `analyze`,
   `plan create/validate/approve`, `execute`, `verify`,
-  `report duplicates`, `audit verify` (con `--json` y códigos de salida
-  documentados).
+  `report duplicates|plan|verification`, `audit verify` (con `--json` y
+  códigos de salida documentados).
 - App de escritorio (Tauri 2 + React + TypeScript strict): crear proyecto,
   abrir proyecto y ver estado, inventario e integridad, usando los mismos
   comandos de `df-facade` que la CLI.
@@ -78,6 +83,8 @@ cargo run -p dataforge-cli -- plan create --path D:\proyectos\demo
 cargo run -p dataforge-cli -- plan approve --path D:\proyectos\demo
 cargo run -p dataforge-cli -- execute --path D:\proyectos\demo
 cargo run -p dataforge-cli -- verify --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report plan --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report verification --path D:\proyectos\demo
 cargo run -p dataforge-cli -- audit verify --path D:\proyectos\demo
 cargo run -p dataforge-cli -- project status --path D:\proyectos\demo
 
@@ -98,7 +105,7 @@ pnpm --filter dataforge-desktop tauri dev
 apps/cli/        CLI `dataforge`
 apps/desktop/    Tauri 2 + React + TS strict (cliente de df-facade)
 crates/df-*      motor: error, domain, ledger, db, scan, hash,
-                 planner, executor, verifier, facade
+                 planner, executor, verifier, report, facade
 docs/            RFCs, ADRs, arquitectura, threat model, guías
 scripts/         bootstrap reproducible del entorno (PowerShell)
 .codex/skills/   skills del repositorio para agentes de codificación

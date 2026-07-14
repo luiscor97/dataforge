@@ -10,6 +10,7 @@ members = [
     "crates/df-planner",
     "crates/df-executor",
     "crates/df-verifier",
+    "crates/df-report",
     "crates/df-facade",
     "apps/cli",
     "apps/desktop/src-tauri",
@@ -26,6 +27,7 @@ default-members = [
     "crates/df-planner",
     "crates/df-executor",
     "crates/df-verifier",
+    "crates/df-report",
     "crates/df-facade",
     "apps/cli",
 ]
@@ -49,6 +51,7 @@ df-hash = { path = "crates/df-hash" }
 df-planner = { path = "crates/df-planner" }
 df-executor = { path = "crates/df-executor" }
 df-verifier = { path = "crates/df-verifier" }
+df-report = { path = "crates/df-report" }
 df-facade = { path = "crates/df-facade" }
 
 # External crates

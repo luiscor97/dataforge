@@ -12,8 +12,8 @@ use df_domain::Actor;
 use df_error::DfResult;
 use df_facade::{
     AnalyzeOutcome, ApproveOutcome, AuditReport, CreateProjectRequest, DuplicateReport,
-    ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus, ScanOutcome,
-    VerifyOutcome,
+    ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus, ReportFile,
+    ScanOutcome, VerificationExport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -147,6 +147,21 @@ enum ReportCommand {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Also export the evidence to `reports/duplicates-<snapshot>.csv`.
+        #[arg(long)]
+        export: bool,
+    },
+    /// Export the current plan to `plans/plan-NNNN.json`.
+    Plan {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Export the latest verification to `reports/verification-NNNN.{json,md}`.
+    Verification {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
     },
 }
 
@@ -174,6 +189,8 @@ enum Output {
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
+    ReportFile(ReportFile),
+    VerificationExport(VerificationExport),
     Audit(AuditReport),
 }
 
@@ -225,8 +242,18 @@ fn run(cli: &Cli) -> DfResult<Output> {
             df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
         }
         Command::Report { command } => match command {
-            ReportCommand::Duplicates { path } => {
-                df_facade::duplicate_report(path).map(Output::Duplicates)
+            ReportCommand::Duplicates { path, export } => {
+                let report = df_facade::duplicate_report(path)?;
+                if *export {
+                    df_facade::export_duplicates_report(path)?;
+                }
+                Ok(Output::Duplicates(report))
+            }
+            ReportCommand::Plan { path } => {
+                df_facade::export_plan_report(path).map(Output::ReportFile)
+            }
+            ReportCommand::Verification { path } => {
+                df_facade::export_verification_report(path).map(Output::VerificationExport)
             }
         },
         Command::Audit { command } => match command {
@@ -397,6 +424,18 @@ fn print_duplicates(report: &DuplicateReport) {
     }
 }
 
+fn print_report_file(file: &ReportFile) {
+    println!("Exported : {}", file.path);
+    println!("Schema   : {}", file.schema);
+    println!("Bytes    : {}", file.bytes);
+}
+
+fn print_verification_export(export: &VerificationExport) {
+    println!("Exported : {}", export.json.path);
+    println!("           {}", export.markdown.path);
+    println!("Schema   : {}", export.json.schema);
+}
+
 fn print_audit(report: &AuditReport) {
     println!("Project : {}", report.project_id);
     println!("Events  : {}", report.event_count);
@@ -422,6 +461,8 @@ fn print_human(output: &Output) {
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
+        Output::ReportFile(file) => print_report_file(file),
+        Output::VerificationExport(export) => print_verification_export(export),
         Output::Audit(report) => print_audit(report),
     }
 }
@@ -496,7 +537,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 0
             }
         }
-        Output::Duplicates(_) => 0,
+        Output::Duplicates(_) | Output::ReportFile(_) | Output::VerificationExport(_) => 0,
     }
 }
 

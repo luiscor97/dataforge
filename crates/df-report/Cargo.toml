@@ -1,6 +1,6 @@
 [package]
-name = "df-facade"
-description = "Stable local API of the DataForge engine; every client (CLI, desktop) goes through this crate"
+name = "df-report"
+description = "Versioned exports of plans, verification manifests and duplicate evidence (RFC-0001 §35, §36)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,14 +13,14 @@ df-error = { workspace = true }
 df-domain = { workspace = true }
 df-db = { workspace = true }
 df-ledger = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
 df-scan = { workspace = true }
 df-hash = { workspace = true }
 df-planner = { workspace = true }
 df-executor = { workspace = true }
 df-verifier = { workspace = true }
-df-report = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-
-[dev-dependencies]
 tempfile = { workspace = true }

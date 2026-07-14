@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub use df_executor::ExecuteOutcome;
 pub use df_hash::HashOutcome;
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
+pub use df_report::{ReportFile, VerificationExport};
 pub use df_scan::ScanOutcome;
 pub use df_verifier::VerifyOutcome;
 
@@ -482,6 +483,32 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
         redundant_bytes,
         sets,
     })
+}
+
+/// Export the current plan to `plans/plan-NNNN.json` (§35, §36).
+pub fn export_plan_report(project_dir: &Path) -> DfResult<ReportFile> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    df_report::export_plan(&db, &project_dir)
+}
+
+/// Export the latest verification run to `reports/verification-NNNN.{json,md}`,
+/// including the copy manifest (§28, §35).
+pub fn export_verification_report(project_dir: &Path) -> DfResult<VerificationExport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    df_report::export_verification(&db, &project_dir)
+}
+
+/// Export the exact-duplicate evidence to `reports/duplicates-<snapshot>.csv`
+/// (§15, §35).
+pub fn export_duplicates_report(project_dir: &Path) -> DfResult<ReportFile> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    df_report::export_duplicates(&db, &project_dir)
 }
 
 /// Result of `dataforge audit verify`: a cryptographic pass over the ledger.

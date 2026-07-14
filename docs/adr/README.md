@@ -11,6 +11,7 @@
 | [ADR-0014](ADR-0014-codex-skills-policy.md) | Skills del repositorio (`.codex/skills/`) | Aceptada |
 | [ADR-0015](ADR-0015-inventory-increment-scan-hash.md) | Decisiones del incremento de inventario (M0.1): escaneo y hashing | Aceptada |
 | [ADR-0016](ADR-0016-plan-execute-verify-increment.md) | Decisiones del incremento de planificación, ejecución y verificación (M0.1) | Aceptada |
+| [ADR-0017](ADR-0017-minimal-reports.md) | Informes mínimos exportables (M0.1) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).

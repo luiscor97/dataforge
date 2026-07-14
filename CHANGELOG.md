@@ -50,6 +50,14 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 - CLI: `dataforge analyze`, `plan create/validate/approve`, `execute`,
   `verify` — el pipeline completo del RFC §33 para 0.1.
 - ADR-0016 con las decisiones del incremento de plan/ejecución/verificación.
+- `df-report`: informes mínimos exportables (§35, §36) con encabezado
+  común versionado y escritura atómica — plan (`plans/plan-NNNN.json`),
+  informe de verificación con manifiesto de copia
+  (`reports/verification-NNNN.json` + `.md` legible) y evidencia de
+  duplicados (`reports/duplicates-<snapshot>.csv`).
+- CLI: `dataforge report plan`, `report verification`, y
+  `report duplicates --export`.
+- ADR-0017 con las decisiones de los informes mínimos.
 
 ### Seguridad
 
