@@ -62,6 +62,30 @@ typed_id!(
     /// Identifier of an [`crate::AuditEvent`].
     EventId
 );
+typed_id!(
+    /// Identifier of a scan run.
+    ScanRunId
+);
+typed_id!(
+    /// Identifier of a folder occurrence.
+    FolderId
+);
+typed_id!(
+    /// Identifier of a [`crate::PathOccurrence`].
+    OccurrenceId
+);
+typed_id!(
+    /// Identifier of a [`crate::ContentObject`].
+    ContentId
+);
+typed_id!(
+    /// Identifier of a hash job.
+    HashJobId
+);
+typed_id!(
+    /// Identifier of an exact-duplicate set.
+    DuplicateSetId
+);
 
 #[cfg(test)]
 mod tests {
