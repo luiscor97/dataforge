@@ -102,6 +102,10 @@ typed_id!(
     /// Identifier of a verification finding (RFC-0001 §28).
     FindingId
 );
+typed_id!(
+    /// Identifier of a tree-clone set (RFC-0001 §19).
+    TreeCloneSetId
+);
 
 #[cfg(test)]
 mod tests {

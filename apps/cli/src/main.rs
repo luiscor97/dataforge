@@ -13,7 +13,7 @@ use df_error::DfResult;
 use df_facade::{
     AnalyzeOutcome, ApproveOutcome, AuditReport, CreateProjectRequest, DuplicateReport,
     ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus, ScanOutcome,
-    VerifyOutcome,
+    TreeCloneReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -148,6 +148,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Exact tree clones (folders with byte-for-byte identical subtrees).
+    TreeClones {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +180,7 @@ enum Output {
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
+    TreeClones(TreeCloneReport),
     Audit(AuditReport),
 }
 
@@ -227,6 +234,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)
+            }
+            ReportCommand::TreeClones { path } => {
+                df_facade::tree_clone_report(path).map(Output::TreeClones)
             }
         },
         Command::Audit { command } => match command {
@@ -312,9 +322,11 @@ fn print_hash(outcome: &HashOutcome) {
 }
 
 fn print_analyze(outcome: &AnalyzeOutcome) {
-    println!("Snapshot        : {}", outcome.snapshot_id);
-    println!("Duplicate sets  : {}", outcome.duplicate_sets);
-    println!("State           : {}", outcome.state);
+    println!("Snapshot         : {}", outcome.snapshot_id);
+    println!("Duplicate sets   : {}", outcome.duplicate_sets);
+    println!("Folder signatures: {}", outcome.folder_signatures);
+    println!("Tree clone sets  : {}", outcome.tree_clone_sets);
+    println!("State            : {}", outcome.state);
 }
 
 fn print_plan(outcome: &PlanOutcome) {
@@ -397,6 +409,28 @@ fn print_duplicates(report: &DuplicateReport) {
     }
 }
 
+fn print_tree_clones(report: &TreeCloneReport) {
+    println!("Snapshot        : {}", report.snapshot_id);
+    println!("Clone sets      : {}", report.sets.len());
+    println!("Cloned folders  : {}", report.cloned_folders);
+    println!("Redundant bytes : {}", report.redundant_bytes);
+    for set in &report.sets {
+        println!();
+        println!(
+            "  {} — {} file(s), {} bytes",
+            set.relationship.as_str(),
+            set.subtree_files,
+            set.subtree_bytes
+        );
+        for folder in &set.folders {
+            println!("    - {folder}");
+        }
+    }
+    if report.sets.is_empty() {
+        println!("No exact tree clones found.");
+    }
+}
+
 fn print_audit(report: &AuditReport) {
     println!("Project : {}", report.project_id);
     println!("Events  : {}", report.event_count);
@@ -422,6 +456,7 @@ fn print_human(output: &Output) {
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
+        Output::TreeClones(report) => print_tree_clones(report),
         Output::Audit(report) => print_audit(report),
     }
 }
@@ -497,6 +532,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
             }
         }
         Output::Duplicates(_) => 0,
+        Output::TreeClones(_) => 0,
     }
 }
 

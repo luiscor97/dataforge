@@ -23,6 +23,10 @@ use sha2::Digest;
 pub struct AnalyzeOutcome {
     pub snapshot_id: String,
     pub duplicate_sets: u64,
+    /// Folders that received a Merkle signature (RFC-0001 §19.2).
+    pub folder_signatures: u64,
+    /// Groups of folders whose subtrees are byte-for-byte identical (§19.3).
+    pub tree_clone_sets: u64,
     pub state: String,
 }
 
@@ -61,8 +65,9 @@ pub struct PlanValidationReport {
     pub problems: Vec<String>,
 }
 
-/// Analyse the hashed snapshot: materialise exact duplicate sets (§15) and
-/// move the project `HASHED → ANALYZING → ANALYZED`.
+/// Analyse the hashed snapshot: materialise exact duplicate sets (§15),
+/// compute folder signatures and tree clones (§19), and move the project
+/// `HASHED → ANALYZING → ANALYZED`.
 pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
     let project = repository::load_project(db)?;
     if project.state != ProjectState::Hashed {
@@ -76,11 +81,15 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
 
     repository::update_project_state(db, ProjectState::Analyzing, actor)?;
     let duplicate_sets = plans::materialize_duplicate_sets(db, project.id, snapshot.id, actor)?;
+    let structure =
+        df_db::structure::compute_folder_signatures(db, project.id, snapshot.id, actor)?;
     let project = repository::update_project_state(db, ProjectState::Analyzed, actor)?;
 
     Ok(AnalyzeOutcome {
         snapshot_id: snapshot.id.to_string(),
         duplicate_sets,
+        folder_signatures: structure.folders_signed,
+        tree_clone_sets: structure.tree_clone_sets,
         state: project.state.as_str().to_string(),
     })
 }

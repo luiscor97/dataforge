@@ -50,6 +50,32 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 - CLI: `dataforge analyze`, `plan create/validate/approve`, `execute`,
   `verify` — el pipeline completo del RFC §33 para 0.1.
 - ADR-0016 con las decisiones del incremento de plan/ejecución/verificación.
+- Migración `0004_structure`: tablas `folder_signatures` y `tree_clone_sets`
+  (RFC-0001 §19), STRICT, evidencia derivada del inventario sin bytes de
+  archivo.
+- `df-db::structure` (Milestone 0.2): firmas Merkle de carpeta calculadas de
+  abajo hacia arriba con BLAKE3 (§19.2, ADR-0007) sobre entradas
+  NUL-separadas (`F\0nombre\0sha256`, `D\0nombre\0firma_hija`), a prueba de
+  inyección porque NUL es ilegal en nombres de archivo. Regla de
+  completitud (§19.4): una carpeta solo tiene firma válida si todos sus
+  archivos descendientes están hasheados y el subárbol no tiene errores ni
+  reparse points sin seguir; incompleta implica firma `NULL` y exclusión de
+  cualquier conjunto de clones.
+- Detección de clones exactos de árbol (`EXACT_TREE_CLONE`, §19.3): dos o
+  más carpetas completas y no vacías que comparten firma se materializan en
+  `tree_clone_sets` como informe de evidencia — sin proponer ni ejecutar
+  ninguna acción (§19.4). Las relaciones `PARTIAL_TREE_CLONE`,
+  `TREE_EMBEDDED`, `REPEATED_COMPONENT_ONLY` y `UNIQUE_CONTENT_IN_CLONE` del
+  §19.3 quedan nombradas en el vocabulario y se aplazan a un incremento
+  posterior. El cómputo corre dentro de `analyze` (`HASHED → ANALYZING →
+  ANALYZED`), justo después de materializar los duplicados exactos, y es
+  idempotente (recomputable tras más hashing).
+- Evento de auditoría `STRUCTURE_ANALYZED` con el recuento de carpetas
+  firmadas, carpetas completas y conjuntos de clones detectados.
+- `df-facade::tree_clone_report`; CLI `dataforge report tree-clones` para
+  listar los conjuntos de clones exactos de árbol.
+- ADR-0018 con las decisiones del incremento de firmas de carpeta y
+  detección de clones de árbol.
 
 ### Seguridad
 

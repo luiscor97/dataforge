@@ -9,6 +9,7 @@ pub mod inventory;
 pub mod migrations;
 pub mod plans;
 pub mod repository;
+pub mod structure;
 
 use std::path::Path;
 

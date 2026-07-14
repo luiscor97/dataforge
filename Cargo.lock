@@ -707,6 +707,7 @@ dependencies = [
 name = "df-db"
 version = "0.0.1-dev"
 dependencies = [
+ "blake3",
  "chrono",
  "df-domain",
  "df-error",

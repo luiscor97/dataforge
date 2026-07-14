@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
-use df_domain::{Actor, ProfileRef, Project, SourceRoot};
+use df_domain::{Actor, ProfileRef, Project, SourceRoot, TreeCloneSet};
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
@@ -479,6 +479,40 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     Ok(DuplicateReport {
         snapshot_id: snapshot.id.to_string(),
         redundant_files,
+        redundant_bytes,
+        sets,
+    })
+}
+
+/// Exact tree-clone report of the latest snapshot (RFC-0001 §19).
+///
+/// Evidence only: DataForge reports directory trees that are byte-for-byte
+/// identical but never infers that a branch is dispensable before its unique
+/// content is identified (§19.4), so this report proposes no action.
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeCloneReport {
+    pub snapshot_id: String,
+    /// Folders that belong to some exact tree-clone set.
+    pub cloned_folders: u64,
+    /// Bytes the redundant copies of those subtrees occupy.
+    pub redundant_bytes: u64,
+    pub sets: Vec<TreeCloneSet>,
+}
+
+/// Compute the exact tree-clone report of the latest complete snapshot.
+pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let sets = df_db::structure::tree_clone_sets(&db, snapshot.id)?;
+    let cloned_folders = sets.iter().map(|s| s.folders.len() as u64).sum();
+    let redundant_bytes = sets.iter().map(|s| s.redundant_bytes()).sum();
+    Ok(TreeCloneReport {
+        snapshot_id: snapshot.id.to_string(),
+        cloned_folders,
         redundant_bytes,
         sets,
     })

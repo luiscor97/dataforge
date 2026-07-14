@@ -12,11 +12,12 @@ pub mod project;
 pub mod snapshot;
 pub mod source_root;
 pub mod state;
+pub mod structure;
 
 pub use event::{Actor, AuditEvent};
 pub use ids::{
     ContentId, DuplicateSetId, EventId, FindingId, FolderId, HashJobId, OccurrenceId, OperationId,
-    PlanId, ProjectId, ScanRunId, SnapshotId, SourceRootId, VerificationRunId,
+    PlanId, ProjectId, ScanRunId, SnapshotId, SourceRootId, TreeCloneSetId, VerificationRunId,
 };
 pub use inventory::{
     ContentObject, FileFingerprint, FolderRecord, HashState, PathOccurrence, ScanCounters,
@@ -30,6 +31,7 @@ pub use project::{ProfileRef, Project};
 pub use snapshot::{Snapshot, SnapshotStatus};
 pub use source_root::{FileSystemKind, SourceRoot};
 pub use state::ProjectState;
+pub use structure::{FolderSignature, TreeCloneSet, TreeRelationship};
 
 /// Canonical timestamp type of the engine (UTC, RFC 3339 when serialized).
 pub type Timestamp = chrono::DateTime<chrono::Utc>;
