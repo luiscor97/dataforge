@@ -27,6 +27,8 @@ pub struct AnalyzeOutcome {
     pub folder_signatures: u64,
     /// Groups of folders whose subtrees are byte-for-byte identical (§19.3).
     pub tree_clone_sets: u64,
+    /// Folders tagged as low-value generic containers (RFC-0001 §18.3).
+    pub generic_folders: u64,
     pub state: String,
 }
 
@@ -83,6 +85,13 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
     let duplicate_sets = plans::materialize_duplicate_sets(db, project.id, snapshot.id, actor)?;
     let structure =
         df_db::structure::compute_folder_signatures(db, project.id, snapshot.id, actor)?;
+    let context = df_db::context::classify_folders(
+        db,
+        project.id,
+        snapshot.id,
+        project.profile.as_str(),
+        actor,
+    )?;
     let project = repository::update_project_state(db, ProjectState::Analyzed, actor)?;
 
     Ok(AnalyzeOutcome {
@@ -90,6 +99,7 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         duplicate_sets,
         folder_signatures: structure.folders_signed,
         tree_clone_sets: structure.tree_clone_sets,
+        generic_folders: context.generic_folders,
         state: project.state.as_str().to_string(),
     })
 }

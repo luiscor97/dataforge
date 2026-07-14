@@ -76,6 +76,19 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   listar los conjuntos de clones exactos de árbol.
 - ADR-0018 con las decisiones del incremento de firmas de carpeta y
   detección de clones de árbol.
+- Migración `0005_contexts`: tabla `folder_contexts` (RFC-0001 §18), STRICT.
+- `df-db::context` (Milestone 0.2): clasificación de contexto de carpetas por
+  marcadores del perfil, determinista. El perfil `generic` marca contenedores
+  de bajo valor —Descargas, Escritorio, Backup, Recuperado, Copia,
+  Temporales y patrones de copia— con la penalización de ubicación del §18.3
+  (50/45/40/35/30). Solo evidencia: baja el ranking de una carpeta como
+  representante (§15.5) pero no marca nada para eliminación. Perfil
+  conservador sin fronteras protegidas (§25.4); `ContextKind::Protected`
+  queda en el vocabulario para un perfil jurídico posterior. Corre dentro de
+  `analyze` tras las firmas de carpeta y es idempotente.
+- Evento de auditoría `CONTEXTS_CLASSIFIED`; `df-facade::context_report`; CLI
+  `dataforge report contexts` para listar carpetas genéricas por penalización.
+- ADR-0019 con las decisiones de la clasificación de contexto por marcadores.
 
 ### Seguridad
 

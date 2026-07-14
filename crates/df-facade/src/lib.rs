@@ -518,6 +518,31 @@ pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     })
 }
 
+/// Generic low-value folders of the latest snapshot (RFC-0001 §18.3).
+///
+/// Evidence only: a generic classification lowers a folder's ranking as a
+/// canonical location but never marks its contents for removal.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextReport {
+    pub snapshot_id: String,
+    pub generic_folders: Vec<df_db::context::GenericFolder>,
+}
+
+/// Report the generic folders of the latest complete snapshot.
+pub fn context_report(project_dir: &Path) -> DfResult<ContextReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let generic_folders = df_db::context::generic_folders(&db, snapshot.id)?;
+    Ok(ContextReport {
+        snapshot_id: snapshot.id.to_string(),
+        generic_folders,
+    })
+}
+
 /// Result of `dataforge audit verify`: a cryptographic pass over the ledger.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditReport {

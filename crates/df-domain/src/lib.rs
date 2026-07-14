@@ -4,6 +4,7 @@
 //! Every state change flows through the [`state::ProjectState`] machine and
 //! is later persisted and audited by `df-db` / `df-ledger`.
 
+pub mod context;
 pub mod event;
 pub mod ids;
 pub mod inventory;
@@ -14,6 +15,7 @@ pub mod source_root;
 pub mod state;
 pub mod structure;
 
+pub use context::{ContextKind, FolderContext};
 pub use event::{Actor, AuditEvent};
 pub use ids::{
     ContentId, DuplicateSetId, EventId, FindingId, FolderId, HashJobId, OccurrenceId, OperationId,

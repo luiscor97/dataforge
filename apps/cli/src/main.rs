@@ -11,9 +11,9 @@ use clap::{Parser, Subcommand};
 use df_domain::Actor;
 use df_error::DfResult;
 use df_facade::{
-    AnalyzeOutcome, ApproveOutcome, AuditReport, CreateProjectRequest, DuplicateReport,
-    ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus, ScanOutcome,
-    TreeCloneReport, VerifyOutcome,
+    AnalyzeOutcome, ApproveOutcome, AuditReport, ContextReport, CreateProjectRequest,
+    DuplicateReport, ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus,
+    ScanOutcome, TreeCloneReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -154,6 +154,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Generic low-value folders (Downloads, Backup, copies, …) and penalties.
+    Contexts {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -181,6 +187,7 @@ enum Output {
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
     TreeClones(TreeCloneReport),
+    Contexts(ContextReport),
     Audit(AuditReport),
 }
 
@@ -237,6 +244,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::TreeClones { path } => {
                 df_facade::tree_clone_report(path).map(Output::TreeClones)
+            }
+            ReportCommand::Contexts { path } => {
+                df_facade::context_report(path).map(Output::Contexts)
             }
         },
         Command::Audit { command } => match command {
@@ -326,6 +336,7 @@ fn print_analyze(outcome: &AnalyzeOutcome) {
     println!("Duplicate sets   : {}", outcome.duplicate_sets);
     println!("Folder signatures: {}", outcome.folder_signatures);
     println!("Tree clone sets  : {}", outcome.tree_clone_sets);
+    println!("Generic folders  : {}", outcome.generic_folders);
     println!("State            : {}", outcome.state);
 }
 
@@ -431,6 +442,18 @@ fn print_tree_clones(report: &TreeCloneReport) {
     }
 }
 
+fn print_contexts(report: &ContextReport) {
+    println!("Snapshot        : {}", report.snapshot_id);
+    println!("Generic folders : {}", report.generic_folders.len());
+    for folder in &report.generic_folders {
+        let marker = folder.marker.as_deref().unwrap_or("generic");
+        println!("  -{:<3} [{}] {}", folder.penalty, marker, folder.path);
+    }
+    if report.generic_folders.is_empty() {
+        println!("No generic low-value folders found.");
+    }
+}
+
 fn print_audit(report: &AuditReport) {
     println!("Project : {}", report.project_id);
     println!("Events  : {}", report.event_count);
@@ -457,6 +480,7 @@ fn print_human(output: &Output) {
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
         Output::TreeClones(report) => print_tree_clones(report),
+        Output::Contexts(report) => print_contexts(report),
         Output::Audit(report) => print_audit(report),
     }
 }
@@ -533,6 +557,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
         }
         Output::Duplicates(_) => 0,
         Output::TreeClones(_) => 0,
+        Output::Contexts(_) => 0,
     }
 }
 

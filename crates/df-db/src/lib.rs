@@ -4,6 +4,7 @@
 //! This crate owns the schema (versioned migrations), the repositories and
 //! the integrity checks. No other crate issues SQL.
 
+pub mod context;
 pub mod integrity;
 pub mod inventory;
 pub mod migrations;
