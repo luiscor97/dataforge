@@ -1,0 +1,46 @@
+name: Bug report
+description: Algo no funciona como está documentado
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Descripción
+      description: Qué ocurre y qué esperabas que ocurriera.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Pasos de reproducción
+      placeholder: |
+        1. dataforge project create --name ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versión / commit
+      placeholder: v0.0.1-dev / abc1234
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Sistema operativo
+      placeholder: Windows 11 24H2 x64
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Salida relevante
+      description: Salida de la CLI (con --json si es posible) o mensajes de error. No pegues rutas o nombres sensibles.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Impacto en seguridad de datos
+      options:
+        - label: Este bug afecta (o podría afectar) a archivos de origen — si es una vulnerabilidad, usa el proceso privado de SECURITY.md en lugar de este formulario

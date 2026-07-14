@@ -1,0 +1,27 @@
+[package]
+name = "dataforge-desktop"
+description = "DataForge Desktop — Tauri 2 shell over df-facade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Solo `rlib`: los tipos `staticlib`/`cdylib` de la plantilla Tauri existen
+# para móvil (fuera de alcance, RFC-0001 §4) y una cdylib en Windows supera
+# el límite de 65 536 símbolos exportados con el linker GNU.
+[lib]
+name = "dataforge_desktop_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+df-error = { workspace = true }
+df-domain = { workspace = true }
+df-facade = { workspace = true }

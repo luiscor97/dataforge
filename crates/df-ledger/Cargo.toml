@@ -1,0 +1,17 @@
+[package]
+name = "df-ledger"
+description = "Hash-chained audit ledger primitives for DataForge (RFC-0001 §29)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-error = { workspace = true }
+df-domain = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }

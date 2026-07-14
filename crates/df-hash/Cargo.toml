@@ -1,0 +1,24 @@
+[package]
+name = "df-hash"
+description = "Content identity: streaming BLAKE3 + SHA-256 with fingerprint invalidation and a resumable job queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-error = { workspace = true }
+df-domain = { workspace = true }
+df-db = { workspace = true }
+blake3 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+df-ledger = { workspace = true }
+df-scan = { workspace = true }
+tempfile = { workspace = true }

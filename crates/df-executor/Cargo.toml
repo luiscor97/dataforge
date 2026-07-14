@@ -1,0 +1,27 @@
+[package]
+name = "df-executor"
+description = "Transactional execution of approved plans: partial files, streamed hashes, atomic finalize (RFC-0001 §27)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-error = { workspace = true }
+df-domain = { workspace = true }
+df-db = { workspace = true }
+blake3 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+df-scan = { workspace = true }
+df-hash = { workspace = true }
+df-planner = { workspace = true }
+df-ledger = { workspace = true }
+tempfile = { workspace = true }
