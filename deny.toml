@@ -10,6 +10,34 @@ targets = [
 [advisories]
 yanked = "deny"
 
+# Specific, documented exceptions with a retirement condition (encargo §5).
+#
+# The `unic-*` family is flagged `unmaintained` (RUSTSEC-2025-0075/0080/0081/
+# 0098/0100). They are NOT vulnerabilities: the advisory says the crates are no
+# longer maintained and points to `icu_properties` as the replacement.
+#
+# They are not ours to remove: they arrive transitively through
+#   unic-* -> unic-ucd-ident -> urlpattern -> tauri-utils -> tauri
+# so the only fixes available to us would be to drop Tauri or to vendor a patch
+# of a dependency five levels down, both of which are worse than the exposure.
+# The crates parse Unicode identifier properties for URL patterns; nothing in
+# DataForge feeds them untrusted input (the desktop shell only loads its own
+# bundled frontend).
+#
+# RETIREMENT CONDITION: remove each ignore as soon as a Tauri release drops
+# `urlpattern`'s dependency on `unic-*` (tracked upstream in
+# https://github.com/rustsec/advisory-db/issues/2414). Re-check on every Tauri
+# bump; if a real vulnerability is ever filed against these crates, this
+# exception is void and the desktop shell must be pinned or dropped instead.
+# Review by: 2026-10-15.
+ignore = [
+    "RUSTSEC-2025-0075", # unic-char-range unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0080", # unic-common unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0081", # unic-char-property unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0098", # unic-ucd-ident unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0100", # unic-ucd-version unmaintained (via tauri/urlpattern)
+]
+
 [licenses]
 allow = [
     "MIT",

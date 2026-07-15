@@ -26,4 +26,5 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+df-ledger = { workspace = true }
 tempfile = { workspace = true }

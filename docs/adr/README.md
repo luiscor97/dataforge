@@ -16,6 +16,8 @@
 | [ADR-0020](ADR-0020-raw-path-representation.md) | Representación raw de rutas (v0.1.1) | Aceptada |
 | [ADR-0021](ADR-0021-platform-no-replace-finalization.md) | Finalize no-replace por plataforma y durabilidad (v0.1.1) | Aceptada |
 
+| [ADR-0022](ADR-0022-atomic-project-initialization.md) | Creación atómica de proyectos y marker endurecido (v0.1.1) | Aceptada |
+
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).
 Nuevas ADR se crean a partir de [TEMPLATE.md](TEMPLATE.md).
