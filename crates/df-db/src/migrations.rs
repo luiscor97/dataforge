@@ -60,6 +60,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "representatives",
         sql: include_str!("../migrations/0008_representatives.sql"),
     },
+    Migration {
+        version: 9,
+        name: "tree_relations",
+        sql: include_str!("../migrations/0009_tree_relations.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {

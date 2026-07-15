@@ -636,3 +636,378 @@ mod tests {
         assert!(tree_clone_sets(&db, s.snapshot).unwrap().is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pairwise tree relations (RFC-0001 §19.3, §19.4)
+// ---------------------------------------------------------------------------
+
+/// Tuning knobs of [`compute_tree_relations`].
+#[derive(Debug, Clone)]
+pub struct TreeRelationOptions {
+    /// Ignore folders whose subtree holds fewer distinct contents than this.
+    /// Two folders sharing a single file are not "almost the same folder".
+    pub min_subtree_contents: usize,
+    /// A content present in more than this many folders is a *component*
+    /// (a logo, a template, a licence): it says nothing about two folders
+    /// being related, and pairing every holder of it explodes quadratically.
+    pub max_folders_per_content: usize,
+    /// Only report pairs at or above this Jaccard similarity. Below it the
+    /// overlap is indistinguishable from coincidence
+    /// (`REPEATED_COMPONENT_ONLY`).
+    pub min_similarity: f64,
+    /// Hard ceiling on candidate pairs, so a pathological snapshot degrades
+    /// into "fewer relations reported" instead of hanging.
+    pub max_pairs: usize,
+}
+
+impl Default for TreeRelationOptions {
+    fn default() -> Self {
+        Self {
+            min_subtree_contents: 2,
+            max_folders_per_content: 32,
+            min_similarity: 0.5,
+            max_pairs: 200_000,
+        }
+    }
+}
+
+/// Counts returned by [`compute_tree_relations`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TreeRelationSummary {
+    pub partial_clones: u64,
+    pub embedded: u64,
+    /// Candidate pairs left unexamined because `max_pairs` was reached.
+    pub pairs_skipped: u64,
+}
+
+/// Every ancestor folder path of a file, from its parent up to the root.
+/// `"a/b"` yields `["a/b", "a", ""]`.
+fn ancestors_of(parent_relative_path: &str) -> Vec<String> {
+    let mut out = vec![parent_relative_path.to_string()];
+    let mut current = parent_relative_path;
+    while let Some((head, _)) = current.rsplit_once(['/', '\\']) {
+        out.push(head.to_string());
+        current = head;
+    }
+    if !out.iter().any(|p| p.is_empty()) {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Is `ancestor` a path-ancestor of `descendant` within the same root?
+///
+/// A folder shares every content with its own parent, so those pairs are
+/// noise: without this check every folder would be "embedded" in its parent.
+fn is_ancestor_of(ancestor: &str, descendant: &str) -> bool {
+    if ancestor == descendant {
+        return false;
+    }
+    if ancestor.is_empty() {
+        return true; // the root contains everything
+    }
+    descendant
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with(['/', '\\']))
+}
+
+/// A folder's subtree, as the set of distinct contents it holds.
+struct SubtreeContents {
+    folder_id: String,
+    source_root_id: String,
+    relative_path: String,
+    contents: std::collections::HashSet<String>,
+    bytes_by_content: HashMap<String, u64>,
+}
+
+/// Compute pairwise `PARTIAL_TREE_CLONE` / `TREE_EMBEDDED` relations between
+/// the complete folders of a snapshot (§19.3) and persist them together with
+/// the evidence of what each side holds uniquely (§19.4).
+///
+/// Evidence only: nothing here proposes consolidating anything. A pair with
+/// unique content on both sides is precisely a reason *not* to drop either
+/// branch. Idempotent: rows for the snapshot are replaced.
+pub fn compute_tree_relations(
+    db: &mut Db,
+    project_id: ProjectId,
+    snapshot_id: SnapshotId,
+    options: &TreeRelationOptions,
+    actor: Actor,
+) -> DfResult<TreeRelationSummary> {
+    let snapshot = snapshot_id.to_string();
+
+    // Complete folders only: a partially scanned branch must never be claimed
+    // similar to another (§19.4).
+    let folder_rows: Vec<(String, String, String)> = {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT folder_id, source_root_id, relative_path
+                 FROM folder_signatures
+                 WHERE snapshot_id = ?1 AND is_complete = 1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([&snapshot], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows
+    };
+
+    // (root, relative_path) -> folder id, to attach an occurrence to each of
+    // its ancestor folders without a LIKE over path separators.
+    let mut folder_at: HashMap<(String, String), String> = HashMap::new();
+    let mut folders: HashMap<String, SubtreeContents> = HashMap::new();
+    for (folder_id, root_id, relative) in folder_rows {
+        folder_at.insert((root_id.clone(), relative.clone()), folder_id.clone());
+        folders.insert(
+            folder_id.clone(),
+            SubtreeContents {
+                folder_id,
+                source_root_id: root_id,
+                relative_path: relative,
+                contents: std::collections::HashSet::new(),
+                bytes_by_content: HashMap::new(),
+            },
+        );
+    }
+
+    let occurrences: Vec<(String, String, String, u64)> = {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT o.source_root_id, o.parent_relative_path, oc.content_id,
+                        c.size_bytes
+                 FROM path_occurrences o
+                 JOIN occurrence_content oc ON oc.occurrence_id = o.id
+                 JOIN content_objects c ON c.id = oc.content_id
+                 WHERE o.snapshot_id = ?1 AND o.scan_status = 'OK'",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([&snapshot], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows
+    };
+
+    // Roll each occurrence up into every ancestor folder's content set:
+    // O(occurrences x depth) instead of a quadratic path match.
+    for (root_id, parent, content_id, size) in occurrences {
+        for ancestor in ancestors_of(&parent) {
+            if let Some(folder_id) = folder_at.get(&(root_id.clone(), ancestor)) {
+                if let Some(folder) = folders.get_mut(folder_id) {
+                    folder.bytes_by_content.insert(content_id.clone(), size);
+                    folder.contents.insert(content_id.clone());
+                }
+            }
+        }
+    }
+    folders.retain(|_, f| f.contents.len() >= options.min_subtree_contents);
+
+    // Inverted index content -> folders, so only folders that actually share
+    // something get paired.
+    let mut by_content: HashMap<&str, Vec<&str>> = HashMap::new();
+    for folder in folders.values() {
+        for content in &folder.contents {
+            by_content
+                .entry(content.as_str())
+                .or_default()
+                .push(folder.folder_id.as_str());
+        }
+    }
+
+    let mut candidates: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    let mut pairs_skipped = 0u64;
+    for holders in by_content.values() {
+        if holders.len() > options.max_folders_per_content {
+            continue; // a shared component, not a sign of kinship
+        }
+        for (i, a) in holders.iter().enumerate() {
+            for b in holders.iter().skip(i + 1) {
+                let pair = if a < b { (*a, *b) } else { (*b, *a) };
+                if candidates.contains(&pair) {
+                    continue;
+                }
+                if candidates.len() >= options.max_pairs {
+                    pairs_skipped += 1;
+                    continue;
+                }
+                candidates.insert(pair);
+            }
+        }
+    }
+
+    let mut relations: Vec<(df_domain::TreeRelation, Option<&'static str>)> = Vec::new();
+    for (a_id, b_id) in &candidates {
+        let (a, b) = (&folders[*a_id], &folders[*b_id]);
+        // Same root and one inside the other: trivially "shared", not a clone.
+        if a.source_root_id == b.source_root_id
+            && (is_ancestor_of(&a.relative_path, &b.relative_path)
+                || is_ancestor_of(&b.relative_path, &a.relative_path))
+        {
+            continue;
+        }
+
+        let shared: Vec<&String> = a.contents.intersection(&b.contents).collect();
+        let shared_files = shared.len() as u64;
+        let unique_a = (a.contents.len() - shared.len()) as u64;
+        let unique_b = (b.contents.len() - shared.len()) as u64;
+        // Exact clones are already reported as clone sets (migration 0006).
+        if unique_a == 0 && unique_b == 0 {
+            continue;
+        }
+        let union = shared_files + unique_a + unique_b;
+        let similarity = if union == 0 {
+            0.0
+        } else {
+            shared_files as f64 / union as f64
+        };
+        if similarity < options.min_similarity {
+            continue; // REPEATED_COMPONENT_ONLY territory: not reported
+        }
+        let shared_bytes: u64 = shared
+            .iter()
+            .filter_map(|c| a.bytes_by_content.get(c.as_str()))
+            .sum();
+
+        // Stable order, so the pair is stored once regardless of hash order.
+        let (fa, fb, ua, ub) =
+            if (&a.relative_path, &a.folder_id) <= (&b.relative_path, &b.folder_id) {
+                (a, b, unique_a, unique_b)
+            } else {
+                (b, a, unique_b, unique_a)
+            };
+        let (relationship, contained) = match (ua, ub) {
+            (0, _) => (TreeRelationship::Embedded, Some("A")),
+            (_, 0) => (TreeRelationship::Embedded, Some("B")),
+            _ => (TreeRelationship::PartialClone, None),
+        };
+        relations.push((
+            df_domain::TreeRelation {
+                snapshot_id,
+                folder_a: df_domain::FolderId::from_str(&fa.folder_id)?,
+                folder_b: df_domain::FolderId::from_str(&fb.folder_id)?,
+                relationship,
+                shared_files,
+                unique_a_files: ua,
+                unique_b_files: ub,
+                shared_bytes,
+                similarity,
+            },
+            contained,
+        ));
+    }
+
+    let mut summary = TreeRelationSummary {
+        pairs_skipped,
+        ..Default::default()
+    };
+    let now = to_stored_timestamp(chrono::Utc::now());
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    tx.execute(
+        "DELETE FROM tree_relations WHERE snapshot_id = ?1",
+        [&snapshot],
+    )
+    .map_err(db_err)?;
+    for (relation, contained) in &relations {
+        match relation.relationship {
+            TreeRelationship::PartialClone => summary.partial_clones += 1,
+            TreeRelationship::Embedded => summary.embedded += 1,
+            _ => {}
+        }
+        tx.execute(
+            "INSERT INTO tree_relations
+                (id, snapshot_id, folder_a, folder_b, relationship, contained,
+                 shared_files, unique_a_files, unique_b_files, shared_bytes,
+                 similarity, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                snapshot,
+                relation.folder_a.to_string(),
+                relation.folder_b.to_string(),
+                relation.relationship.as_str(),
+                contained,
+                relation.shared_files as i64,
+                relation.unique_a_files as i64,
+                relation.unique_b_files as i64,
+                relation.shared_bytes as i64,
+                relation.similarity,
+                now,
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    let payload = serde_json::json!({
+        "snapshot_id": snapshot,
+        "partial_clones": summary.partial_clones,
+        "embedded": summary.embedded,
+        "pairs_skipped": summary.pairs_skipped,
+    });
+    append_event(&tx, project_id, EVENT_STRUCTURE_ANALYZED, &payload, actor)?;
+    tx.commit().map_err(db_err)?;
+    Ok(summary)
+}
+
+/// Read the pairwise tree relations of a snapshot, most similar first.
+///
+/// Evidence for review (§19.3): each row says what the two folders share and,
+/// crucially, what each one holds that the other does not (§19.4).
+pub fn tree_relations(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<df_domain::TreeRelation>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT folder_a, folder_b, relationship, shared_files,
+                    unique_a_files, unique_b_files, shared_bytes, similarity
+             FROM tree_relations
+             WHERE snapshot_id = ?1
+             ORDER BY similarity DESC, shared_files DESC",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<DfResult<df_domain::TreeRelation>> = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, f64>(7)?,
+            ))
+        })
+        .map_err(db_err)?
+        .map(|raw| {
+            let (a, b, relationship, shared, ua, ub, bytes, similarity) = raw.map_err(db_err)?;
+            Ok(df_domain::TreeRelation {
+                snapshot_id,
+                folder_a: df_domain::FolderId::from_str(&a)?,
+                folder_b: df_domain::FolderId::from_str(&b)?,
+                relationship: TreeRelationship::parse(&relationship)?,
+                shared_files: shared as u64,
+                unique_a_files: ua as u64,
+                unique_b_files: ub as u64,
+                shared_bytes: bytes as u64,
+                similarity,
+            })
+        })
+        .collect();
+    rows.into_iter().collect()
+}

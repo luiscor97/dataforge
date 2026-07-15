@@ -48,7 +48,7 @@ pub use raw_path::RawPath;
 pub use snapshot::{Snapshot, SnapshotStatus};
 pub use source_root::{FileSystemKind, SourceRoot};
 pub use state::ProjectState;
-pub use structure::{FolderSignature, TreeCloneSet, TreeRelationship};
+pub use structure::{FolderSignature, TreeCloneSet, TreeRelation, TreeRelationship};
 
 /// Canonical timestamp type of the engine (UTC, RFC 3339 when serialized).
 pub type Timestamp = chrono::DateTime<chrono::Utc>;

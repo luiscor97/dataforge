@@ -29,6 +29,11 @@ pub struct AnalyzeOutcome {
     pub folder_signatures: u64,
     /// Groups of folders whose subtrees are byte-for-byte identical (§19.3).
     pub tree_clone_sets: u64,
+    /// Folder pairs that share content but where **both** hold something the
+    /// other does not (§19.3). Neither may be dropped for the other (§19.4).
+    pub partial_tree_clones: u64,
+    /// Folder pairs where one subtree's content is wholly inside the other's.
+    pub embedded_trees: u64,
     /// Folders tagged as low-value generic containers (RFC-0001 §18.3).
     pub generic_folders: u64,
     /// Duplicate sets that got a logical representative (RFC-0001 §15.5).
@@ -104,6 +109,14 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         project.profile.as_str(),
         actor,
     )?;
+    // Pairwise relations need the signatures, so they run after them.
+    let relations = df_db::structure::compute_tree_relations(
+        db,
+        project.id,
+        snapshot.id,
+        &df_db::structure::TreeRelationOptions::default(),
+        actor,
+    )?;
     // Representatives need the context penalties, so this runs last.
     let duplicate_representatives =
         df_db::dedup::score_duplicate_representatives(db, project.id, snapshot.id, actor)?;
@@ -114,6 +127,8 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         duplicate_sets,
         folder_signatures: structure.folders_signed,
         tree_clone_sets: structure.tree_clone_sets,
+        partial_tree_clones: relations.partial_clones,
+        embedded_trees: relations.embedded,
         generic_folders: context.generic_folders,
         duplicate_representatives,
         state: project.state.as_str().to_string(),
@@ -1061,5 +1076,74 @@ mod tests {
         );
         // Coverage still holds.
         assert!(validate_plan(&db).unwrap().ok);
+    }
+
+    /// §19.3/§19.4: two branches that are almost the same but where EACH holds
+    /// something the other does not. This is the case the RFC warns about:
+    /// dropping either branch loses data, so it is reported as a
+    /// PARTIAL_TREE_CLONE with the evidence of what is unique on each side.
+    #[test]
+    fn a_partial_tree_clone_reports_the_unique_content_of_both_branches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("casos")).unwrap();
+        std::fs::create_dir_all(origin.join("casos-2019")).unwrap();
+
+        // Shared between both branches.
+        for (name, body) in [("a.txt", b"aaa".as_slice()), ("b.txt", b"bbb".as_slice())] {
+            std::fs::write(origin.join("casos").join(name), body).unwrap();
+            std::fs::write(origin.join("casos-2019").join(name), body).unwrap();
+        }
+        // Unique to each side.
+        std::fs::write(origin.join("casos").join("solo-casos.txt"), b"only here").unwrap();
+        std::fs::write(
+            origin.join("casos-2019").join("solo-2019.txt"),
+            b"only there",
+        )
+        .unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Clon parcial",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+
+        // Not an exact clone: the subtrees differ.
+        assert_eq!(outcome.tree_clone_sets, 0);
+        // But they are recognised as a partial clone.
+        assert_eq!(outcome.partial_tree_clones, 1, "expected one partial clone");
+        assert_eq!(outcome.embedded_trees, 0);
+
+        let relation = df_db::structure::tree_relations(&db, outcome.snapshot_id.parse().unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.relationship == df_domain::TreeRelationship::PartialClone)
+            .expect("the partial clone relation");
+        assert_eq!(relation.shared_files, 2);
+        // The evidence that matters: each side has exactly one unique file.
+        assert_eq!(relation.unique_a_files, 1);
+        assert_eq!(relation.unique_b_files, 1);
+        assert!(relation.similarity > 0.4 && relation.similarity < 1.0);
+    }
+
+    /// A folder is not "embedded" in its own parent: that would be noise on
+    /// every single snapshot.
+    #[test]
+    fn a_folder_is_never_related_to_its_own_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = hashed_project(tmp.path());
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+        // origen/ contains origen/sub/, which would trivially be "embedded".
+        assert_eq!(outcome.embedded_trees, 0);
+        assert_eq!(outcome.partial_tree_clones, 0);
     }
 }
