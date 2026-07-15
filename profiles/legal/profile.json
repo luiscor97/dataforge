@@ -3,12 +3,13 @@
   "schema_version": "1.0.0",
   "id": "legal",
   "name": "Jurídico",
-  "description": "Perfil para despachos, asesorías y gestorías. Hereda los contenedores genéricos y declara las fronteras protegidas del dominio jurídico: un expediente, una pericial o un procedimiento son límites que la deduplicación no debe disolver, aunque dos de ellos contengan archivos byte a byte idénticos. Dos copias del mismo documento en expedientes distintos NO son redundancia: cada expediente debe poder sostenerse por sí mismo como unidad probatoria (RFC-0001 regla 9, §15.2, §15.3 ACROSS_PROTECTED_CONTEXTS).",
+  "description": "Perfil para despachos, asesorías y gestorías. Hereda los contenedores genéricos y declara las fronteras protegidas del dominio jurídico: un expediente, una pericial o un procedimiento son límites que la deduplicación no debe disolver, aunque dos de ellos contengan archivos byte a byte idénticos. Dos copias del mismo documento en expedientes distintos NO son redundancia: cada expediente debe poder sostenerse por sí mismo como unidad probatoria (RFC-0001 regla 9, §15.2, §15.3 ACROSS_PROTECTED_CONTEXTS). Los marcadores usan match \"prefix\" porque las carpetas reales se llaman \"Expediente 1234-2020\", no \"Expediente\" a secas; el prefijo exige separador o dígito detrás, de modo que \"expediente\" no engulle \"expedientes\".",
   "inherits": "generic",
   "generic_markers": [],
   "protected_markers": [
     {
       "name": "expediente",
+      "match": "prefix",
       "reason": "un expediente es la unidad de trabajo jurídica; sus documentos no se consolidan contra otros expedientes"
     },
     {
@@ -16,7 +17,13 @@
       "reason": "contenedor de expedientes: sus subcarpetas son unidades de trabajo independientes"
     },
     {
+      "name": "exp",
+      "match": "prefix",
+      "reason": "abreviatura habitual de expediente en carpetas tipo \"Exp 1234-2020\""
+    },
+    {
       "name": "pericial",
+      "match": "prefix",
       "reason": "una pericial debe conservarse íntegra: fusionar sus archivos con otra copia destruye su valor probatorio"
     },
     {
@@ -25,6 +32,7 @@
     },
     {
       "name": "procedimiento",
+      "match": "prefix",
       "reason": "un procedimiento judicial es una frontera: su documentación no se mezcla con la de otro"
     },
     {
@@ -33,14 +41,17 @@
     },
     {
       "name": "sumario",
+      "match": "prefix",
       "reason": "un sumario es una unidad procesal cerrada"
     },
     {
       "name": "autos",
+      "match": "prefix",
       "reason": "los autos de un procedimiento forman una unidad que no se deduplica contra otra"
     },
     {
       "name": "asunto",
+      "match": "prefix",
       "reason": "un asunto agrupa la documentación de un cliente/caso concreto"
     },
     {

@@ -44,11 +44,21 @@ aceptación.
    consolida nada por sí solo (§25.4). El fallback nunca puede conceder
    *menos* protección de la esperada por accidente.
 
-6. **`Protected` gana a `Generic`.** Un `expediente` dentro de `Backup` sigue
+6. **Coincidencia `exact` por defecto, `prefix` cuando se declara.** Las
+   carpetas reales se llaman `Expediente 1234-2020`, así que con solo igualdad
+   exacta el perfil jurídico no protegería casi nada. `prefix` exige que tras
+   el marcador venga un separador o un dígito, de modo que `expediente` casa
+   `expediente 1234`, `expediente_12` y `expediente2020`, pero **no**
+   `expedientes` ni `exposicion`. El default sigue siendo `exact` porque una
+   coincidencia laxa es un problema de seguridad en ambos sentidos: penaliza
+   ubicaciones legítimas o protege tanto que la consolidación deja de
+   funcionar en silencio.
+
+7. **`Protected` gana a `Generic`.** Un `expediente` dentro de `Backup` sigue
    siendo una frontera. Y una frontera tiene penalización 0: ser un límite no
    la convierte en mala ubicación canónica.
 
-7. **`is_protected_boundary` se deriva del `kind`.** Estaba fijado a `0` en el
+8. **`is_protected_boundary` se deriva del `kind`.** Estaba fijado a `0` en el
    `INSERT`; con el perfil jurídico eso habría dejado carpetas
    `kind='PROTECTED'` con el flag a `0` — un falso negativo de seguridad
    silencioso para cualquier lector de esa columna. Ahora hay un test que fija
@@ -78,11 +88,12 @@ sostenerse por sí mismo como unidad probatoria (§15.2, §15.3
 - La regla 9 pasa de correcta a **efectiva**: con `--profile legal`, un
   duplicado dentro de un expediente se conserva bajo cualquier política.
 - Añadir un dominio (fotografía, migración) es escribir un JSON y probarlo.
-- Deuda aceptada: los marcadores se comparan por **igualdad exacta** del nombre
-  normalizado; un `Expediente 1234-2020` es neutral, no protegido. Las anclas
-  fuertes por patrón (número de procedimiento, §18.2) y el rule engine (§25.1)
-  llegan con el grafo de entidades. Hasta entonces, la protección cubre el
-  contenedor, no cada carpeta hoja.
+- Deuda aceptada: la coincidencia es por nombre (`exact` o `prefix`), no por
+  contenido ni por anclas fuertes. Un `Expediente 1234-2020` se protege por el
+  prefijo, pero una carpeta llamada `Martínez vs. Ayuntamiento` que sea de
+  facto un expediente no se detecta: eso necesita el grafo de entidades y las
+  anclas del §18.2 (número de procedimiento, identificador fiscal), y el rule
+  engine del §25.1.
 
 ## Tests
 

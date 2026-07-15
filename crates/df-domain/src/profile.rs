@@ -34,12 +34,53 @@ const LEGAL_JSON: &str = include_str!("../../../profiles/legal/profile.json");
 /// Every profile shipped with this build.
 const BUILT_IN: &[(&str, &str)] = &[("generic", GENERIC_JSON), ("legal", LEGAL_JSON)];
 
+/// How a marker is compared against a folder name.
+///
+/// The default is [`MatchMode::Exact`] on purpose: a loose match that grabs
+/// more folders than intended is a safety problem in both directions — it can
+/// penalise a legitimate location, or protect so much that consolidation
+/// silently stops working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    /// The whole name equals the marker.
+    #[default]
+    Exact,
+    /// The name *starts* with the marker and what follows is a separator or a
+    /// digit — real folders are called `Expediente 1234-2020`, `Expediente_12`
+    /// or `Expediente2020`, and all three must match.
+    ///
+    /// The separator/digit requirement is what stops `expediente` from
+    /// swallowing `expedientes` (rest is `s`) or `copia` from swallowing
+    /// `copiadora` (rest is `dora`).
+    Prefix,
+}
+
+/// Characters that may follow a `Prefix` marker.
+fn is_boundary_after_prefix(rest: &str) -> bool {
+    rest.is_empty()
+        || rest.starts_with([' ', '-', '_', '.', '(', '[', '#'])
+        || rest.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Whether `name` matches `marker` under `mode`.
+fn marker_matches(name: &str, marker: &str, mode: MatchMode) -> bool {
+    match mode {
+        MatchMode::Exact => name == marker,
+        MatchMode::Prefix => name
+            .strip_prefix(marker)
+            .is_some_and(is_boundary_after_prefix),
+    }
+}
+
 /// A low-value container marker and its representative-location penalty
 /// (§18.3). Compared against a folder's lowercase name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenericMarker {
     pub name: String,
     pub penalty: u32,
+    #[serde(default, rename = "match")]
+    pub match_mode: MatchMode,
 }
 
 /// A folder name that marks a boundary deduplication must not dissolve.
@@ -48,6 +89,8 @@ pub struct ProtectedMarker {
     pub name: String,
     /// Why this is a boundary, surfaced in the operation's reason (§5.3).
     pub reason: String,
+    #[serde(default, rename = "match")]
+    pub match_mode: MatchMode,
 }
 
 /// A parsed, resolved profile.
@@ -150,12 +193,12 @@ impl Profile {
     pub fn classify(&self, normalized_name: &str) -> (ContextKind, u32, Option<String>) {
         let name = normalized_name.trim();
         for marker in &self.protected_markers {
-            if name == marker.name {
+            if marker_matches(name, &marker.name, marker.match_mode) {
                 return (ContextKind::Protected, 0, Some(marker.name.clone()));
             }
         }
         for marker in &self.generic_markers {
-            if name == marker.name {
+            if marker_matches(name, &marker.name, marker.match_mode) {
                 return (
                     ContextKind::Generic,
                     marker.penalty,
@@ -272,6 +315,75 @@ mod tests {
         // The generic profile does not: same folder, no protection.
         let generic = Profile::load("generic").unwrap();
         assert_eq!(generic.classify("expediente").0, ContextKind::Neutral);
+    }
+
+    /// Real folders are called `Expediente 1234-2020`, not `Expediente`.
+    /// Without prefix matching the legal profile would protect almost nothing.
+    #[test]
+    fn prefix_markers_match_real_world_folder_names() {
+        let legal = Profile::load("legal").unwrap();
+        for name in [
+            "expediente 1234-2020",
+            "expediente-1234",
+            "expediente_12",
+            "expediente2020",
+            "expediente (archivado)",
+            "expediente",
+            "exp 1234-2020",
+            "pericial martinez",
+            "procedimiento 55/2021",
+            "asunto 7",
+        ] {
+            assert_eq!(
+                legal.classify(name).0,
+                ContextKind::Protected,
+                "`{name}` should be a protected boundary"
+            );
+        }
+    }
+
+    /// The separator/digit requirement is what keeps prefix matching honest.
+    /// A marker that swallowed neighbouring words would protect so much that
+    /// consolidation silently stopped working.
+    #[test]
+    fn prefix_markers_do_not_swallow_unrelated_names() {
+        let legal = Profile::load("legal").unwrap();
+        // "expedientes" is declared separately (exact); the singular prefix
+        // must not match it, or the plural's own rule would be dead code.
+        assert!(marker_matches(
+            "expediente 1",
+            "expediente",
+            MatchMode::Prefix
+        ));
+        assert!(!marker_matches(
+            "expedientes",
+            "expediente",
+            MatchMode::Prefix
+        ));
+        assert!(!marker_matches(
+            "expedientenuevo",
+            "expediente",
+            MatchMode::Prefix
+        ));
+        // Unrelated words that merely start with a marker's letters.
+        assert_eq!(legal.classify("exposicion").0, ContextKind::Neutral);
+        assert_eq!(legal.classify("expertos").0, ContextKind::Neutral);
+        assert_eq!(legal.classify("asuntos varios").0, ContextKind::Neutral);
+    }
+
+    /// Generic markers stay `exact` by default, so `copia` must not swallow
+    /// `copiadora` — that would penalise a legitimate location.
+    #[test]
+    fn generic_markers_default_to_exact_matching() {
+        let generic = Profile::load("generic").unwrap();
+        assert_eq!(generic.classify("copia").0, ContextKind::Generic);
+        assert_eq!(generic.classify("copiadora").0, ContextKind::Neutral);
+        assert_eq!(generic.classify("backup").0, ContextKind::Generic);
+        assert_eq!(generic.classify("backupsystem").0, ContextKind::Neutral);
+        assert!(generic
+            .generic_markers
+            .iter()
+            .all(|m| m.match_mode == MatchMode::Exact));
     }
 
     /// A boundary inside a generic container is still a boundary.
