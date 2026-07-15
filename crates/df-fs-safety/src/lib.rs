@@ -168,6 +168,41 @@ impl SafeRelativePath {
     pub fn to_path(&self) -> PathBuf {
         self.components.iter().collect()
     }
+
+    /// Last component (the file or directory name itself).
+    pub fn file_name(&self) -> &str {
+        self.components
+            .last()
+            .map(String::as_str)
+            .expect("a SafeRelativePath always has at least one component")
+    }
+
+    /// The containing directory, or `None` when this sits directly at the root.
+    pub fn parent(&self) -> Option<Self> {
+        if self.components.len() <= 1 {
+            return None;
+        }
+        Some(Self {
+            components: self.components[..self.components.len() - 1].to_vec(),
+        })
+    }
+
+    /// Same directory, different last component. The new name is validated
+    /// exactly like a parsed one, so a crafted name cannot smuggle in a
+    /// separator or `..`.
+    pub fn with_file_name(&self, name: &str) -> FsResult<Self> {
+        let candidate = Self::parse(Path::new(name))?;
+        if candidate.components.len() != 1 {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: PathBuf::from(name),
+                reason: "a file name must be a single component".to_string(),
+            });
+        }
+        let mut components = self.components.clone();
+        components.pop();
+        components.push(candidate.components.into_iter().next().expect("one"));
+        Ok(Self { components })
+    }
 }
 
 /// What we learned about one component of a destination path.
@@ -566,6 +601,26 @@ mod tests {
         assert!(SafeRelativePath::parse(Path::new("informe ")).is_err());
         assert!(SafeRelativePath::parse(Path::new("informe.")).is_err());
         assert!(SafeRelativePath::parse(Path::new("ok/informe .txt")).is_ok());
+    }
+
+    #[test]
+    fn parent_and_with_file_name_stay_inside() {
+        let rel = SafeRelativePath::parse(Path::new("a/b/c.txt")).unwrap();
+        assert_eq!(rel.file_name(), "c.txt");
+        assert_eq!(
+            rel.parent().unwrap().components(),
+            &["a".to_string(), "b".to_string()]
+        );
+        let sibling = rel.with_file_name(".c.txt.partial").unwrap();
+        assert_eq!(sibling.components(), &["a", "b", ".c.txt.partial"]);
+        // A crafted name cannot smuggle a separator or traversal.
+        assert!(rel.with_file_name("../escape").is_err());
+        assert!(rel.with_file_name("sub/escape").is_err());
+        // A single-component path has no parent.
+        assert!(SafeRelativePath::parse(Path::new("x"))
+            .unwrap()
+            .parent()
+            .is_none());
     }
 
     #[test]
