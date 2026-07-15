@@ -453,6 +453,15 @@ pub fn finalize_no_replace(partial: &Path, destination: &Path) -> FsResult<()> {
     platform::finalize_no_replace(partial, destination)
 }
 
+/// Is this already-read metadata a reparse point?
+///
+/// For callers that already hold `symlink_metadata` and must not pay for a
+/// second stat (e.g. a directory walk). Note the metadata **must** come from
+/// `symlink_metadata`: `metadata()` follows links and would report the target.
+pub fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    platform::metadata_is_reparse_point(metadata)
+}
+
 /// Is this path a reparse point? Never follows it.
 pub fn is_reparse_point(path: &Path) -> FsResult<bool> {
     match std::fs::symlink_metadata(path) {

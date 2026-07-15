@@ -272,6 +272,19 @@ pub fn verify_project(
 }
 
 /// Recursively inspect one plan output subtree for §28.2 invariants.
+///
+/// This walk is **adversarial by design** (ADR-0017, threat T7). The previous
+/// version used `entry.metadata()`, which follows links: a junction planted in
+/// the output was reported as an ordinary directory, pushed onto the queue and
+/// walked into — so the verifier happily read files *outside* the output root
+/// and called the result verified. It also swallowed `read_dir` errors with a
+/// silent `continue`, so an unreadable subtree looked like an empty one.
+///
+/// Now:
+/// - every entry is stat'ed with `symlink_metadata` (never follows);
+/// - any reparse point is a `PROBLEM` and is never descended into;
+/// - read failures become findings instead of silence;
+/// - cycles are cut by physical identity, not by a depth limit.
 fn walk_output(
     output_root: &Path,
     subtree: &Path,
@@ -279,18 +292,117 @@ fn walk_output(
     expected_dirs: &HashSet<String>,
     findings: &mut Vec<VerificationFinding>,
 ) {
+    // Directories already visited, by physical identity: a junction loop would
+    // otherwise spin forever with ever-longer paths.
+    let mut visited: HashSet<df_fs_safety::FileIdentity> = HashSet::new();
     let mut queue: Vec<PathBuf> = vec![subtree.to_path_buf()];
+
     while let Some(dir_rel) = queue.pop() {
         let dir_abs = output_root.join(&dir_rel);
-        let Ok(entries) = std::fs::read_dir(&dir_abs) else {
-            continue;
+        let dir_text = dir_rel.to_string_lossy().into_owned();
+
+        // A directory we are about to read must itself not be a link.
+        match df_fs_safety::is_reparse_point(&dir_abs) {
+            Ok(true) => {
+                findings.push(VerificationFinding {
+                    kind: "OUTPUT_REPARSE_POINT".to_string(),
+                    severity: SEVERITY_PROBLEM.to_string(),
+                    subject: dir_text,
+                    detail: "a directory in the output is a reparse point; the output is not \
+                             fully under DataForge's control (RFC-0001 §28.2)"
+                        .to_string(),
+                });
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                findings.push(VerificationFinding {
+                    kind: "OUTPUT_SUBTREE_UNREADABLE".to_string(),
+                    severity: SEVERITY_PROBLEM.to_string(),
+                    subject: dir_text,
+                    detail: format!("could not inspect the directory: {error}"),
+                });
+                continue;
+            }
+        }
+
+        // Cycle detection by identity (§28.2): cheap and exact.
+        if let Ok(Some(identity)) = df_fs_safety::identity_of(&dir_abs) {
+            if !visited.insert(identity) {
+                findings.push(VerificationFinding {
+                    kind: "OUTPUT_CYCLE_DETECTED".to_string(),
+                    severity: SEVERITY_PROBLEM.to_string(),
+                    subject: dir_text,
+                    detail: "this directory was already visited; the output contains a cycle"
+                        .to_string(),
+                });
+                continue;
+            }
+        }
+
+        let entries = match std::fs::read_dir(&dir_abs) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // Never a silent continue: an output we cannot read is an
+                // output we cannot certify.
+                findings.push(VerificationFinding {
+                    kind: "OUTPUT_SUBTREE_UNREADABLE".to_string(),
+                    severity: SEVERITY_PROBLEM.to_string(),
+                    subject: dir_text,
+                    detail: format!("could not list the directory: {error}"),
+                });
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    findings.push(VerificationFinding {
+                        kind: "OUTPUT_SUBTREE_UNREADABLE".to_string(),
+                        severity: SEVERITY_PROBLEM.to_string(),
+                        subject: dir_text.clone(),
+                        detail: format!("could not read a directory entry: {error}"),
+                    });
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = dir_rel.join(&name);
             let rel_text = rel.to_string_lossy().into_owned();
-            let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
-            if is_dir {
+            let abs = output_root.join(&rel);
+
+            // symlink_metadata: describes the entry itself, not its target.
+            let metadata = match std::fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    findings.push(VerificationFinding {
+                        kind: "OUTPUT_SUBTREE_UNREADABLE".to_string(),
+                        severity: SEVERITY_PROBLEM.to_string(),
+                        subject: rel_text,
+                        detail: format!("could not stat the entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+
+            // A reparse point is reported and never followed — this is the one
+            // that used to let the walk escape.
+            if df_fs_safety::metadata_is_reparse(&metadata) {
+                findings.push(VerificationFinding {
+                    kind: "OUTPUT_REPARSE_POINT".to_string(),
+                    severity: SEVERITY_PROBLEM.to_string(),
+                    subject: rel_text,
+                    detail: "a symlink, junction or mount point appeared in the output; \
+                             DataForge never creates one, so the output is not solely under \
+                             its control (RFC-0001 §28.2)"
+                        .to_string(),
+                });
+                continue;
+            }
+
+            if metadata.is_dir() {
                 if !expected_dirs.contains(&rel_text.to_lowercase()) {
                     findings.push(VerificationFinding {
                         kind: "UNTRACKED_FILE".to_string(),
@@ -303,6 +415,7 @@ fn walk_output(
                 queue.push(rel);
                 continue;
             }
+
             if name.contains(".dataforge-partial-") {
                 findings.push(VerificationFinding {
                     kind: "PARTIAL_LEFTOVER".to_string(),
@@ -312,7 +425,10 @@ fn walk_output(
                 });
                 continue;
             }
+
             if !expected_files.contains(&rel_text.to_lowercase()) {
+                // Still a warning: a legible, ordinary file inside the
+                // legitimate tree is untidy, not a breach of containment.
                 findings.push(VerificationFinding {
                     kind: "UNTRACKED_FILE".to_string(),
                     severity: SEVERITY_WARNING.to_string(),
@@ -354,6 +470,20 @@ mod tests {
         output: PathBuf,
     }
 
+    /// Create a directory junction with `mklink /J`; false when the
+    /// environment forbids it, so a test skips *loudly* rather than silently.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(s) if s.success()) && link.exists()
+    }
+
     fn executed_project(tmp: &Path) -> Fixture {
         let origin = tmp.join("origen");
         std::fs::create_dir_all(origin.join("sub")).unwrap();
@@ -379,6 +509,112 @@ mod tests {
         approve_plan(&mut db, Actor::Test).unwrap();
         execute_plan(&mut db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
         Fixture { db, origin, output }
+    }
+
+    /// Threat T7 / P0-2: a junction planted after execution must make the
+    /// verification FAIL, and the walk must not read a single byte outside the
+    /// output root.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_planted_after_execution_fails_verification_without_reading_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = executed_project(tmp.path());
+
+        // A directory full of secrets that the verifier must never touch.
+        let outside = tmp.path().join("fuera");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secreto.txt"), b"no me leas").unwrap();
+
+        // Plant salida\origen\atajo -> fuera, after a clean execution.
+        let planted = fx.output.join("origen").join("atajo");
+        if !make_junction(&planted, &outside) {
+            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            return;
+        }
+
+        let outcome = verify_project(&mut fx.db, Actor::Test, &VerifyOptions::default()).unwrap();
+
+        assert_eq!(outcome.verdict, "FAILED", "{:?}", outcome.findings);
+        assert_eq!(outcome.state, "FAILED");
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.kind == "OUTPUT_REPARSE_POINT" && f.severity == "PROBLEM"),
+            "expected an OUTPUT_REPARSE_POINT problem, got {:?}",
+            outcome.findings
+        );
+        // The proof it did not follow: the file behind the junction is never
+        // mentioned in any finding.
+        assert!(
+            !outcome
+                .findings
+                .iter()
+                .any(|f| f.subject.contains("secreto")),
+            "the verifier walked through the junction and saw {:?}",
+            outcome.findings
+        );
+    }
+
+    /// Deny/restore read access on a directory via `icacls`. Returns false
+    /// when the environment does not allow it, so the test skips loudly.
+    #[cfg(windows)]
+    fn set_read_denied(path: &Path, denied: bool) -> bool {
+        let user = match std::env::var("USERNAME") {
+            Ok(user) if !user.is_empty() => user,
+            _ => return false,
+        };
+        let mut cmd = std::process::Command::new("icacls");
+        cmd.arg(path);
+        if denied {
+            cmd.arg("/deny").arg(format!("{user}:(RX)"));
+        } else {
+            cmd.arg("/remove:d").arg(&user);
+        }
+        matches!(
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+            Ok(s) if s.success()
+        )
+    }
+
+    /// P0-2: a directory we cannot read is a PROBLEM, never a silent
+    /// `continue` that would let an uninspected output pass as verified.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_subtree_is_reported_instead_of_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = executed_project(tmp.path());
+        let sub = fx.output.join("origen").join("sub");
+
+        if !set_read_denied(&sub, true) {
+            eprintln!("SKIP: icacls could not deny read access in this environment");
+            return;
+        }
+        // Confirm the denial actually bites; if not, we would be asserting on
+        // a test that proves nothing.
+        if std::fs::read_dir(&sub).is_ok() {
+            let _ = set_read_denied(&sub, false);
+            eprintln!("SKIP: the read denial had no effect (elevated session?)");
+            return;
+        }
+
+        let outcome = verify_project(&mut fx.db, Actor::Test, &VerifyOptions::default());
+        // Always restore access before asserting, so the temp dir can be
+        // cleaned up even when an assertion fails.
+        let _ = set_read_denied(&sub, false);
+        let outcome = outcome.unwrap();
+
+        assert_eq!(outcome.verdict, "FAILED", "{:?}", outcome.findings);
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.kind == "OUTPUT_SUBTREE_UNREADABLE" && f.severity == "PROBLEM"),
+            "an output we cannot read must be a PROBLEM, got {:?}",
+            outcome.findings
+        );
     }
 
     #[test]

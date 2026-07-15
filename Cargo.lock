@@ -858,6 +858,7 @@ dependencies = [
  "df-domain",
  "df-error",
  "df-executor",
+ "df-fs-safety",
  "df-hash",
  "df-ledger",
  "df-planner",
