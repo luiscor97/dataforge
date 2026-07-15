@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use df_domain::{Actor, ProjectId, SnapshotId};
+use df_domain::{Actor, ContextKind, ProjectId, SnapshotId};
 use df_error::DfResult;
 use rusqlite::params;
 
@@ -313,4 +313,114 @@ mod tests {
         // A copy marker breaks a tie between equally-located files.
         assert!(location_cost(0, false, 2) < location_cost(0, true, 2));
     }
+}
+
+/// One occurrence of a duplicated content, with everything the planner needs
+/// to apply a [`df_domain::DuplicatePolicy`] to it.
+#[derive(Debug, Clone)]
+pub struct DuplicateMember {
+    pub duplicate_set_id: String,
+    pub occurrence_id: String,
+    /// This occurrence is the set's logical representative (§15.5).
+    pub is_representative: bool,
+    /// Most restrictive context found along the occurrence's ancestor chain:
+    /// `Protected` wins over `Generic`, which wins over `Neutral`. A file
+    /// inside a protected expediente is protected even if it also sits under
+    /// a folder named "Copia".
+    pub context: ContextKind,
+    /// The marker that classified the context, for the operation's reason.
+    pub context_marker: Option<String>,
+}
+
+/// Every occurrence that belongs to some exact-duplicate set of a snapshot,
+/// resolved against the folder contexts and the recorded representatives.
+///
+/// Occurrences that are not duplicated at all are not returned: the planner
+/// copies them unconditionally.
+pub fn duplicate_members(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<DuplicateMember>> {
+    let snapshot = snapshot_id.to_string();
+
+    // (source_root_id, folder_relative_path) -> (kind, marker)
+    let contexts: HashMap<(String, String), (ContextKind, Option<String>)> = {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT f.source_root_id, fc.relative_path, fc.kind, fc.marker
+                 FROM folder_contexts fc
+                 JOIN folders f ON f.id = fc.folder_id
+                 WHERE fc.snapshot_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([&snapshot], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?),
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(key, (kind, marker))| Ok((key, (ContextKind::parse(&kind)?, marker))))
+            .collect::<DfResult<HashMap<_, _>>>()?
+    };
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ds.id, o.id, o.source_root_id, o.parent_relative_path,
+                    CASE WHEN dr.occurrence_id = o.id THEN 1 ELSE 0 END
+             FROM duplicate_sets ds
+             JOIN occurrence_content oc ON oc.content_id = ds.content_id
+             JOIN path_occurrences o ON o.id = oc.occurrence_id
+             LEFT JOIN duplicate_representatives dr ON dr.duplicate_set_id = ds.id
+             WHERE ds.snapshot_id = ?1 AND o.snapshot_id = ?1
+             ORDER BY ds.id, o.relative_path",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([&snapshot], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(set_id, occurrence_id, root_id, parent, is_representative)| {
+                // Walk the ancestor chain and keep the most restrictive context.
+                let mut context = ContextKind::Neutral;
+                let mut marker = None;
+                for ancestor in ancestor_paths(&parent) {
+                    if let Some((kind, found)) = contexts.get(&(root_id.clone(), ancestor)) {
+                        let wins = matches!(
+                            (context, kind),
+                            (_, ContextKind::Protected)
+                                | (ContextKind::Neutral, ContextKind::Generic)
+                        );
+                        if wins {
+                            context = *kind;
+                            marker.clone_from(found);
+                        }
+                    }
+                }
+                DuplicateMember {
+                    duplicate_set_id: set_id,
+                    occurrence_id,
+                    is_representative,
+                    context,
+                    context_marker: marker,
+                }
+            },
+        )
+        .collect())
 }
