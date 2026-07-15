@@ -744,6 +744,13 @@ pub struct DuplicateSet {
     pub size_bytes: u64,
     /// Absolute paths of every occurrence, reconstructed root + relative.
     pub occurrences: Vec<String>,
+    /// Absolute path of the logical representative — the best canonical
+    /// location of this content (RFC-0001 §15.5), or `None` when the snapshot
+    /// has not been analysed yet. Naming a representative never implies that
+    /// the other occurrences are dispensable (§15.5, rule 8).
+    pub representative: Option<String>,
+    /// Why that occurrence was chosen (§5.3 explainable-by-design).
+    pub representative_reason: Option<String>,
 }
 
 /// Exact duplicate sets of a snapshot, largest waste first.
@@ -796,8 +803,61 @@ pub fn exact_duplicates(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Duplic
                 sha256,
                 size_bytes: size as u64,
                 occurrences: vec![absolute],
+                representative: None,
+                representative_reason: None,
             }),
         }
     }
+    attach_representatives(db, snapshot_id, &mut sets)?;
     Ok(sets)
+}
+
+/// Fill in the logical representative of each set from the rows recorded by
+/// `dedup::score_duplicate_representatives` (RFC-0001 §15.5). Sets analysed
+/// before that step existed simply keep `None`.
+fn attach_representatives(
+    db: &Db,
+    snapshot_id: SnapshotId,
+    sets: &mut [DuplicateSet],
+) -> DfResult<()> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT c.sha256, r.absolute_path, o.relative_path, dr.reason
+             FROM duplicate_representatives dr
+             JOIN duplicate_sets ds ON ds.id = dr.duplicate_set_id
+             JOIN content_objects c ON c.id = ds.content_id
+             JOIN path_occurrences o ON o.id = dr.occurrence_id
+             JOIN source_roots r ON r.id = o.source_root_id
+             WHERE dr.snapshot_id = ?1 AND c.sha256 IS NOT NULL",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            let sha256: String = row.get(0)?;
+            let root: String = row.get(1)?;
+            let relative: String = row.get(2)?;
+            let reason: String = row.get(3)?;
+            let absolute = if relative.is_empty() {
+                root
+            } else {
+                format!("{root}{}{relative}", std::path::MAIN_SEPARATOR)
+            };
+            Ok((sha256, absolute, reason))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let by_sha: std::collections::HashMap<String, (String, String)> = rows
+        .into_iter()
+        .map(|(sha, path, reason)| (sha, (path, reason)))
+        .collect();
+    for set in sets.iter_mut() {
+        if let Some((path, reason)) = by_sha.get(&set.sha256) {
+            set.representative = Some(path.clone());
+            set.representative_reason = Some(reason.clone());
+        }
+    }
+    Ok(())
 }

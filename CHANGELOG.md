@@ -89,6 +89,21 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 - Evento de auditoría `CONTEXTS_CLASSIFIED`; `df-facade::context_report`; CLI
   `dataforge report contexts` para listar carpetas genéricas por penalización.
 - ADR-0019 con las decisiones de la clasificación de contexto por marcadores.
+- Migración `0006_representatives`: tabla `duplicate_representatives`
+  (RFC-0001 §15.5), STRICT, con la razón legible de cada decisión.
+- `df-db::dedup` (Milestone 0.2): representante lógico de cada conjunto de
+  duplicados exactos. Coste determinista `penalización_ubicación*100 + marca
+  de copia*10 + profundidad`, donde la penalización es la peor de las carpetas
+  ancestras (§18.3); desempate estable por ruta. Implementa las señales
+  `- Descargas/Escritorio/Backup/Copia/temporal`, `+ nombre limpio` y
+  `+ ruta canónica` del §15.5; aplaza `+ contexto específico`, `+ fecha
+  coherente`, `+ menor anomalía` y `- ruta injertada` por falta de señal.
+  **Elegir representante no implica borrar las demás apariciones** (§15.5,
+  regla 8): no genera ninguna operación de plan. Corre en `analyze` tras la
+  clasificación de contexto y es idempotente.
+- Evento `DUPLICATE_REPRESENTATIVES_SCORED`; `report duplicates` marca la copia
+  representante con `*` y muestra la razón de la elección (§5.3).
+- ADR-0020 con las decisiones del representante lógico.
 
 ### Seguridad
 

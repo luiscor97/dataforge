@@ -29,6 +29,8 @@ pub struct AnalyzeOutcome {
     pub tree_clone_sets: u64,
     /// Folders tagged as low-value generic containers (RFC-0001 §18.3).
     pub generic_folders: u64,
+    /// Duplicate sets that got a logical representative (RFC-0001 §15.5).
+    pub duplicate_representatives: u64,
     pub state: String,
 }
 
@@ -92,6 +94,9 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         project.profile.as_str(),
         actor,
     )?;
+    // Representatives need the context penalties, so this runs last.
+    let duplicate_representatives =
+        df_db::dedup::score_duplicate_representatives(db, project.id, snapshot.id, actor)?;
     let project = repository::update_project_state(db, ProjectState::Analyzed, actor)?;
 
     Ok(AnalyzeOutcome {
@@ -100,6 +105,7 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         folder_signatures: structure.folders_signed,
         tree_clone_sets: structure.tree_clone_sets,
         generic_folders: context.generic_folders,
+        duplicate_representatives,
         state: project.state.as_str().to_string(),
     })
 }

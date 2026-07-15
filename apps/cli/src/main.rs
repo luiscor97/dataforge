@@ -337,6 +337,7 @@ fn print_analyze(outcome: &AnalyzeOutcome) {
     println!("Folder signatures: {}", outcome.folder_signatures);
     println!("Tree clone sets  : {}", outcome.tree_clone_sets);
     println!("Generic folders  : {}", outcome.generic_folders);
+    println!("Representatives  : {}", outcome.duplicate_representatives);
     println!("State            : {}", outcome.state);
 }
 
@@ -412,7 +413,17 @@ fn print_duplicates(report: &DuplicateReport) {
         println!();
         println!("  sha256 {} ({} bytes)", set.sha256, set.size_bytes);
         for path in &set.occurrences {
-            println!("    - {path}");
+            // The representative is the best canonical location, not a
+            // verdict that the others are dispensable (RFC-0001 §15.5).
+            let mark = if set.representative.as_deref() == Some(path.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            println!("    {mark} {path}");
+        }
+        if let Some(reason) = &set.representative_reason {
+            println!("      * representative: {reason}");
         }
     }
     if report.sets.is_empty() {

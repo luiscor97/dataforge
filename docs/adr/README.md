@@ -13,6 +13,7 @@
 | [ADR-0016](ADR-0016-plan-execute-verify-increment.md) | Decisiones del incremento de planificación, ejecución y verificación (M0.1) | Aceptada |
 | [ADR-0018](ADR-0018-folder-merkle-signatures.md) | Firmas Merkle de carpeta y detección de clones exactos de árbol (M0.2) | Aceptada |
 | [ADR-0019](ADR-0019-folder-context-classification.md) | Clasificación de contexto de carpetas por marcadores de perfil (M0.2) | Aceptada |
+| [ADR-0020](ADR-0020-duplicate-logical-representative.md) | Representante lógico de un conjunto de duplicados (M0.2) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).

@@ -5,6 +5,7 @@
 //! the integrity checks. No other crate issues SQL.
 
 pub mod context;
+pub mod dedup;
 pub mod integrity;
 pub mod inventory;
 pub mod migrations;

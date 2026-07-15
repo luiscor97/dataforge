@@ -9,7 +9,9 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
-**Estado actual: Milestone 0.1 — Safe Inventory Core (en curso).**
+**Estado actual: Milestone 0.2 — Structural Intelligence (en curso).**
+Milestone 0.1 (Safe Inventory Core) está completo: el pipeline llega de la
+carpeta caótica a la copia verificada con informe.
 
 Qué existe hoy (real, con pruebas):
 
@@ -27,7 +29,16 @@ Qué existe hoy (real, con pruebas):
   con invalidación pre/post (`SOURCE_CHANGED`) y cola reanudable — matar el
   proceso no pierde trabajo.
 - Duplicados exactos (mismo tamaño + SHA-256) como informe de evidencia y
-  conjuntos materializados en el análisis.
+  conjuntos materializados en el análisis, cada uno con su **representante
+  lógico** (§15.5): la mejor ubicación canónica, elegida por penalización de
+  ubicación, limpieza del nombre y profundidad, con la razón explicada — sin
+  que ello implique borrar las demás copias.
+- **Inteligencia estructural (M0.2)**: firmas Merkle de carpeta (BLAKE3,
+  §19.2) y detección de **clones exactos de árbol** (carpetas injertadas con
+  subárboles byte a byte idénticos); y **clasificación de contexto** que marca
+  contenedores genéricos de bajo valor (Descargas, Escritorio, Backup,
+  Recuperado, Copia, Temporales) con la penalización del §18.3. Todo es
+  evidencia: nada se propone borrar.
 - Planificación (`df-planner`): plan con cobertura completa de cada
   aparición, razones por operación, validación (destinos, colisiones,
   cobertura) y aprobación que congela el plan bajo un SHA-256 canónico.
@@ -43,14 +54,15 @@ Qué existe hoy (real, con pruebas):
   y eventos de todo el pipeline.
 - CLI `dataforge`: `project create/status`, `scan`, `hash`, `analyze`,
   `plan create/validate/approve`, `execute`, `verify`,
-  `report duplicates`, `audit verify` (con `--json` y códigos de salida
-  documentados).
+  `report duplicates/tree-clones/contexts`, `audit verify` (con `--json` y
+  códigos de salida documentados).
 - App de escritorio (Tauri 2 + React + TypeScript strict): crear proyecto,
   abrir proyecto y ver estado, inventario e integridad, usando los mismos
   comandos de `df-facade` que la CLI.
 
-Qué **no** existe todavía (y no está simulado): contextos y perfiles,
-consolidación de duplicados, similitud, búsqueda, informes exportables,
+Qué **no** existe todavía (y no está simulado): clones parciales/embebidos de
+árbol, perfiles con fronteras protegidas, grafo de entidades, reglas
+declarativas, anomalías, consolidación de duplicados, similitud, búsqueda,
 plugins, IA.
 Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro).
 
@@ -74,6 +86,8 @@ cargo run -p dataforge-cli -- scan --path D:\proyectos\demo
 cargo run -p dataforge-cli -- hash --path D:\proyectos\demo
 cargo run -p dataforge-cli -- analyze --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report duplicates --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report tree-clones --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report contexts --path D:\proyectos\demo
 cargo run -p dataforge-cli -- plan create --path D:\proyectos\demo
 cargo run -p dataforge-cli -- plan approve --path D:\proyectos\demo
 cargo run -p dataforge-cli -- execute --path D:\proyectos\demo
