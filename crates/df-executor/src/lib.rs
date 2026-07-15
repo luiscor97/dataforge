@@ -322,15 +322,28 @@ fn copy_file(
         )
     })?;
 
-    // 1. Validate the source fingerprint (§27.1).
-    let pre = current_fingerprint(&source).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => OperationFailure::fatal(
-            OperationErrorCode::SourceMissing,
-            format!("source `{}` no longer exists", source.display()),
-        ),
-        _ => OperationFailure::from_io(&e, "reading source metadata"),
-    })?;
-    if Some(pre.as_str()) != operation.source_fingerprint.as_deref() {
+    // 1. Validate the source against the fingerprint frozen in the manifest
+    // (§27.1). Parsed, not string-compared: a v1 token from an older snapshot
+    // must not masquerade as a v2 match (ADR-0019).
+    let pre = current_fingerprint(&source)?;
+    let approved = operation
+        .source_fingerprint
+        .as_deref()
+        .map(FileFingerprint::parse)
+        .transpose()
+        .map_err(|error| {
+            OperationFailure::fatal(
+                OperationErrorCode::InvalidPath,
+                format!("unreadable approved fingerprint: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            OperationFailure::fatal(
+                OperationErrorCode::InvalidPath,
+                "copy operation without an approved source fingerprint",
+            )
+        })?;
+    if FileFingerprint::compare(&approved, &pre).is_changed() {
         return Err(OperationFailure::fatal(
             OperationErrorCode::SourceChanged,
             "source changed since the snapshot was taken (RFC-0001 §27.5)",
@@ -410,7 +423,7 @@ fn copy_file(
 
     // 7. The source must not have changed while we read it (§14.5).
     match current_fingerprint(&source) {
-        Ok(post) if post == pre => {}
+        Ok(post) if !FileFingerprint::compare(&pre, &post).is_changed() => {}
         _ => {
             remove_own_partial(&partial);
             return Err(OperationFailure::fatal(
@@ -584,13 +597,17 @@ fn hash_existing(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
     Ok(hex::encode(sha.finalize()))
 }
 
-fn current_fingerprint(path: &Path) -> std::io::Result<String> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    Ok(FileFingerprint {
-        size_bytes: metadata.len(),
-        modified_at_fs: metadata.modified().ok().map(Into::into),
-    }
-    .token())
+/// Current v2 fingerprint of the source (ADR-0019).
+fn current_fingerprint(path: &Path) -> Result<FileFingerprint, OperationFailure> {
+    df_fs_safety::capture_fingerprint(path).map_err(|error| match &error {
+        FsSafetyError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            OperationFailure::fatal(
+                OperationErrorCode::SourceMissing,
+                format!("source `{}` no longer exists", path.display()),
+            )
+        }
+        _ => OperationFailure::from_fs_safety(error),
+    })
 }
 
 #[cfg(windows)]

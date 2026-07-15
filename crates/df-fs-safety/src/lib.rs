@@ -453,6 +453,19 @@ pub fn finalize_no_replace(partial: &Path, destination: &Path) -> FsResult<()> {
     platform::finalize_no_replace(partial, destination)
 }
 
+/// Capture the physical fingerprint of a file (RFC-0001 §14.1, ADR-0019).
+///
+/// Always produces a **v2** fingerprint. When the filesystem cannot supply an
+/// identity the fingerprint is v2-but-degraded, never a v1: the caller can
+/// then see, from the value itself, that a same-size same-mtime substitution
+/// would go unnoticed here.
+///
+/// The file is opened for metadata only and never followed if it is a reparse
+/// point, so this cannot be tricked into fingerprinting a link's target.
+pub fn capture_fingerprint(path: &Path) -> FsResult<df_domain::FileFingerprint> {
+    platform::capture_fingerprint(path)
+}
+
 /// Is this already-read metadata a reparse point?
 ///
 /// For callers that already hold `symlink_metadata` and must not pay for a
@@ -542,6 +555,72 @@ mod platform {
         }))
     }
 
+    /// FILETIME (100-ns ticks since 1601-01-01) -> Unix milliseconds.
+    fn filetime_to_unix_ms(ticks: i64) -> Option<i64> {
+        const EPOCH_DIFF_TICKS: i64 = 116_444_736_000_000_000;
+        if ticks <= 0 {
+            return None;
+        }
+        Some((ticks - EPOCH_DIFF_TICKS) / 10_000)
+    }
+
+    pub(super) fn capture_fingerprint(path: &Path) -> FsResult<df_domain::FileFingerprint> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        };
+
+        let file = open_for_query(path).map_err(|e| FsSafetyError::io(path, e))?;
+        let handle = file.as_raw_handle() as HANDLE;
+
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: live handle, properly sized zeroed output.
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(FsSafetyError::io(path, std::io::Error::last_os_error()));
+        }
+
+        let size_bytes = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
+        let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+        let identity = if file_index == 0 {
+            // No file id: degraded, and the fingerprint says so.
+            None
+        } else {
+            Some(df_domain::PhysicalIdentity {
+                volume_serial: info.dwVolumeSerialNumber as u64,
+                file_id: file_index,
+            })
+        };
+        let modified_at_ms = filetime_to_unix_ms(
+            ((info.ftLastWriteTime.dwHighDateTime as i64) << 32)
+                | info.ftLastWriteTime.dwLowDateTime as i64,
+        );
+
+        // Change time needs the Ex call; it moves even when a writer restores
+        // the modification time, so it is worth the extra syscall.
+        let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: live handle; buffer size matches the requested class.
+        let change_time_ms = if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                &mut basic as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            None
+        } else {
+            filetime_to_unix_ms(basic.ChangeTime)
+        };
+
+        Ok(df_domain::FileFingerprint::V2(df_domain::FingerprintV2 {
+            size_bytes,
+            modified_at_ms,
+            change_time_ms,
+            attributes: info.dwFileAttributes,
+            identity,
+        }))
+    }
+
     pub(super) fn finalize_no_replace(partial: &Path, destination: &Path) -> FsResult<()> {
         let from = to_wide(partial);
         let to = to_wide(destination);
@@ -583,6 +662,24 @@ mod platform {
         Err(FsSafetyError::UnsupportedPlatform {
             platform: std::env::consts::OS,
         })
+    }
+
+    /// Degraded capture: size and mtime only, and honestly labelled as such
+    /// (no identity), since this platform has no implementation yet.
+    pub(super) fn capture_fingerprint(path: &Path) -> FsResult<df_domain::FileFingerprint> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| FsSafetyError::io(path, e))?;
+        let modified_at_ms = metadata.modified().ok().and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as i64)
+        });
+        Ok(df_domain::FileFingerprint::V2(df_domain::FingerprintV2 {
+            size_bytes: metadata.len(),
+            modified_at_ms,
+            change_time_ms: None,
+            attributes: 0,
+            identity: None,
+        }))
     }
 }
 
@@ -666,6 +763,62 @@ mod tests {
                 .resolve_destination_without_following_links(&file)
                 .unwrap();
             assert!(dest.absolute().starts_with(root.path()));
+        }
+
+        /// P0-4 / threat T6: the reason v2 exists. Swap a file for a different
+        /// one of the same size, restoring the mtime the way any copy tool
+        /// would. v1 (`size` + `mtime`) saw nothing; v2 catches it via file id.
+        #[test]
+        fn a_same_size_same_mtime_substitution_is_detected() {
+            use df_domain::{FileFingerprint, FingerprintVerdict};
+
+            let (_tmp, root) = root();
+            let victim = root.path().join("contrato.txt");
+            std::fs::write(&victim, b"ORIGINAL-1234567890").unwrap();
+            let before = capture_fingerprint(&victim).unwrap();
+
+            // Replace it with a different file of identical length, then put
+            // the original modification time back.
+            let stolen_mtime = std::fs::metadata(&victim).unwrap().modified().unwrap();
+            std::fs::remove_file(&victim).unwrap();
+            std::fs::write(&victim, b"FALSIFICADO-7890123").unwrap();
+            let handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&victim)
+                .unwrap();
+            handle.set_modified(stolen_mtime).unwrap();
+            drop(handle);
+
+            let after = capture_fingerprint(&victim).unwrap();
+
+            // The trap: on these two, v1's fields agree.
+            assert_eq!(before.size_bytes(), after.size_bytes(), "sizes must match");
+            assert_eq!(
+                before.modified_at_ms(),
+                after.modified_at_ms(),
+                "the test must actually restore the mtime, or it proves nothing"
+            );
+
+            // v2 still catches it, because the file id changed.
+            assert_eq!(
+                FileFingerprint::compare(&before, &after),
+                FingerprintVerdict::Changed,
+                "a same-size same-mtime substitution went undetected"
+            );
+        }
+
+        #[test]
+        fn a_captured_fingerprint_carries_physical_identity() {
+            use df_domain::FingerprintGuarantee;
+
+            let (_tmp, root) = root();
+            let file = root.path().join("x.txt");
+            std::fs::write(&file, b"hola").unwrap();
+            let fp = capture_fingerprint(&file).unwrap();
+            assert_eq!(fp.guarantee(), FingerprintGuarantee::Physical);
+            assert_eq!(fp.size_bytes(), 4);
+            // And it round-trips through its stored token.
+            assert_eq!(df_domain::FileFingerprint::parse(&fp.token()).unwrap(), fp);
         }
 
         #[test]

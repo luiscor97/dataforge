@@ -219,21 +219,26 @@ pub fn verify_project(
             continue;
         };
         let source = root.join(&occurrence.relative_path);
-        let current = std::fs::symlink_metadata(&source).ok().map(|metadata| {
-            FileFingerprint {
-                size_bytes: metadata.len(),
-                modified_at_fs: metadata.modified().ok().map(Into::into),
-            }
-            .token()
-        });
-        if current.as_deref() != Some(occurrence.fingerprint.as_str()) {
+        // Parsed comparison against the snapshot's fingerprint (ADR-0019); a
+        // v1 token from an older snapshot is compared on what it carries and
+        // never mistaken for a proven match.
+        let stored = FileFingerprint::parse(&occurrence.fingerprint).ok();
+        let current = df_fs_safety::capture_fingerprint(&source).ok();
+        let changed = match (&stored, &current) {
+            (Some(stored), Some(current)) => FileFingerprint::compare(stored, current).is_changed(),
+            // Unreadable now, or an unparsable stored token: both are worth
+            // reporting rather than silently treating as unchanged.
+            _ => true,
+        };
+        if changed {
             findings.push(VerificationFinding {
                 kind: "ORIGIN_CHANGED".to_string(),
                 severity: SEVERITY_WARNING.to_string(),
                 subject: occurrence.relative_path.clone(),
-                detail: match current {
-                    Some(_) => "source file changed since the snapshot".to_string(),
-                    None => "source file is no longer readable".to_string(),
+                detail: match (stored, current) {
+                    (Some(_), Some(_)) => "source file changed since the snapshot".to_string(),
+                    (None, _) => "the snapshot's fingerprint is unreadable".to_string(),
+                    (_, None) => "source file is no longer readable".to_string(),
                 },
             });
         }

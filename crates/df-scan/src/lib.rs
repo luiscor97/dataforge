@@ -409,11 +409,22 @@ impl Walker<'_> {
         let size_bytes = metadata.map(|m| m.len()).unwrap_or(0);
         let created_at_fs = metadata.and_then(|m| m.created().ok()).map(to_timestamp);
         let modified_at_fs = metadata.and_then(|m| m.modified().ok()).map(to_timestamp);
-        let fingerprint = FileFingerprint {
-            size_bytes,
-            modified_at_fs,
-        }
-        .token();
+        // v2 fingerprint with physical identity when the filesystem offers
+        // one (ADR-0019). A stat failure degrades to size+mtime rather than
+        // aborting the scan: a partial record beats no record.
+        let fingerprint =
+            df_fs_safety::capture_fingerprint(&compose_path(&root.absolute_path, &relative_path))
+                .map(|fp| fp.token())
+                .unwrap_or_else(|_| {
+                    FileFingerprint::V2(df_domain::FingerprintV2 {
+                        size_bytes,
+                        modified_at_ms: modified_at_fs.map(|t: Timestamp| t.timestamp_millis()),
+                        change_time_ms: None,
+                        attributes: 0,
+                        identity: None,
+                    })
+                    .token()
+                });
         let absolute = compose_path(&root.absolute_path, &relative_path);
         let extension = Path::new(&name)
             .extension()
@@ -628,7 +639,18 @@ mod tests {
         assert_eq!(acta.size_bytes, 3);
         assert_eq!(acta.depth, 3);
         assert!(!acta.name_is_lossy);
-        assert!(acta.fingerprint.starts_with("v1:3:"));
+        // The scanner now records a v2 fingerprint (ADR-0019): it parses, its
+        // size matches, and on a real NTFS volume it carries the physical
+        // identity that makes a same-size same-mtime swap detectable.
+        let fingerprint = FileFingerprint::parse(&acta.fingerprint).expect("fingerprint parses");
+        assert!(matches!(fingerprint, FileFingerprint::V2(_)));
+        assert_eq!(fingerprint.size_bytes(), 3);
+        #[cfg(windows)]
+        assert_eq!(
+            fingerprint.guarantee(),
+            df_domain::FingerprintGuarantee::Physical,
+            "a local NTFS file must yield a physical identity"
+        );
         assert!(acta.modified_at_fs.is_some());
         assert!(acta.path_length > 0);
     }

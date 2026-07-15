@@ -5,6 +5,7 @@
 //! is later persisted and audited by `df-db` / `df-ledger`.
 
 pub mod event;
+pub mod fingerprint;
 pub mod ids;
 pub mod inventory;
 pub mod manifest;
@@ -15,13 +16,17 @@ pub mod source_root;
 pub mod state;
 
 pub use event::{Actor, AuditEvent};
+pub use fingerprint::{
+    FileFingerprint, FingerprintGuarantee, FingerprintV1, FingerprintV2, FingerprintVerdict,
+    PhysicalIdentity,
+};
 pub use ids::{
     ContentId, DuplicateSetId, EventId, FindingId, FolderId, HashJobId, OccurrenceId, OperationId,
     PlanId, ProjectId, ScanRunId, SnapshotId, SourceRootId, VerificationRunId,
 };
 pub use inventory::{
-    ContentObject, FileFingerprint, FolderRecord, HashState, PathOccurrence, ScanCounters,
-    ScanEntryStatus, ScanRun, ScanRunStatus,
+    ContentObject, FolderRecord, HashState, PathOccurrence, ScanCounters, ScanEntryStatus, ScanRun,
+    ScanRunStatus,
 };
 pub use manifest::ManifestEntry;
 pub use plan::{

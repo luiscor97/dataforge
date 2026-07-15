@@ -781,6 +781,7 @@ dependencies = [
 name = "df-fs-safety"
 version = "0.0.1-dev"
 dependencies = [
+ "df-domain",
  "df-error",
  "serde",
  "tempfile",
@@ -797,6 +798,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-ledger",
  "df-scan",
  "hex",
@@ -844,6 +846,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-ledger",
  "serde",
  "serde_json",
