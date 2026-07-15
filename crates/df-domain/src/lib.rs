@@ -5,6 +5,7 @@
 //! is later persisted and audited by `df-db` / `df-ledger`.
 
 pub mod context;
+pub mod duplicate_policy;
 pub mod event;
 pub mod fingerprint;
 pub mod ids;
@@ -19,6 +20,9 @@ pub mod state;
 pub mod structure;
 
 pub use context::{ContextKind, FolderContext};
+pub use duplicate_policy::{
+    decide as decide_duplicate, DuplicateDisposition, DuplicateKind, DuplicatePolicy, Placement,
+};
 pub use event::{Actor, AuditEvent};
 pub use fingerprint::{
     FileFingerprint, FingerprintGuarantee, FingerprintV1, FingerprintV2, FingerprintVerdict,
