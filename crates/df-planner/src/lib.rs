@@ -985,4 +985,81 @@ mod tests {
         assert_eq!(outcome.skipped_represented, 0);
         assert_eq!(outcome.copies, 3);
     }
+
+    /// RFC-0001 §19.4: "No eliminar una rama completa hasta identificar
+    /// contenido único". This is the acceptance criterion "preservar contenido
+    /// único" and it must hold under the most aggressive policy available.
+    ///
+    /// Scenario: a grafted copy of a working folder that ALSO carries one file
+    /// the original never had. Consolidating the branch must never take that
+    /// file with it.
+    #[test]
+    fn unique_content_in_a_cloned_branch_is_never_consolidated_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("casos")).unwrap();
+        // "casos - copia" is a generic container (copy-suffix marker).
+        std::fs::create_dir_all(origin.join("casos - copia")).unwrap();
+
+        std::fs::write(origin.join("casos").join("escrito.txt"), b"shared payload").unwrap();
+        std::fs::write(
+            origin.join("casos - copia").join("escrito.txt"),
+            b"shared payload",
+        )
+        .unwrap();
+        // The file that only exists in the copied branch.
+        std::fs::write(
+            origin.join("casos - copia").join("solo-aqui.txt"),
+            b"this exists nowhere else",
+        )
+        .unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Rama injertada",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+
+        let outcome = create_plan(
+            &mut db,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateGenericCopies,
+        )
+        .unwrap();
+
+        // The duplicated file in the generic copy is consolidated...
+        assert_eq!(outcome.skipped_represented, 1);
+
+        // ...but the unique file is planned for copy, no matter the policy.
+        let plan = plans::current_plan(&db, project.id).unwrap().unwrap();
+        let operations = plans::list_operations(&db, plan.id).unwrap();
+        let unique = operations
+            .iter()
+            .find(|o| {
+                o.destination_relative_path
+                    .as_deref()
+                    .is_some_and(|d| d.ends_with("solo-aqui.txt"))
+            })
+            .expect("the unique file must have a copy operation with a destination");
+        assert_eq!(unique.operation_type, OperationType::CopyActive);
+
+        // It was never even a candidate for consolidation: it is not a duplicate.
+        assert!(
+            !operations
+                .iter()
+                .any(|o| o.operation_type == OperationType::SkipRepresented
+                    && o.source_occurrence == unique.source_occurrence),
+            "unique content must never be skipped"
+        );
+        // Coverage still holds.
+        assert!(validate_plan(&db).unwrap().ok);
+    }
 }
