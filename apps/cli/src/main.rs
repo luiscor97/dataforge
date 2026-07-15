@@ -13,7 +13,7 @@ use df_error::DfResult;
 use df_facade::{
     AnalyzeOutcome, ApproveOutcome, AuditReport, ContextReport, CreateProjectRequest,
     DuplicateReport, ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus,
-    ScanOutcome, TreeCloneReport, VerifyOutcome,
+    ScanOutcome, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -159,6 +159,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Folders that share content without being identical (partial clones).
+    TreeRelations {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Generic low-value folders (Downloads, Backup, copies, …) and penalties.
     Contexts {
         /// Project directory.
@@ -192,6 +198,7 @@ enum Output {
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
     TreeClones(TreeCloneReport),
+    TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
     Audit(AuditReport),
 }
@@ -253,6 +260,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::TreeClones { path } => {
                 df_facade::tree_clone_report(path).map(Output::TreeClones)
+            }
+            ReportCommand::TreeRelations { path } => {
+                df_facade::tree_relation_report(path).map(Output::TreeRelations)
             }
             ReportCommand::Contexts { path } => {
                 df_facade::context_report(path).map(Output::Contexts)
@@ -440,6 +450,45 @@ fn print_duplicates(report: &DuplicateReport) {
     }
 }
 
+fn print_tree_relations(report: &TreeRelationReport) {
+    println!("Snapshot        : {}", report.snapshot_id);
+    println!("Partial clones  : {}", report.partial_clones);
+    println!("Embedded trees  : {}", report.embedded);
+    for relation in &report.relations {
+        println!();
+        println!(
+            "  {} — {:.0}% shared ({} file(s), {} bytes)",
+            relation.relationship,
+            relation.similarity * 100.0,
+            relation.shared_files,
+            relation.shared_bytes
+        );
+        println!("    A: {}", relation.path_a);
+        println!("    B: {}", relation.path_b);
+        match relation.contained.as_deref() {
+            Some("A") => println!(
+                "    A is fully contained in B ({} file(s) only in B)",
+                relation.unique_b_files
+            ),
+            Some("B") => println!(
+                "    B is fully contained in A ({} file(s) only in A)",
+                relation.unique_a_files
+            ),
+            _ => println!(
+                "    Only in A: {} file(s) | Only in B: {} file(s) \
+                 — dropping either side loses data (RFC-0001 §19.4)",
+                relation.unique_a_files, relation.unique_b_files
+            ),
+        }
+    }
+    if report.relations.is_empty() {
+        println!("No partial or embedded tree relations found.");
+    } else {
+        println!();
+        println!("Evidence only: nothing here is proposed for removal.");
+    }
+}
+
 fn print_tree_clones(report: &TreeCloneReport) {
     println!("Snapshot        : {}", report.snapshot_id);
     println!("Clone sets      : {}", report.sets.len());
@@ -500,6 +549,7 @@ fn print_human(output: &Output) {
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
         Output::TreeClones(report) => print_tree_clones(report),
+        Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
         Output::Audit(report) => print_audit(report),
     }
@@ -575,8 +625,11 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 0
             }
         }
+        // Evidence reports always succeed: finding duplicates, clones or
+        // partial clones is information, not a failure.
         Output::Duplicates(_) => 0,
         Output::TreeClones(_) => 0,
+        Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,
     }
 }

@@ -689,6 +689,46 @@ pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     })
 }
 
+/// Folders that share content without being identical (RFC-0001 §19.3).
+///
+/// Evidence only, and the most important kind: a `PARTIAL_TREE_CLONE` has
+/// unique content on **both** sides, so dropping either branch loses data
+/// (§19.4). Nothing here proposes an action.
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeRelationReport {
+    pub snapshot_id: String,
+    /// Pairs where both sides hold something the other does not.
+    pub partial_clones: u64,
+    /// Pairs where one subtree's content is wholly inside the other's.
+    pub embedded: u64,
+    pub relations: Vec<df_db::structure::TreeRelationView>,
+}
+
+/// Report the tree relations of the latest complete snapshot.
+pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let relations = df_db::structure::tree_relation_views(&db, snapshot.id)?;
+    let partial_clones = relations
+        .iter()
+        .filter(|r| r.relationship == "PARTIAL_TREE_CLONE")
+        .count() as u64;
+    let embedded = relations
+        .iter()
+        .filter(|r| r.relationship == "TREE_EMBEDDED")
+        .count() as u64;
+    Ok(TreeRelationReport {
+        snapshot_id: snapshot.id.to_string(),
+        partial_clones,
+        embedded,
+        relations,
+    })
+}
+
 /// Generic low-value folders of the latest snapshot (RFC-0001 §18.3).
 ///
 /// Evidence only: a generic classification lowers a folder's ranking as a

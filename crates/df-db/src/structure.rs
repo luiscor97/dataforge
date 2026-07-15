@@ -1011,3 +1011,68 @@ pub fn tree_relations(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<df_domai
         .collect();
     rows.into_iter().collect()
 }
+
+/// A tree relation with both folder paths resolved, ready to show a human.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TreeRelationView {
+    pub path_a: String,
+    pub path_b: String,
+    /// `PARTIAL_TREE_CLONE` or `TREE_EMBEDDED`.
+    pub relationship: String,
+    /// For `TREE_EMBEDDED`, which side is inside the other (`A` or `B`).
+    pub contained: Option<String>,
+    pub shared_files: u64,
+    /// Contents only in `path_a`: what would be lost by dropping that side.
+    pub unique_a_files: u64,
+    /// Contents only in `path_b`: what would be lost by dropping that side.
+    pub unique_b_files: u64,
+    pub shared_bytes: u64,
+    pub similarity: f64,
+}
+
+/// Read the tree relations of a snapshot with their folder paths resolved,
+/// most similar first (§19.3).
+pub fn tree_relation_views(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<TreeRelationView>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ra.absolute_path, fa.relative_path,
+                    rb.absolute_path, fb.relative_path,
+                    tr.relationship, tr.contained, tr.shared_files,
+                    tr.unique_a_files, tr.unique_b_files, tr.shared_bytes,
+                    tr.similarity
+             FROM tree_relations tr
+             JOIN folders fa ON fa.id = tr.folder_a
+             JOIN folders fb ON fb.id = tr.folder_b
+             JOIN source_roots ra ON ra.id = fa.source_root_id
+             JOIN source_roots rb ON rb.id = fb.source_root_id
+             WHERE tr.snapshot_id = ?1
+             ORDER BY tr.similarity DESC, tr.shared_files DESC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            let join = |root: String, relative: String| {
+                if relative.is_empty() {
+                    root
+                } else {
+                    format!("{root}{}{relative}", std::path::MAIN_SEPARATOR)
+                }
+            };
+            Ok(TreeRelationView {
+                path_a: join(row.get(0)?, row.get(1)?),
+                path_b: join(row.get(2)?, row.get(3)?),
+                relationship: row.get(4)?,
+                contained: row.get(5)?,
+                shared_files: row.get::<_, i64>(6)? as u64,
+                unique_a_files: row.get::<_, i64>(7)? as u64,
+                unique_b_files: row.get::<_, i64>(8)? as u64,
+                shared_bytes: row.get::<_, i64>(9)? as u64,
+                similarity: row.get(10)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
