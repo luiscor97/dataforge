@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/df-error",
     "crates/df-domain",
+    "crates/df-fs-safety",
     "crates/df-ledger",
     "crates/df-db",
     "crates/df-scan",
@@ -19,6 +20,7 @@ members = [
 default-members = [
     "crates/df-error",
     "crates/df-domain",
+    "crates/df-fs-safety",
     "crates/df-ledger",
     "crates/df-db",
     "crates/df-scan",
@@ -42,6 +44,7 @@ rust-version = "1.82"
 # Internal crates
 df-error = { path = "crates/df-error" }
 df-domain = { path = "crates/df-domain" }
+df-fs-safety = { path = "crates/df-fs-safety" }
 df-ledger = { path = "crates/df-ledger" }
 df-db = { path = "crates/df-db" }
 df-scan = { path = "crates/df-scan" }

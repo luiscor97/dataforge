@@ -777,6 +777,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "df-fs-safety"
+version = "0.0.1-dev"
+dependencies = [
+ "df-error",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "df-hash"
 version = "0.0.1-dev"
 dependencies = [

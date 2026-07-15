@@ -1,0 +1,25 @@
+[package]
+name = "df-fs-safety"
+description = "Safe filesystem boundary for DataForge: reparse-aware path resolution, physical identity and no-replace finalization"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-error = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Windows identity (GetFileInformationByHandle) and the no-replace rename
+# (MoveFileExW without MOVEFILE_REPLACE_EXISTING). Official Microsoft crate.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
