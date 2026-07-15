@@ -48,6 +48,16 @@ impl Db {
         Ok(db)
     }
 
+    /// Raw connection for security tests that must simulate an attacker with
+    /// the `.sqlite` file in hand (dropping triggers, forging rows).
+    ///
+    /// Behind the `test-support` feature: a production build cannot reach it,
+    /// so the "only df-db issues SQL" rule still holds where it matters.
+    #[cfg(feature = "test-support")]
+    pub fn conn_for_tests(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
     pub(crate) fn conn(&self) -> &rusqlite::Connection {
         &self.conn
     }

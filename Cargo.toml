@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/df-error",
     "crates/df-domain",
+    "crates/df-fs-safety",
     "crates/df-ledger",
     "crates/df-db",
     "crates/df-scan",
@@ -19,6 +20,7 @@ members = [
 default-members = [
     "crates/df-error",
     "crates/df-domain",
+    "crates/df-fs-safety",
     "crates/df-ledger",
     "crates/df-db",
     "crates/df-scan",
@@ -40,16 +42,17 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 # Internal crates
-df-error = { path = "crates/df-error" }
-df-domain = { path = "crates/df-domain" }
-df-ledger = { path = "crates/df-ledger" }
-df-db = { path = "crates/df-db" }
-df-scan = { path = "crates/df-scan" }
-df-hash = { path = "crates/df-hash" }
-df-planner = { path = "crates/df-planner" }
-df-executor = { path = "crates/df-executor" }
-df-verifier = { path = "crates/df-verifier" }
-df-facade = { path = "crates/df-facade" }
+df-error = { path = "crates/df-error", version = "0.0.1-dev" }
+df-domain = { path = "crates/df-domain", version = "0.0.1-dev" }
+df-fs-safety = { path = "crates/df-fs-safety", version = "0.0.1-dev" }
+df-ledger = { path = "crates/df-ledger", version = "0.0.1-dev" }
+df-db = { path = "crates/df-db", version = "0.0.1-dev" }
+df-scan = { path = "crates/df-scan", version = "0.0.1-dev" }
+df-hash = { path = "crates/df-hash", version = "0.0.1-dev" }
+df-planner = { path = "crates/df-planner", version = "0.0.1-dev" }
+df-executor = { path = "crates/df-executor", version = "0.0.1-dev" }
+df-verifier = { path = "crates/df-verifier", version = "0.0.1-dev" }
+df-facade = { path = "crates/df-facade", version = "0.0.1-dev" }
 
 # External crates
 serde = { version = "1", features = ["derive"] }

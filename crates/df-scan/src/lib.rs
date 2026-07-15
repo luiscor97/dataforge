@@ -409,21 +409,42 @@ impl Walker<'_> {
         let size_bytes = metadata.map(|m| m.len()).unwrap_or(0);
         let created_at_fs = metadata.and_then(|m| m.created().ok()).map(to_timestamp);
         let modified_at_fs = metadata.and_then(|m| m.modified().ok()).map(to_timestamp);
-        let fingerprint = FileFingerprint {
-            size_bytes,
-            modified_at_fs,
-        }
-        .token();
+        // v2 fingerprint with physical identity when the filesystem offers
+        // one (ADR-0019). A stat failure degrades to size+mtime rather than
+        // aborting the scan: a partial record beats no record.
+        let fingerprint =
+            df_fs_safety::capture_fingerprint(&compose_path(&root.absolute_path, &relative_path))
+                .map(|fp| fp.token())
+                .unwrap_or_else(|_| {
+                    FileFingerprint::V2(df_domain::FingerprintV2 {
+                        size_bytes,
+                        modified_at_ms: modified_at_fs.map(|t: Timestamp| t.timestamp_millis()),
+                        change_time_ms: None,
+                        attributes: 0,
+                        identity: None,
+                    })
+                    .token()
+                });
         let absolute = compose_path(&root.absolute_path, &relative_path);
         let extension = Path::new(&name)
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase());
+
+        // The exact bytes of the relative path (ADR-0020). `relative_path`
+        // below is the display form and may be lossy; this is what will reopen
+        // the file. Derived from the absolute path we actually walked, so it
+        // is what the OS gave us, not a re-encoding of a damaged string.
+        let raw_relative_path = absolute
+            .strip_prefix(&root.absolute_path)
+            .ok()
+            .map(|rel| df_domain::RawPath::from_os_str(rel.as_os_str()));
 
         self.batch.occurrences.push(PathOccurrence {
             id: OccurrenceId::new(),
             snapshot_id: self.snapshot_id,
             source_root_id: root.id,
             relative_path,
+            raw_relative_path,
             parent_relative_path: parent.to_string(),
             normalized_name: name.to_lowercase(),
             file_name: name,
@@ -628,7 +649,18 @@ mod tests {
         assert_eq!(acta.size_bytes, 3);
         assert_eq!(acta.depth, 3);
         assert!(!acta.name_is_lossy);
-        assert!(acta.fingerprint.starts_with("v1:3:"));
+        // The scanner now records a v2 fingerprint (ADR-0019): it parses, its
+        // size matches, and on a real NTFS volume it carries the physical
+        // identity that makes a same-size same-mtime swap detectable.
+        let fingerprint = FileFingerprint::parse(&acta.fingerprint).expect("fingerprint parses");
+        assert!(matches!(fingerprint, FileFingerprint::V2(_)));
+        assert_eq!(fingerprint.size_bytes(), 3);
+        #[cfg(windows)]
+        assert_eq!(
+            fingerprint.guarantee(),
+            df_domain::FingerprintGuarantee::Physical,
+            "a local NTFS file must yield a physical identity"
+        );
         assert!(acta.modified_at_fs.is_some());
         assert!(acta.path_length > 0);
     }

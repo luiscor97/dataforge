@@ -9,7 +9,7 @@
 //! entry(folder) = "D\0" + normalized_name + "\0" + child_folder_signature
 //! ```
 //!
-//! BLAKE3 is DataForge's tree hash (ADR-0007 / ADR-0018). NUL cannot appear
+//! BLAKE3 is DataForge's tree hash (ADR-0007 / ADR-0023). NUL cannot appear
 //! in a filename, so the separator is injection-proof. A folder is *complete*
 //! only when every descendant file has a content hash and the subtree has no
 //! error entry or unfollowed reparse point; only complete folders may form a

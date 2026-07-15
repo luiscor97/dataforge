@@ -729,6 +729,7 @@ dependencies = [
  "df-error",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 
@@ -748,6 +749,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-hash",
  "df-ledger",
  "df-planner",
@@ -767,6 +769,7 @@ dependencies = [
  "df-domain",
  "df-error",
  "df-executor",
+ "df-fs-safety",
  "df-hash",
  "df-ledger",
  "df-planner",
@@ -775,6 +778,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "df-fs-safety"
+version = "0.0.1-dev"
+dependencies = [
+ "df-domain",
+ "df-error",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -786,6 +802,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-ledger",
  "df-scan",
  "hex",
@@ -814,6 +831,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-hash",
  "df-ledger",
  "df-scan",
@@ -832,6 +850,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-ledger",
  "serde",
  "serde_json",
@@ -847,6 +866,7 @@ dependencies = [
  "df-domain",
  "df-error",
  "df-executor",
+ "df-fs-safety",
  "df-hash",
  "df-ledger",
  "df-planner",

@@ -49,30 +49,6 @@ impl ScanEntryStatus {
     }
 }
 
-/// Physical fingerprint of a file (RFC-0001 §14.1).
-///
-/// Cheap identity used to detect that a file changed between scan and hash
-/// (`SOURCE_CHANGED_DURING_HASH`) and to skip re-hashing unchanged files.
-/// It is *not* a content hash.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileFingerprint {
-    pub size_bytes: u64,
-    pub modified_at_fs: Option<Timestamp>,
-}
-
-impl FileFingerprint {
-    /// Canonical token stored in SQLite and compared verbatim.
-    ///
-    /// Versioned (`v1:`) so a future fingerprint that includes volume/file
-    /// identity (RFC-0001 §13.5) never compares equal to an old one.
-    pub fn token(&self) -> String {
-        match self.modified_at_fs {
-            Some(ts) => format!("v1:{}:{}", self.size_bytes, ts.timestamp_millis()),
-            None => format!("v1:{}:none", self.size_bytes),
-        }
-    }
-}
-
 /// A directory seen during a scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderRecord {
@@ -101,6 +77,10 @@ pub struct PathOccurrence {
     /// as `source_root.absolute_path ∪ relative_path`; it is not duplicated
     /// in storage so root relocation cannot desynchronise the inventory.
     pub relative_path: String,
+    /// The exact bytes of `relative_path` (ADR-0020). `relative_path` above is
+    /// the *display* form and may be lossy; this is the one that reopens the
+    /// file. `None` only for snapshots taken before v0.1.1.
+    pub raw_relative_path: Option<crate::raw_path::RawPath>,
     pub parent_relative_path: String,
     pub file_name: String,
     /// Lowercased name used for grouping and comparison (RFC-0001 §13.4);
@@ -247,41 +227,6 @@ impl ScanRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fingerprint_token_is_versioned_and_stable() {
-        let ts: Timestamp = "2026-07-14T10:00:00.123Z".parse().unwrap();
-        let fp = FileFingerprint {
-            size_bytes: 42,
-            modified_at_fs: Some(ts),
-        };
-        assert_eq!(fp.token(), format!("v1:42:{}", ts.timestamp_millis()));
-        let no_mtime = FileFingerprint {
-            size_bytes: 42,
-            modified_at_fs: None,
-        };
-        assert_eq!(no_mtime.token(), "v1:42:none");
-        assert_ne!(fp.token(), no_mtime.token());
-    }
-
-    #[test]
-    fn fingerprint_changes_when_size_or_mtime_change() {
-        let ts: Timestamp = "2026-07-14T10:00:00.000Z".parse().unwrap();
-        let base = FileFingerprint {
-            size_bytes: 10,
-            modified_at_fs: Some(ts),
-        };
-        let bigger = FileFingerprint {
-            size_bytes: 11,
-            ..base
-        };
-        let later = FileFingerprint {
-            modified_at_fs: Some(ts + chrono::Duration::milliseconds(1)),
-            ..base
-        };
-        assert_ne!(base.token(), bigger.token());
-        assert_ne!(base.token(), later.token());
-    }
 
     #[test]
     fn status_enums_round_trip() {

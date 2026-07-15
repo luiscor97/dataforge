@@ -1,9 +1,9 @@
-# ADR-0020 — Representante lógico de un conjunto de duplicados
+# ADR-0025 — Representante lógico de un conjunto de duplicados
 
 **Estado:** Aceptada
 **Fecha:** 2026-07-14
 **Relacionada con:** RFC-0001 §15.5, §15.2, §18.3, §5.3, reglas 8 y 9;
-ADR-0019
+ADR-0024
 
 ## Contexto
 
@@ -11,7 +11,7 @@ Milestone 0.1 ya detecta duplicados exactos (mismo tamaño, mismo SHA-256) y
 los lista como evidencia, pero no dice *cuál* de las copias es la buena. El
 §15.5 define un "representante lógico" con una puntuación configurable que
 premia el contexto específico, el nombre limpio y la ruta canónica, y penaliza
-Descargas, Escritorio, Backup, Copia, rutas injertadas y temporales. ADR-0019
+Descargas, Escritorio, Backup, Copia, rutas injertadas y temporales. ADR-0024
 acaba de aportar la mitad negativa de esa fórmula: las penalizaciones de
 ubicación por carpeta (§18.3). Esta rebanada las usa para cerrar el criterio
 "políticas de duplicado" de M0.2.
@@ -51,7 +51,7 @@ ubicación por carpeta (§18.3). Esta rebanada las usa para cerrar el criterio
    `+ contexto específico` y `+ fecha coherente` requieren el grafo de
    entidades (§18.2); `+ menor anomalía` requiere el detector de anomalías; y
    `- ruta injertada` requiere las relaciones de árbol parciales/embebidas de
-   ADR-0018. Ninguna se simula.
+   ADR-0023. Ninguna se simula.
 
 5. **Evidencia por decisión (§5.3).** Junto al representante se guarda un
    `reason` legible ("outside any generic folder; clean file name; path depth
@@ -88,7 +88,7 @@ ubicación por carpeta (§18.3). Esta rebanada las usa para cerrar el criterio
 
 - Cierra el criterio "políticas de duplicado" de M0.2 en su versión segura:
   DataForge ya sabe *qué copia recomendaría* y lo justifica, sin tocar nada.
-- La calidad de la elección depende directamente de ADR-0019: si una carpeta
+- La calidad de la elección depende directamente de ADR-0024: si una carpeta
   genérica no está en la tabla de marcadores, su contenido no se penaliza.
   Ampliar marcadores mejora esta decisión sin cambiar este algoritmo.
 - Deuda aceptada: las señales aplazadas del punto 4; la consolidación guiada

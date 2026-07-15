@@ -119,9 +119,9 @@ fn insert_occurrence(tx: &Transaction<'_>, occ: &PathOccurrence) -> DfResult<()>
             (id, snapshot_id, source_root_id, relative_path, parent_relative_path,
              file_name, normalized_name, extension, size_bytes, created_at_fs,
              modified_at_fs, attributes, path_length, depth, fingerprint,
-             scan_status, error, name_is_lossy, created_at)
+             scan_status, error, name_is_lossy, raw_relative_path, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             occ.id.to_string(),
             occ.snapshot_id.to_string(),
@@ -141,6 +141,7 @@ fn insert_occurrence(tx: &Transaction<'_>, occ: &PathOccurrence) -> DfResult<()>
             occ.scan_status.as_str(),
             occ.error,
             occ.name_is_lossy as i64,
+            occ.raw_relative_path.as_ref().map(|r| r.to_blob()),
             to_stored_timestamp(chrono::Utc::now()),
         ],
     )
@@ -404,7 +405,7 @@ pub fn list_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<PathOc
                     parent_relative_path, file_name, normalized_name, extension,
                     size_bytes, created_at_fs, modified_at_fs, attributes,
                     path_length, depth, fingerprint, scan_status, error,
-                    name_is_lossy
+                    name_is_lossy, raw_relative_path
              FROM path_occurrences
              WHERE snapshot_id = ?1
              ORDER BY relative_path",
@@ -431,6 +432,7 @@ pub fn list_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<PathOc
                 row.get::<_, String>(15)?,
                 row.get::<_, Option<String>>(16)?,
                 row.get::<_, i64>(17)?,
+                row.get::<_, Option<Vec<u8>>>(18)?,
             ))
         })
         .map_err(db_err)?
@@ -454,12 +456,17 @@ pub fn list_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<PathOc
                 scan_status,
                 error,
                 name_is_lossy,
+                raw_relative_path,
             ) = raw.map_err(db_err)?;
             Ok(PathOccurrence {
                 id: OccurrenceId::from_str(&id)?,
                 snapshot_id: SnapshotId::from_str(&snapshot)?,
                 source_root_id: SourceRootId::from_str(&root)?,
                 relative_path,
+                raw_relative_path: raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 parent_relative_path,
                 file_name,
                 normalized_name,

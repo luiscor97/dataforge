@@ -8,11 +8,12 @@
 //! (§26.2) and approval freezes the plan under a canonical SHA-256 (§26.4).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use df_db::{plans, repository, Db};
 use df_domain::{
-    Actor, ApprovalState, ExecutionState, OperationType, Plan, PlanOperation, PlanStatus,
-    ProjectState, RiskLevel, SourceRootId,
+    Actor, ApprovalState, ExecutionState, ManifestEntry, OperationType, Plan, PlanOperation,
+    PlanStatus, ProjectState, RiskLevel, SourceRootId,
 };
 use df_error::{DfError, DfResult};
 use serde::Serialize;
@@ -201,8 +202,21 @@ pub fn approve_plan(db: &mut Db, actor: Actor) -> DfResult<ApproveOutcome> {
     validate_operations(&operations)?;
 
     repository::update_project_state(db, ProjectState::PlanReview, actor)?;
-    let sha256 = plan_operations_sha256(&operations);
-    plans::approve_plan(db, &plan, &sha256, actor)?;
+
+    // Freeze the whole execution contract (ADR-0018): snapshot the live
+    // inventory into manifest entries, stamp each source root's physical
+    // identity, and hash *that*. After this point the live tables are evidence,
+    // not the contract.
+    let mut entries = plans::build_manifest_entries(db, plan.id)?;
+    for entry in &mut entries {
+        entry.source_root_identity = entry
+            .source_root_path_snapshot
+            .as_ref()
+            .and_then(|path| df_fs_safety::identity_of(Path::new(path)).ok().flatten())
+            .map(|id| format!("{}:{}", id.volume_serial, id.file_index));
+    }
+    let sha256 = manifest_sha256(&entries);
+    plans::approve_plan(db, &plan, &entries, &sha256, actor)?;
     let project = repository::update_project_state(db, ProjectState::PlanApproved, actor)?;
 
     Ok(ApproveOutcome {
@@ -218,28 +232,22 @@ pub fn approve_plan(db: &mut Db, actor: Actor) -> DfResult<ApproveOutcome> {
 ///
 /// Shared with the verifier, which recomputes this hash to prove the plan
 /// was not modified after approval (§26.4, §28.2).
-pub fn serialize_plan_operations(operations: &[PlanOperation]) -> String {
-    let items: Vec<serde_json::Value> = operations
-        .iter()
-        .map(|op| {
-            serde_json::json!({
-                "sequence": op.sequence,
-                "operation_type": op.operation_type.as_str(),
-                "source_occurrence": op.source_occurrence.map(|id| id.to_string()),
-                "content_id": op.content_id.map(|id| id.to_string()),
-                "destination": op.destination_relative_path,
-                "idempotency_key": op.idempotency_key,
-            })
-        })
-        .collect();
+/// Canonical JSON of the execution manifest (RFC-0001 §26.4, ADR-0018).
+///
+/// This is what approval signs. It replaced an earlier version that covered
+/// only identifiers (occurrence id, content id, destination): those bound the
+/// paperwork while the executor resolved the actual bytes to read and the
+/// hashes to expect from live tables, so a post-approval edit to
+/// `content_objects.sha256` changed the work without moving this hash. Now
+/// every field that decides what is read, expected, written or done is inside.
+pub fn serialize_manifest(entries: &[ManifestEntry]) -> String {
+    let items: Vec<serde_json::Value> = entries.iter().map(|e| e.canonical_value()).collect();
     df_ledger::canonical_json(&serde_json::Value::Array(items))
 }
 
-/// SHA-256 of [`serialize_plan_operations`].
-pub fn plan_operations_sha256(operations: &[PlanOperation]) -> String {
-    hex::encode(sha2::Sha256::digest(
-        serialize_plan_operations(operations).as_bytes(),
-    ))
+/// SHA-256 of [`serialize_manifest`] — the approval hash.
+pub fn manifest_sha256(entries: &[ManifestEntry]) -> String {
+    hex::encode(sha2::Sha256::digest(serialize_manifest(entries).as_bytes()))
 }
 
 /// Deterministic idempotency key (§26.3).
@@ -643,9 +651,13 @@ mod tests {
             Some(approved.serialized_sha256.as_str())
         );
 
-        // The stored operations re-serialize to the same hash.
+        // The stored manifest re-serializes to the same hash: approval is
+        // reproducible from what was frozen (ADR-0018).
+        let manifest = plans::manifest(&db, plan.id).unwrap();
+        assert!(!manifest.is_empty(), "approval must freeze a manifest");
+        assert_eq!(manifest_sha256(&manifest), approved.serialized_sha256);
         let ops = plans::list_operations(&db, plan.id).unwrap();
-        assert_eq!(plan_operations_sha256(&ops), approved.serialized_sha256);
+        assert_eq!(manifest.len(), ops.len(), "every operation is frozen");
         assert!(ops.iter().all(|o| o.approval == ApprovalState::Approved));
 
         // A second approval attempt is rejected: the plan is frozen.

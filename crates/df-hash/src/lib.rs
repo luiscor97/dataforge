@@ -136,7 +136,22 @@ fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfRe
             );
         }
     };
-    if pre != job.fingerprint {
+    // Parsed comparison, never a string compare: a v1 token stored by an
+    // older version must not be mistaken for a v2 match, and the verdict
+    // distinguishes "same file, proven" from "nothing visible changed"
+    // (ADR-0019).
+    let stored = match FileFingerprint::parse(&job.fingerprint) {
+        Ok(stored) => stored,
+        Err(error) => {
+            return inventory::record_hash_failure(
+                db,
+                job.job_id,
+                HashState::Failed,
+                &format!("unreadable stored fingerprint: {error}"),
+            );
+        }
+    };
+    if FileFingerprint::compare(&stored, &pre).is_changed() {
         return inventory::record_hash_failure(
             db,
             job.job_id,
@@ -159,7 +174,7 @@ fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfRe
 
     // Post-check (§14.5): the fingerprint must not have moved while reading.
     match current_fingerprint(&path) {
-        Ok(post) if post == pre => {}
+        Ok(post) if !FileFingerprint::compare(&pre, &post).is_changed() => {}
         Ok(_) | Err(_) => {
             return inventory::record_hash_failure(
                 db,
@@ -199,13 +214,9 @@ fn stream_digests(path: &Path, buffer_bytes: usize) -> std::io::Result<Digests> 
     })
 }
 
-fn current_fingerprint(path: &Path) -> std::io::Result<String> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    Ok(FileFingerprint {
-        size_bytes: metadata.len(),
-        modified_at_fs: metadata.modified().ok().map(Into::into),
-    }
-    .token())
+/// Capture the current fingerprint (v2, ADR-0019).
+fn current_fingerprint(path: &Path) -> DfResult<FileFingerprint> {
+    Ok(df_fs_safety::capture_fingerprint(path)?)
 }
 
 /// Mirror of the scanner's path composition, including the Windows

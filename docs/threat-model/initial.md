@@ -3,6 +3,11 @@
 Ámbito: Milestone 0.0 (fundación). Se ampliará con cada hito; la lista
 completa de amenazas del producto está en RFC-0001 §37.
 
+> Las amenazas del sistema de archivos (junctions, symlinks, carreras TOCTOU,
+> manipulación del manifiesto, sustitución de origen, semántica de rename)
+> viven en [`filesystem-hardening.md`](filesystem-hardening.md), el modelo de
+> amenazas de v0.1.1-dev.
+
 ## Activos
 
 1. Los archivos de origen del usuario (valor probatorio/histórico).

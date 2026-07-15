@@ -257,6 +257,20 @@ fn status_from_db(
     })
 }
 
+/// Major version of a `major.minor.patch` string.
+fn major_version(text: &str) -> DfResult<u32> {
+    text.split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .ok_or_else(|| DfError::Validation(format!("unparsable schema_version `{text}`")))
+}
+
+/// Validate the marker (P1-3).
+///
+/// The marker is not the source of truth (SQLite is, rule 5), but it is the
+/// front door, and it is an ordinary file a user or another program can edit.
+/// So it is treated as untrusted input: every field is checked, and none of
+/// them is allowed to point the engine somewhere else.
 fn read_marker(project_dir: &Path) -> DfResult<ProjectMarker> {
     let marker_path = project_dir.join(PROJECT_MARKER_FILE);
     if !marker_path.is_file() {
@@ -269,17 +283,71 @@ fn read_marker(project_dir: &Path) -> DfResult<ProjectMarker> {
         std::fs::read_to_string(&marker_path).map_err(|e| DfError::io(marker_path.clone(), e))?;
     let marker: ProjectMarker = serde_json::from_str(&text)
         .map_err(|e| DfError::Serialization(format!("invalid project marker: {e}")))?;
+
     if marker.schema != MARKER_SCHEMA {
         return Err(DfError::Validation(format!(
-            "unexpected marker schema `{}`",
+            "unexpected marker schema `{}` (expected `{MARKER_SCHEMA}`)",
             marker.schema
         )));
+    }
+
+    // Version policy: same major = compatible (minor/patch are additive); a
+    // newer major was written by a DataForge that knows things this build does
+    // not, so refuse rather than guess; an older major would need a migration
+    // and none exists yet.
+    let ours = major_version(MARKER_SCHEMA_VERSION)?;
+    let theirs = major_version(&marker.schema_version)?;
+    match theirs.cmp(&ours) {
+        std::cmp::Ordering::Greater => {
+            return Err(DfError::Validation(format!(
+                "project marker schema_version {} was written by a newer DataForge; \
+                 this build supports {MARKER_SCHEMA_VERSION}. Upgrade DataForge to open it.",
+                marker.schema_version
+            )))
+        }
+        std::cmp::Ordering::Less => {
+            return Err(DfError::Validation(format!(
+                "project marker schema_version {} is older than {MARKER_SCHEMA_VERSION} \
+                 and no migration exists for it",
+                marker.schema_version
+            )))
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+
+    // `database_path` is kept for compatibility but is NOT authoritative: it
+    // must equal the constant exactly. Anything else — `..`, an absolute path,
+    // a different name — is a redirection attempt. (On Windows `join` with an
+    // absolute path silently discards the base, so this check is what stops
+    // the engine opening `C:\somewhere\else.sqlite`.)
+    if marker.database_path != PROJECT_DB_RELATIVE {
+        return Err(DfError::Validation(format!(
+            "project marker database_path `{}` must be exactly `{PROJECT_DB_RELATIVE}`; \
+             a marker cannot point the database anywhere else",
+            marker.database_path
+        )));
+    }
+
+    if marker.project_id.parse::<uuid::Uuid>().is_err() {
+        return Err(DfError::Validation(format!(
+            "project marker project_id `{}` is not a UUID",
+            marker.project_id
+        )));
+    }
+    if marker.generator_version.trim().is_empty() {
+        return Err(DfError::Validation(
+            "project marker has no generator_version".to_string(),
+        ));
     }
     Ok(marker)
 }
 
 fn open_db(project_dir: &Path, marker: &ProjectMarker) -> DfResult<Db> {
-    let db_path = project_dir.join(&marker.database_path);
+    // The constant, never the marker field: even validated, the field is only
+    // a compatibility echo (P1-3).
+    let db_path = project_dir.join(PROJECT_DB_RELATIVE);
+    // `Connection::open` would happily CREATE a missing file, which would hand
+    // the user an empty project instead of telling them theirs is gone.
     if !db_path.is_file() {
         return Err(DfError::NotFound(format!(
             "project database `{}` is missing",
@@ -316,7 +384,55 @@ pub fn create_project(request: &CreateProjectRequest, actor: Actor) -> DfResult<
     let (audit_root, profile) = validate_request(request)?;
 
     let project_dir = &request.project_dir;
-    let db_path = project_dir.join(PROJECT_DB_RELATIVE);
+
+    // Build the whole project in a staging directory next to its final home,
+    // and only put it in place once it is sound (P1-2, ADR-0022). Doing it in
+    // situ meant a failure between `create_dir_all`, the migrations and the
+    // marker left a directory that could not be opened *and* was no longer
+    // empty — so even retrying was refused.
+    let staging = staging_dir(project_dir);
+    // `build_project_in` closes the database before returning: Windows refuses
+    // to rename a directory that still holds an open handle, so the staging
+    // database must be shut before the finalize.
+    if let Err(error) = build_project_in(&staging, request, audit_root, profile, actor) {
+        // Only ever the staging directory we just created ourselves.
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    if let Err(error) = finalize_project_dir(&staging, project_dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    let db = Db::open(&project_dir.join(PROJECT_DB_RELATIVE))?;
+    status_from_db(&db, project_dir, None)
+}
+
+/// `<project_dir>.init-<uuid>`: a sibling, so the rename that finalizes it
+/// stays on the same volume and is therefore atomic.
+fn staging_dir(project_dir: &Path) -> PathBuf {
+    let name = project_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dataforge".to_string());
+    let parent = project_dir.parent().unwrap_or(Path::new("."));
+    parent.join(format!(".{name}.init-{}", uuid::Uuid::new_v4()))
+}
+
+/// Create the structure, the database and the marker inside `staging`.
+///
+/// The marker is written **last**, and only after the integrity check passes:
+/// it is what makes a directory a project, so it must never appear over a
+/// database that is not sound.
+fn build_project_in(
+    staging: &Path,
+    request: &CreateProjectRequest,
+    audit_root: PathBuf,
+    profile: ProfileRef,
+    actor: Actor,
+) -> DfResult<()> {
+    let db_path = staging.join(PROJECT_DB_RELATIVE);
     let state_dir = db_path
         .parent()
         .expect("PROJECT_DB_RELATIVE has a parent directory");
@@ -336,8 +452,18 @@ pub fn create_project(request: &CreateProjectRequest, actor: Actor) -> DfResult<
         .collect();
     project.source_roots = roots.iter().map(|r| r.id).collect();
 
+    // Opening applies the migrations.
     let mut db = Db::open(&db_path)?;
     repository::create_project(&mut db, &project, &roots, actor)?;
+
+    // Prove it is sound before advertising it as a project.
+    let report = df_db::integrity::check(&db)?;
+    if !report.is_ok() {
+        return Err(DfError::Database(format!(
+            "the new project failed its integrity check: {}",
+            report.problems.join("; ")
+        )));
+    }
 
     let marker = ProjectMarker {
         schema: MARKER_SCHEMA.to_string(),
@@ -347,12 +473,45 @@ pub fn create_project(request: &CreateProjectRequest, actor: Actor) -> DfResult<
         created_at: df_ledger::canonical_timestamp(project.created_at),
         generator_version: APP_VERSION.to_string(),
     };
-    let marker_path = project_dir.join(PROJECT_MARKER_FILE);
     let marker_json =
         serde_json::to_string_pretty(&marker).map_err(|e| DfError::Serialization(e.to_string()))?;
-    std::fs::write(&marker_path, marker_json).map_err(|e| DfError::io(&marker_path, e))?;
+    let marker_path = staging.join(PROJECT_MARKER_FILE);
+    {
+        use std::io::Write;
+        let mut file =
+            std::fs::File::create(&marker_path).map_err(|e| DfError::io(&marker_path, e))?;
+        file.write_all(marker_json.as_bytes())
+            .map_err(|e| DfError::io(&marker_path, e))?;
+        // Flush before the finalize: a marker that exists but is empty would be
+        // worse than no marker at all.
+        file.sync_all().map_err(|e| DfError::io(&marker_path, e))?;
+    }
 
-    status_from_db(&db, project_dir, None)
+    // Close the database here: the caller is about to rename this directory,
+    // and Windows will not rename a directory with an open handle inside it.
+    drop(db);
+    Ok(())
+}
+
+/// Move the staged project into place.
+///
+/// The only directory this may ever remove is one the OS itself confirms is
+/// empty: `remove_dir` (never `remove_dir_all`) fails on a non-empty
+/// directory, so no user data can be lost here even if the checks above were
+/// wrong (P1-2).
+fn finalize_project_dir(staging: &Path, project_dir: &Path) -> DfResult<()> {
+    if project_dir.exists() {
+        // `validate_request` already established it is an empty directory; a
+        // reparse point would make "empty" meaningless, so refuse it.
+        if df_fs_safety::is_reparse_point(project_dir).unwrap_or(true) {
+            return Err(DfError::Validation(format!(
+                "project directory `{}` is a reparse point",
+                project_dir.display()
+            )));
+        }
+        std::fs::remove_dir(project_dir).map_err(|e| DfError::io(project_dir, e))?;
+    }
+    std::fs::rename(staging, project_dir).map_err(|e| DfError::io(project_dir, e))
 }
 
 /// Open an existing project directory (read-only, no integrity pass).
@@ -801,6 +960,169 @@ mod tests {
         assert!(matches!(
             duplicate_report(&req.project_dir),
             Err(DfError::Validation(_))
+        ));
+    }
+
+    /// P1-2: a failed creation must leave nothing behind — no half-project, no
+    /// staging litter — so retrying works.
+    #[test]
+    fn a_failed_creation_leaves_no_trace_and_retrying_works() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Force a failure *after* validation: the project's parent is a file,
+        // so the directory cannot exist (validation passes) but the staging
+        // build cannot create anything either. `create_dir_all` would happily
+        // invent a missing parent, so a merely-absent parent proves nothing.
+        let blocker = tmp.path().join("soy-un-archivo");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut req = request(tmp.path());
+        req.project_dir = blocker.join("proyecto");
+
+        assert!(
+            create_project(&req, Actor::Test).is_err(),
+            "creation must fail when the project's parent is a file"
+        );
+        assert!(!req.project_dir.exists(), "no half-project may survive");
+
+        // No staging directory survived next to the intended home.
+        let litter: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".init-"))
+            .collect();
+        assert!(litter.is_empty(), "staging directories were left behind");
+
+        // A valid retry then succeeds.
+        let good = request(tmp.path());
+        assert!(create_project(&good, Actor::Test).is_ok());
+        assert!(open_project(&good.project_dir).is_ok());
+    }
+
+    /// P1-2: the marker appears only over a sound database — never before.
+    #[test]
+    fn the_marker_and_the_database_appear_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+        // Both, or neither: a directory with a marker but no database (or the
+        // reverse) is exactly what the staging dance prevents.
+        assert!(req.project_dir.join(PROJECT_MARKER_FILE).is_file());
+        assert!(req.project_dir.join(PROJECT_DB_RELATIVE).is_file());
+        assert!(open_project(&req.project_dir).is_ok());
+    }
+
+    /// P1-2: an existing non-empty directory is never touched, let alone
+    /// cleaned. The user's data outranks our convenience.
+    #[test]
+    fn a_preexisting_non_empty_directory_is_never_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        std::fs::create_dir_all(&req.project_dir).unwrap();
+        let precious = req.project_dir.join("no-me-borres.txt");
+        std::fs::write(&precious, b"datos del usuario").unwrap();
+
+        assert!(create_project(&req, Actor::Test).is_err());
+        // Still there, untouched.
+        assert_eq!(std::fs::read(&precious).unwrap(), b"datos del usuario");
+    }
+
+    /// Rewrite one field of a project's marker, for tamper tests.
+    fn tamper_marker(project_dir: &Path, field: &str, value: serde_json::Value) {
+        let path = project_dir.join(PROJECT_MARKER_FILE);
+        let mut marker: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        marker[field] = value;
+        std::fs::write(&path, marker.to_string()).unwrap();
+    }
+
+    /// P1-3: a marker must never be able to point the engine at another
+    /// database. On Windows `join` with an absolute path discards the base, so
+    /// this is not theoretical.
+    #[test]
+    fn a_marker_cannot_redirect_the_database_outside_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        for attempt in [
+            "../../otro.sqlite",
+            "..\\..\\otro.sqlite",
+            "C:\\evil.sqlite",
+            "/etc/passwd",
+            "\\\\?\\C:\\evil.sqlite",
+            "\\\\servidor\\share\\evil.sqlite",
+            "state\\dataforge.sqlite", // ambiguous separator: not the constant
+            "state/otro.sqlite",
+            "",
+        ] {
+            tamper_marker(&req.project_dir, "database_path", attempt.into());
+            let err = open_project(&req.project_dir).unwrap_err();
+            assert!(
+                matches!(err, DfError::Validation(_)),
+                "`{attempt}` must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    /// P1-3: a marker from a newer DataForge is refused with a clear message
+    /// rather than opened on a guess.
+    #[test]
+    fn a_future_marker_version_is_rejected_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        tamper_marker(&req.project_dir, "schema_version", "2.0.0".into());
+        let err = open_project(&req.project_dir).unwrap_err();
+        match err {
+            DfError::Validation(message) => {
+                assert!(message.contains("newer DataForge"), "unclear: {message}");
+                assert!(message.contains("Upgrade"), "no remedy offered: {message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+
+        // A newer minor is fine: minor/patch are additive.
+        tamper_marker(&req.project_dir, "schema_version", "1.9.3".into());
+        assert!(open_project(&req.project_dir).is_ok());
+
+        // Garbage is rejected too.
+        tamper_marker(
+            &req.project_dir,
+            "schema_version",
+            "no-soy-una-version".into(),
+        );
+        assert!(open_project(&req.project_dir).is_err());
+    }
+
+    /// P1-3: opening must not silently create a database that is missing —
+    /// `Connection::open` would happily do exactly that.
+    #[test]
+    fn opening_never_creates_a_missing_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let db_path = req.project_dir.join(PROJECT_DB_RELATIVE);
+        std::fs::remove_file(&db_path).unwrap();
+
+        let err = open_project(&req.project_dir).unwrap_err();
+        assert!(matches!(err, DfError::NotFound(_)), "{err:?}");
+        assert!(
+            !db_path.exists(),
+            "opening must not conjure an empty database into existence"
+        );
+    }
+
+    #[test]
+    fn a_marker_with_a_non_uuid_project_id_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+        tamper_marker(&req.project_dir, "project_id", "no-soy-un-uuid".into());
+        assert!(matches!(
+            open_project(&req.project_dir).unwrap_err(),
+            DfError::Validation(_)
         ));
     }
 

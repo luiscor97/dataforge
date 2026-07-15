@@ -1,4 +1,4 @@
-# ADR-0019 — Clasificación de contexto de carpetas por marcadores de perfil
+# ADR-0024 — Clasificación de contexto de carpetas por marcadores de perfil
 
 **Estado:** Aceptada
 **Fecha:** 2026-07-14
@@ -51,7 +51,7 @@ esa parte determinista sin adelantar la extracción de entidades.
 
 5. **Dónde se ejecuta y persistencia.** El cómputo corre dentro del paso
    `analyze` (transición `HASHED → ANALYZING → ANALYZED`), tras las firmas de
-   carpeta (ADR-0018). Se persiste en la tabla `folder_contexts` de la
+   carpeta (ADR-0023). Se persiste en la tabla `folder_contexts` de la
    migración `0005_contexts.sql` (una fila por carpeta: `kind`,
    `is_protected_boundary`, `penalty`, `marker`). El recómputo es idempotente.
    Se emite el evento de auditoría `CONTEXTS_CLASSIFIED`. Un nuevo informe de

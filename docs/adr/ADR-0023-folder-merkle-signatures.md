@@ -1,4 +1,4 @@
-# ADR-0018 — Firmas Merkle de carpeta y detección de clones exactos de árbol
+# ADR-0023 — Firmas Merkle de carpeta y detección de clones exactos de árbol
 
 **Estado:** Aceptada
 **Fecha:** 2026-07-14

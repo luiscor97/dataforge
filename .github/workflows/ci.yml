@@ -67,6 +67,32 @@ jobs:
       - name: Check Tauri shell (MSVC)
         run: cargo check -p dataforge-desktop
 
+  hardening:
+    name: Filesystem hardening (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # These tests plant real junctions with `mklink /J` and deny read access
+      # with `icacls`. They skip loudly (never silently) when the environment
+      # forbids it, so a green run here is meaningful evidence.
+      - name: Filesystem safety boundary
+        run: cargo test -p df-fs-safety -- --nocapture
+
+      - name: Executor and verifier hardening (junctions, no-replace)
+        run: cargo test -p df-executor -p df-verifier -- --nocapture
+
+      - name: Tamper tests (manifest, inventory, marker)
+        run: cargo test -p df-db -p df-facade -p df-planner
+
+      - name: Migration compatibility (0.1 database opens under 0.1.1)
+        run: cargo test -p df-db a_v0_1_database_migrates_forward_and_keeps_its_data -- --nocapture
+
   supply-chain:
     name: Dependency audit
     runs-on: windows-latest
