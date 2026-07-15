@@ -8,12 +8,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use df_domain::{
-    Actor, ApprovalState, ContentId, DuplicateSetId, ExecutionState, FindingId, OccurrenceId,
-    OperationErrorCode, OperationId, OperationType, Plan, PlanId, PlanOperation, PlanStatus,
-    ProjectId, RiskLevel, SnapshotId, VerificationRunId,
+    Actor, ApprovalState, ContentId, DuplicateSetId, ExecutionState, FindingId, ManifestEntry,
+    OccurrenceId, OperationErrorCode, OperationId, OperationType, Plan, PlanId, PlanOperation,
+    PlanStatus, ProjectId, RiskLevel, SnapshotId, SourceRootId, VerificationRunId,
 };
 use df_error::{DfError, DfResult};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::repository::{append_event, parse_stored_timestamp, to_stored_timestamp};
 use crate::{db_err, Db};
@@ -395,9 +395,14 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
 
 /// Freeze a plan (§26.4): store the canonical hash, approve its operations
 /// and emit `PLAN_APPROVED` — one tx.
+/// Approve a plan: freeze its execution manifest, record the canonical hash
+/// and flip the statuses — all in one transaction, so a plan can never be
+/// APPROVED without the manifest that defines what "approved" means
+/// (ADR-0018).
 pub fn approve_plan(
     db: &mut Db,
     plan: &Plan,
+    manifest_entries: &[ManifestEntry],
     serialized_sha256: &str,
     actor: Actor,
 ) -> DfResult<()> {
@@ -408,6 +413,7 @@ pub fn approve_plan(
         )));
     }
     let tx = db.conn_mut().transaction().map_err(db_err)?;
+    insert_manifest(&tx, manifest_entries)?;
     tx.execute(
         "UPDATE plan_operations SET approval = 'APPROVED', updated_at = ?1
          WHERE plan_id = ?2 AND approval = 'PENDING'",
@@ -435,6 +441,201 @@ pub fn approve_plan(
     Ok(())
 }
 
+/// Gather, from the live inventory, everything the manifest must freeze.
+///
+/// This is the **only** place the live tables are read as an execution
+/// contract, and it happens exactly once: at approval. From that moment the
+/// manifest is the contract and these tables are just evidence (ADR-0018).
+///
+/// `source_root_identity` is left `None` here — df-db does not touch the
+/// filesystem; the planner fills it in before hashing.
+pub fn build_manifest_entries(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT p.id, p.sequence, p.operation_type, p.idempotency_key,
+                    p.destination_relative_path, o.source_root_id, r.absolute_path,
+                    o.relative_path, o.fingerprint, o.size_bytes, c.sha256, c.blake3
+             FROM plan_operations p
+             LEFT JOIN path_occurrences o ON o.id = p.source_occurrence
+             LEFT JOIN source_roots r ON r.id = o.source_root_id
+             LEFT JOIN content_objects c ON c.id = p.content_id
+             WHERE p.plan_id = ?1
+             ORDER BY p.sequence",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<DfResult<ManifestEntry>> = stmt
+        .query_map([plan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })
+        .map_err(db_err)?
+        .map(|raw| {
+            let (
+                operation_id,
+                sequence,
+                operation_type,
+                idempotency_key,
+                destination,
+                source_root_id,
+                root_path,
+                relative,
+                fingerprint,
+                size,
+                sha256,
+                blake3,
+            ) = raw.map_err(db_err)?;
+            Ok(ManifestEntry {
+                operation_id: OperationId::from_str(&operation_id)?,
+                plan_id,
+                sequence: sequence as u64,
+                operation_type: OperationType::parse(&operation_type)?,
+                idempotency_key,
+                source_root_id: source_root_id
+                    .as_deref()
+                    .map(SourceRootId::from_str)
+                    .transpose()?,
+                source_root_identity: None,
+                source_root_path_snapshot: root_path,
+                source_relative_path_exact: relative,
+                source_fingerprint: fingerprint,
+                expected_size_bytes: size.map(|n| n as u64),
+                expected_sha256: sha256,
+                expected_blake3: blake3,
+                destination_relative_path: destination,
+            })
+        })
+        .collect();
+    rows.into_iter().collect()
+}
+
+/// Freeze the execution manifest of a plan (ADR-0018).
+///
+/// Written once, inside the approval transaction; the table's triggers reject
+/// any later UPDATE or DELETE, so from here on the contract is fixed.
+pub fn insert_manifest(tx: &Transaction<'_>, entries: &[ManifestEntry]) -> DfResult<()> {
+    let now = to_stored_timestamp(chrono::Utc::now());
+    for entry in entries {
+        tx.execute(
+            "INSERT INTO execution_manifest
+                (operation_id, plan_id, sequence, operation_type, idempotency_key,
+                 source_root_id, source_root_identity, source_root_path_snapshot,
+                 source_relative_path_exact, source_fingerprint,
+                 expected_size_bytes, expected_sha256, expected_blake3,
+                 destination_relative_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                entry.operation_id.to_string(),
+                entry.plan_id.to_string(),
+                entry.sequence as i64,
+                entry.operation_type.as_str(),
+                entry.idempotency_key,
+                entry.source_root_id.map(|id| id.to_string()),
+                entry.source_root_identity,
+                entry.source_root_path_snapshot,
+                entry.source_relative_path_exact,
+                entry.source_fingerprint,
+                entry.expected_size_bytes.map(|n| n as i64),
+                entry.expected_sha256,
+                entry.expected_blake3,
+                entry.destination_relative_path,
+                now,
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+/// Read the frozen manifest of a plan, in sequence order.
+///
+/// This is what the verifier re-hashes and what `report` exports: the
+/// authoritative record of what was approved.
+pub fn manifest(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT operation_id, plan_id, sequence, operation_type, idempotency_key,
+                    source_root_id, source_root_identity, source_root_path_snapshot,
+                    source_relative_path_exact, source_fingerprint,
+                    expected_size_bytes, expected_sha256, expected_blake3,
+                    destination_relative_path
+             FROM execution_manifest WHERE plan_id = ?1 ORDER BY sequence",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<DfResult<ManifestEntry>> = stmt
+        .query_map([plan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+            ))
+        })
+        .map_err(db_err)?
+        .map(|raw| {
+            let (
+                operation_id,
+                plan_id,
+                sequence,
+                operation_type,
+                idempotency_key,
+                source_root_id,
+                source_root_identity,
+                source_root_path_snapshot,
+                source_relative_path_exact,
+                source_fingerprint,
+                expected_size_bytes,
+                expected_sha256,
+                expected_blake3,
+                destination_relative_path,
+            ) = raw.map_err(db_err)?;
+            Ok(ManifestEntry {
+                operation_id: OperationId::from_str(&operation_id)?,
+                plan_id: PlanId::from_str(&plan_id)?,
+                sequence: sequence as u64,
+                operation_type: OperationType::parse(&operation_type)?,
+                idempotency_key,
+                source_root_id: source_root_id
+                    .as_deref()
+                    .map(SourceRootId::from_str)
+                    .transpose()?,
+                source_root_identity,
+                source_root_path_snapshot,
+                source_relative_path_exact,
+                source_fingerprint,
+                expected_size_bytes: expected_size_bytes.map(|n| n as u64),
+                expected_sha256,
+                expected_blake3,
+                destination_relative_path,
+            })
+        })
+        .collect();
+    rows.into_iter().collect()
+}
+
 /// Everything the executor needs to run one operation.
 #[derive(Debug, Clone)]
 pub struct ExecutableOperation {
@@ -457,6 +658,14 @@ pub struct ExecutableOperation {
 ///
 /// `RUNNING` rows are included: they belong to a run that died mid-copy and
 /// are safe to retry (the executor overwrites its own partial file).
+///
+/// **Reads only the frozen manifest** (ADR-0018). It deliberately does not
+/// join `path_occurrences`, `source_roots` or `content_objects`: those are
+/// live, mutable evidence, and resolving execution material from them is what
+/// let a post-approval edit change the executed bytes without moving the plan
+/// hash (threat T5). `plan_operations` is still joined, but only for the
+/// mutable *progress* columns (approval, execution_state) — never for what to
+/// read or expect.
 pub fn executable_operations(
     db: &Db,
     plan_id: PlanId,
@@ -465,20 +674,19 @@ pub fn executable_operations(
     let mut stmt = db
         .conn()
         .prepare(
-            "SELECT p.id, p.sequence, p.operation_type, p.destination_relative_path,
-                    r.absolute_path, o.relative_path, o.fingerprint, o.size_bytes,
-                    c.sha256, c.blake3
-             FROM plan_operations p
-             LEFT JOIN path_occurrences o ON o.id = p.source_occurrence
-             LEFT JOIN source_roots r ON r.id = o.source_root_id
-             LEFT JOIN content_objects c ON c.id = p.content_id
-             WHERE p.plan_id = ?1
+            "SELECT m.operation_id, m.sequence, m.operation_type,
+                    m.destination_relative_path, m.source_root_path_snapshot,
+                    m.source_relative_path_exact, m.source_fingerprint,
+                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3
+             FROM execution_manifest m
+             JOIN plan_operations p ON p.id = m.operation_id
+             WHERE m.plan_id = ?1
                AND p.approval = 'APPROVED'
-               AND p.operation_type IN
+               AND m.operation_type IN
                    ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
                     'COPY_WITH_SUFFIX', 'CREATE_DIRECTORY')
                AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
-             ORDER BY p.sequence
+             ORDER BY m.sequence
              LIMIT ?2",
         )
         .map_err(db_err)?;
@@ -845,7 +1053,10 @@ mod tests {
         assert_eq!(loaded.status, PlanStatus::Ready);
         assert_eq!(list_operations(&db, plan.id).unwrap().len(), 1);
 
-        approve_plan(&mut db, &loaded, &"a".repeat(64), Actor::Test).unwrap();
+        // Approving now freezes the manifest in the same transaction, so the
+        // entries travel with the approval (ADR-0018).
+        let entries = build_manifest_entries(&db, plan.id).unwrap();
+        approve_plan(&mut db, &loaded, &entries, &"a".repeat(64), Actor::Test).unwrap();
         let approved = current_plan(&db, plan.project_id).unwrap().unwrap();
         assert_eq!(approved.status, PlanStatus::Approved);
         assert!(approved.approved_at.is_some());

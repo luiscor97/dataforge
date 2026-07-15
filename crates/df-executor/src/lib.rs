@@ -731,6 +731,76 @@ mod tests {
         assert!(!fx.output.join("origen").join("a.txt").exists());
     }
 
+    /// Threat T5 / P0-3: after approval, the live inventory is evidence, not
+    /// the contract. Editing `content_objects` must not change one byte of
+    /// what the executor does.
+    #[test]
+    fn editing_content_objects_after_approval_does_not_change_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        // Forge one content identity in the live table (only one: sha256 is
+        // uniquely indexed, so forging them all to the same value would fail
+        // for an uninteresting reason). Before ADR-0018 the executor read
+        // expected_sha256 straight from here, so this would have made that copy
+        // fail with HASH_MISMATCH — the tables dictated the run and the plan
+        // hash never noticed.
+        let changed = fx
+            .db
+            .conn_for_tests()
+            .execute(
+                "UPDATE content_objects SET sha256 = ?1
+                 WHERE id = (SELECT id FROM content_objects WHERE sha256 IS NOT NULL LIMIT 1)",
+                [&"e".repeat(64)],
+            )
+            .unwrap();
+        assert!(changed > 0, "the test must actually tamper with something");
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        // The run is unaffected: it executed the frozen manifest.
+        assert_eq!(outcome.state, "EXECUTED");
+        assert_eq!(outcome.failed_final, 0, "the forged table changed the run");
+        assert_eq!(outcome.completed, 6);
+        assert_eq!(
+            std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
+            b"same bytes"
+        );
+    }
+
+    /// Threat T5 / P0-3: same for the source location. Repointing a source
+    /// root after approval must not redirect what gets read.
+    #[test]
+    fn repointing_a_source_root_after_approval_does_not_change_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        // A decoy tree with different content at the same relative paths.
+        let decoy = tmp.path().join("señuelo");
+        std::fs::create_dir_all(decoy.join("sub")).unwrap();
+        std::fs::write(decoy.join("a.txt"), b"CONTENIDO FALSO").unwrap();
+
+        let changed = fx
+            .db
+            .conn_for_tests()
+            .execute(
+                "UPDATE source_roots SET absolute_path = ?1",
+                [decoy.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        assert!(changed > 0, "the test must actually tamper with something");
+
+        execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        // The copy came from the approved root, not the decoy.
+        assert_eq!(
+            std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
+            b"same bytes",
+            "the executor followed the repointed live table instead of the manifest"
+        );
+    }
+
     /// The encargo requires the refusal to be *typed*, not a generic I/O blob.
     #[test]
     fn fs_safety_refusals_map_to_typed_final_failures() {

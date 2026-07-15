@@ -7,6 +7,7 @@
 pub mod event;
 pub mod ids;
 pub mod inventory;
+pub mod manifest;
 pub mod plan;
 pub mod project;
 pub mod snapshot;
@@ -22,6 +23,7 @@ pub use inventory::{
     ContentObject, FileFingerprint, FolderRecord, HashState, PathOccurrence, ScanCounters,
     ScanEntryStatus, ScanRun, ScanRunStatus,
 };
+pub use manifest::ManifestEntry;
 pub use plan::{
     ApprovalState, Confidence, ExecutionState, OperationErrorCode, OperationType, Plan,
     PlanOperation, PlanStatus, RiskLevel,

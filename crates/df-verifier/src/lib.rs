@@ -90,7 +90,11 @@ pub fn verify_project(
     // 1. Plan immutability (§26.4): stored operations must re-serialize to
     //    the hash frozen at approval.
     let operations = plans::list_operations(db, plan.id)?;
-    let recomputed = df_planner::plan_operations_sha256(&operations);
+    // Re-hash the frozen manifest, not the operation rows: the manifest is
+    // what approval signed (ADR-0018), so this is what detects a post-approval
+    // edit to the executed material.
+    let manifest = plans::manifest(db, plan.id)?;
+    let recomputed = df_planner::manifest_sha256(&manifest);
     match plan.serialized_sha256.as_deref() {
         Some(stored) if stored == recomputed => {}
         stored => findings.push(VerificationFinding {
@@ -98,7 +102,7 @@ pub fn verify_project(
             severity: SEVERITY_PROBLEM.to_string(),
             subject: plan.id.to_string(),
             detail: format!(
-                "plan re-serializes to {recomputed} but approval recorded {}",
+                "the execution manifest re-serializes to {recomputed} but approval recorded {}",
                 stored.unwrap_or("nothing")
             ),
         }),
@@ -614,6 +618,70 @@ mod tests {
                 .any(|f| f.kind == "OUTPUT_SUBTREE_UNREADABLE" && f.severity == "PROBLEM"),
             "an output we cannot read must be a PROBLEM, got {:?}",
             outcome.findings
+        );
+    }
+
+    /// Threat T5 / P0-3: the manifest is what approval signed, so editing it
+    /// offline must fail verification. The triggers block the honest paths, so
+    /// we drop them first to simulate someone with raw access to the file.
+    #[test]
+    fn tampering_the_execution_manifest_fails_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = executed_project(tmp.path());
+
+        // (A clean run of this same fixture verifying as COMPLETED is covered
+        // by `a_clean_execution_verifies_as_completed`; verifying here first
+        // would move the project past EXECUTED and make the second pass
+        // invalid for a reason unrelated to tampering.)
+
+        // Forge the expected hash of one entry, bypassing the immutability
+        // triggers the way an offline attacker with the .sqlite would.
+        fx.db
+            .conn_for_tests()
+            .execute_batch("DROP TRIGGER execution_manifest_no_update;")
+            .unwrap();
+        let changed = fx
+            .db
+            .conn_for_tests()
+            .execute(
+                "UPDATE execution_manifest SET expected_sha256 = ?1
+                 WHERE expected_sha256 IS NOT NULL",
+                [&"f".repeat(64)],
+            )
+            .unwrap();
+        assert!(changed > 0, "the test must actually tamper with something");
+
+        // Verify: the manifest no longer hashes to what approval recorded.
+        let outcome = verify_project(&mut fx.db, Actor::Test, &VerifyOptions::default()).unwrap();
+        assert_eq!(outcome.verdict, "FAILED", "{:?}", outcome.findings);
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.kind == "PLAN_TAMPERED" && f.severity == "PROBLEM"),
+            "expected PLAN_TAMPERED, got {:?}",
+            outcome.findings
+        );
+    }
+
+    /// P0-3: the immutability triggers refuse the ordinary paths outright.
+    #[test]
+    fn the_execution_manifest_rejects_update_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = executed_project(tmp.path());
+        assert!(
+            fx.db
+                .conn_for_tests()
+                .execute("UPDATE execution_manifest SET expected_sha256 = NULL", [])
+                .is_err(),
+            "the manifest must reject UPDATE"
+        );
+        assert!(
+            fx.db
+                .conn_for_tests()
+                .execute("DELETE FROM execution_manifest", [])
+                .is_err(),
+            "the manifest must reject DELETE"
         );
     }
 

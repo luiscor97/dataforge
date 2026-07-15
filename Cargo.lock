@@ -825,6 +825,7 @@ dependencies = [
  "df-db",
  "df-domain",
  "df-error",
+ "df-fs-safety",
  "df-hash",
  "df-ledger",
  "df-scan",
