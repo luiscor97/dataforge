@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ids::{OperationId, PlanId, SourceRootId},
     plan::OperationType,
+    raw_path::RawPath,
 };
 
 /// One frozen operation: everything needed to execute it, and nothing that
@@ -40,6 +41,10 @@ pub struct ManifestEntry {
     /// The source root's path as recorded at approval; the live row may drift.
     pub source_root_path_snapshot: Option<String>,
     pub source_relative_path_exact: Option<String>,
+    /// The exact bytes of the source's relative path (ADR-0020). This — not
+    /// the display string above — is what the executor reopens. `None` for a
+    /// snapshot taken before v0.1.1.
+    pub source_raw_relative_path: Option<RawPath>,
     pub source_fingerprint: Option<String>,
 
     // --- what content is expected ----------------------------------------
@@ -70,6 +75,10 @@ impl ManifestEntry {
             "source_root_identity": self.source_root_identity,
             "source_root_path_snapshot": self.source_root_path_snapshot,
             "source_relative_path_exact": self.source_relative_path_exact,
+            // Hex rendering of the very same UTF-16LE bytes stored as a BLOB.
+            "source_raw_relative_path": self.source_raw_relative_path
+                .as_ref()
+                .map(|raw| raw.to_hex()),
             "source_fingerprint": self.source_fingerprint,
             "expected_size_bytes": self.expected_size_bytes,
             "expected_sha256": self.expected_sha256,
@@ -95,6 +104,7 @@ mod tests {
             source_root_identity: Some("1234:5678".to_string()),
             source_root_path_snapshot: Some("D:/origen".to_string()),
             source_relative_path_exact: Some("a.txt".to_string()),
+            source_raw_relative_path: Some(RawPath::from_os_str(std::ffi::OsStr::new("a.txt"))),
             source_fingerprint: Some("v1:10:0".to_string()),
             expected_size_bytes: Some(10),
             expected_sha256: Some("a".repeat(64)),
@@ -119,6 +129,7 @@ mod tests {
             "source_root_identity",
             "source_root_path_snapshot",
             "source_relative_path_exact",
+            "source_raw_relative_path",
             "source_fingerprint",
             "expected_size_bytes",
             "expected_sha256",

@@ -11,6 +11,7 @@ pub mod inventory;
 pub mod manifest;
 pub mod plan;
 pub mod project;
+pub mod raw_path;
 pub mod snapshot;
 pub mod source_root;
 pub mod state;
@@ -34,6 +35,7 @@ pub use plan::{
     PlanOperation, PlanStatus, RiskLevel,
 };
 pub use project::{ProfileRef, Project};
+pub use raw_path::RawPath;
 pub use snapshot::{Snapshot, SnapshotStatus};
 pub use source_root::{FileSystemKind, SourceRoot};
 pub use state::ProjectState;

@@ -430,11 +430,21 @@ impl Walker<'_> {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase());
 
+        // The exact bytes of the relative path (ADR-0020). `relative_path`
+        // below is the display form and may be lossy; this is what will reopen
+        // the file. Derived from the absolute path we actually walked, so it
+        // is what the OS gave us, not a re-encoding of a damaged string.
+        let raw_relative_path = absolute
+            .strip_prefix(&root.absolute_path)
+            .ok()
+            .map(|rel| df_domain::RawPath::from_os_str(rel.as_os_str()));
+
         self.batch.occurrences.push(PathOccurrence {
             id: OccurrenceId::new(),
             snapshot_id: self.snapshot_id,
             source_root_id: root.id,
             relative_path,
+            raw_relative_path,
             parent_relative_path: parent.to_string(),
             normalized_name: name.to_lowercase(),
             file_name: name,

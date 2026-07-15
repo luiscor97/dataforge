@@ -463,12 +463,22 @@ fn source_path(operation: &ExecutableOperation) -> Result<PathBuf, OperationFail
             "copy operation without a source root",
         )
     })?;
-    let relative = operation.source_relative_path.as_deref().ok_or_else(|| {
-        OperationFailure::fatal(
-            OperationErrorCode::InvalidPath,
-            "copy operation without a source path",
-        )
-    })?;
+    // The raw form is authoritative (ADR-0020): the display string may have
+    // been damaged by `to_string_lossy`, and a U+FFFD is a real character — it
+    // would name a different file, or none. Only fall back to the display
+    // string for snapshots taken before v0.1.1, which have no raw form.
+    let relative = match operation.source_raw_relative_path.as_ref() {
+        Some(raw) => PathBuf::from(raw.to_os_string()),
+        None => {
+            let display = operation.source_relative_path.as_deref().ok_or_else(|| {
+                OperationFailure::fatal(
+                    OperationErrorCode::InvalidPath,
+                    "copy operation without a source path",
+                )
+            })?;
+            PathBuf::from(display)
+        }
+    };
     Ok(extend_long_path(root.join(relative)))
 }
 
@@ -815,6 +825,66 @@ mod tests {
             std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
             b"same bytes",
             "the executor followed the repointed live table instead of the manifest"
+        );
+    }
+
+    /// P0-5: the executor reopens the source from the raw path, not from the
+    /// lossy display string. Uses names that survive display but exercise the
+    /// whole raw pipeline end to end.
+    #[test]
+    fn sources_are_reopened_through_their_raw_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        // Names that a lossy round-trip could plausibly mangle.
+        std::fs::write(origin.join("acta ñ 文件 🎉.txt"), b"unicode").unwrap();
+        std::fs::write(origin.join("normal.txt"), b"plain").unwrap();
+
+        let output = tmp.path().join("salida");
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = df_domain::Project::new(
+            "Raw paths",
+            df_domain::ProfileRef::default(),
+            output.clone(),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![df_domain::SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        df_scan::scan_project(&mut db, Actor::Test, &df_scan::ScanOptions::default(), None)
+            .unwrap();
+        df_hash::hash_project(&mut db, Actor::Test, &df_hash::HashOptions::default(), None)
+            .unwrap();
+        df_planner::analyze_project(&mut db, Actor::Test).unwrap();
+        df_planner::create_plan(&mut db, Actor::Test).unwrap();
+        df_planner::approve_plan(&mut db, Actor::Test).unwrap();
+
+        // The approved manifest must carry the raw path (§P0-5), not just the
+        // display string.
+        let plan = plans::current_plan(&db, project.id).unwrap().unwrap();
+        let manifest = plans::manifest(&db, plan.id).unwrap();
+        let unicode_entry = manifest
+            .iter()
+            .find(|e| {
+                e.source_relative_path_exact
+                    .as_deref()
+                    .is_some_and(|p| p.contains("acta"))
+            })
+            .expect("the unicode file is in the manifest");
+        let raw = unicode_entry
+            .source_raw_relative_path
+            .as_ref()
+            .expect("the manifest must freeze the raw path");
+        assert_eq!(raw.display(), "acta ñ 文件 🎉.txt");
+        assert!(!raw.is_lossy());
+
+        let outcome = execute_plan(&mut db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert_eq!(outcome.failed_final, 0, "raw-path copies must not fail");
+
+        // The bytes arrived, so the source really was reopened.
+        assert_eq!(
+            std::fs::read(output.join("origen").join("acta ñ 文件 🎉.txt")).unwrap(),
+            b"unicode"
         );
     }
 

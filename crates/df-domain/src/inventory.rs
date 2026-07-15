@@ -77,6 +77,10 @@ pub struct PathOccurrence {
     /// as `source_root.absolute_path ∪ relative_path`; it is not duplicated
     /// in storage so root relocation cannot desynchronise the inventory.
     pub relative_path: String,
+    /// The exact bytes of `relative_path` (ADR-0020). `relative_path` above is
+    /// the *display* form and may be lossy; this is the one that reopens the
+    /// file. `None` only for snapshots taken before v0.1.1.
+    pub raw_relative_path: Option<crate::raw_path::RawPath>,
     pub parent_relative_path: String,
     pub file_name: String,
     /// Lowercased name used for grouping and comparison (RFC-0001 §13.4);

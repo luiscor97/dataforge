@@ -37,6 +37,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "execution_manifest",
         sql: include_str!("../migrations/0004_execution_manifest.sql"),
     },
+    Migration {
+        version: 5,
+        name: "path_identity",
+        sql: include_str!("../migrations/0005_path_identity.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {

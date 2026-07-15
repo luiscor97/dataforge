@@ -455,7 +455,8 @@ pub fn build_manifest_entries(db: &Db, plan_id: PlanId) -> DfResult<Vec<Manifest
         .prepare(
             "SELECT p.id, p.sequence, p.operation_type, p.idempotency_key,
                     p.destination_relative_path, o.source_root_id, r.absolute_path,
-                    o.relative_path, o.fingerprint, o.size_bytes, c.sha256, c.blake3
+                    o.relative_path, o.fingerprint, o.size_bytes, c.sha256, c.blake3,
+                    o.raw_relative_path
              FROM plan_operations p
              LEFT JOIN path_occurrences o ON o.id = p.source_occurrence
              LEFT JOIN source_roots r ON r.id = o.source_root_id
@@ -479,6 +480,7 @@ pub fn build_manifest_entries(db: &Db, plan_id: PlanId) -> DfResult<Vec<Manifest
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<Vec<u8>>>(12)?,
             ))
         })
         .map_err(db_err)?
@@ -496,6 +498,7 @@ pub fn build_manifest_entries(db: &Db, plan_id: PlanId) -> DfResult<Vec<Manifest
                 size,
                 sha256,
                 blake3,
+                raw_relative,
             ) = raw.map_err(db_err)?;
             Ok(ManifestEntry {
                 operation_id: OperationId::from_str(&operation_id)?,
@@ -510,6 +513,10 @@ pub fn build_manifest_entries(db: &Db, plan_id: PlanId) -> DfResult<Vec<Manifest
                 source_root_identity: None,
                 source_root_path_snapshot: root_path,
                 source_relative_path_exact: relative,
+                source_raw_relative_path: raw_relative
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 source_fingerprint: fingerprint,
                 expected_size_bytes: size.map(|n| n as u64),
                 expected_sha256: sha256,
@@ -534,8 +541,8 @@ pub fn insert_manifest(tx: &Transaction<'_>, entries: &[ManifestEntry]) -> DfRes
                  source_root_id, source_root_identity, source_root_path_snapshot,
                  source_relative_path_exact, source_fingerprint,
                  expected_size_bytes, expected_sha256, expected_blake3,
-                 destination_relative_path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 destination_relative_path, source_raw_relative_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 entry.operation_id.to_string(),
                 entry.plan_id.to_string(),
@@ -551,6 +558,7 @@ pub fn insert_manifest(tx: &Transaction<'_>, entries: &[ManifestEntry]) -> DfRes
                 entry.expected_sha256,
                 entry.expected_blake3,
                 entry.destination_relative_path,
+                entry.source_raw_relative_path.as_ref().map(|r| r.to_blob()),
                 now,
             ],
         )
@@ -571,7 +579,7 @@ pub fn manifest(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
                     source_root_id, source_root_identity, source_root_path_snapshot,
                     source_relative_path_exact, source_fingerprint,
                     expected_size_bytes, expected_sha256, expected_blake3,
-                    destination_relative_path
+                    destination_relative_path, source_raw_relative_path
              FROM execution_manifest WHERE plan_id = ?1 ORDER BY sequence",
         )
         .map_err(db_err)?;
@@ -592,6 +600,7 @@ pub fn manifest(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
                 row.get::<_, Option<String>>(11)?,
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
             ))
         })
         .map_err(db_err)?
@@ -611,6 +620,7 @@ pub fn manifest(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
                 expected_sha256,
                 expected_blake3,
                 destination_relative_path,
+                source_raw_relative_path,
             ) = raw.map_err(db_err)?;
             Ok(ManifestEntry {
                 operation_id: OperationId::from_str(&operation_id)?,
@@ -625,6 +635,10 @@ pub fn manifest(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
                 source_root_identity,
                 source_root_path_snapshot,
                 source_relative_path_exact,
+                source_raw_relative_path: source_raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 source_fingerprint,
                 expected_size_bytes: expected_size_bytes.map(|n| n as u64),
                 expected_sha256,
@@ -645,7 +659,10 @@ pub struct ExecutableOperation {
     pub destination_relative_path: String,
     /// Source file, for copies: absolute root + relative path.
     pub source_root_path: Option<PathBuf>,
+    /// Display form; never used to open anything (ADR-0020).
     pub source_relative_path: Option<String>,
+    /// The exact bytes to reopen the source with.
+    pub source_raw_relative_path: Option<df_domain::RawPath>,
     /// Fingerprint captured at scan time (§27.1 "validate source fingerprint").
     pub source_fingerprint: Option<String>,
     pub size_bytes: u64,
@@ -677,7 +694,8 @@ pub fn executable_operations(
             "SELECT m.operation_id, m.sequence, m.operation_type,
                     m.destination_relative_path, m.source_root_path_snapshot,
                     m.source_relative_path_exact, m.source_fingerprint,
-                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3
+                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
+                    m.source_raw_relative_path
              FROM execution_manifest m
              JOIN plan_operations p ON p.id = m.operation_id
              WHERE m.plan_id = ?1
@@ -703,12 +721,24 @@ pub fn executable_operations(
                 row.get::<_, Option<i64>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (id, sequence, op_type, destination, root, relative, fingerprint, size, sha, blake) =
-                raw.map_err(db_err)?;
+            let (
+                id,
+                sequence,
+                op_type,
+                destination,
+                root,
+                relative,
+                fingerprint,
+                size,
+                sha,
+                blake,
+                raw_relative,
+            ) = raw.map_err(db_err)?;
             let destination = destination.ok_or_else(|| {
                 DfError::Database(format!("executable operation {id} has no destination"))
             })?;
@@ -719,6 +749,10 @@ pub fn executable_operations(
                 destination_relative_path: destination,
                 source_root_path: root.map(PathBuf::from),
                 source_relative_path: relative,
+                source_raw_relative_path: raw_relative
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 source_fingerprint: fingerprint,
                 size_bytes: size.unwrap_or(0) as u64,
                 expected_sha256: sha,

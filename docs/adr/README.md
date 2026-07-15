@@ -13,6 +13,7 @@
 | [ADR-0016](ADR-0016-plan-execute-verify-increment.md) | Decisiones del incremento de planificación, ejecución y verificación (M0.1) | Aceptada |
 | [ADR-0017](ADR-0017-secure-filesystem-boundary.md) | Frontera segura del sistema de archivos (`df-fs-safety`) (v0.1.1) | Aceptada |
 | [ADR-0019](ADR-0019-file-fingerprint-v2.md) | Fingerprint físico v2 (v0.1.1) | Aceptada |
+| [ADR-0020](ADR-0020-raw-path-representation.md) | Representación raw de rutas (v0.1.1) | Aceptada |
 | [ADR-0021](ADR-0021-platform-no-replace-finalization.md) | Finalize no-replace por plataforma y durabilidad (v0.1.1) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
