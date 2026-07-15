@@ -6,9 +6,11 @@
 //! matches a profile's *protected* marker is a `PROTECTED` boundary that
 //! deduplication must never dissolve (rule 9); everything else is `NEUTRAL`.
 //!
-//! Only the conservative `generic` profile exists for now, and it declares
-//! no protected markers (§25.4). Entity anchors and weighted propagation
-//! (§18.2–§18.4) are a later slice.
+//! The markers are not hardcoded here: they come from the declarative profile
+//! in `profiles/<id>/profile.json` (ADR-0026), so what counts as a boundary is
+//! reviewable data, not code. The `generic` profile declares no protected
+//! markers (§25.4); `legal` declares expedientes and periciales. Entity
+//! anchors and weighted propagation (§18.2–§18.4) are a later slice.
 
 use df_domain::{Actor, ContextKind, ProjectId, SnapshotId};
 use df_error::DfResult;
@@ -28,141 +30,11 @@ pub struct ContextSummary {
     pub neutral_folders: u64,
 }
 
-/// A generic-container marker and its representative-location penalty
-/// (RFC-0001 §18.3). Names are compared in lowercase.
-struct Marker {
-    name: &'static str,
-    penalty: u32,
-}
-
-/// Generic markers of the conservative `generic` profile. Penalties follow
-/// RFC-0001 §18.3. Matched against a folder's normalized (lowercase) name.
-const GENERIC_MARKERS: &[Marker] = &[
-    Marker {
-        name: "descargas",
-        penalty: 50,
-    },
-    Marker {
-        name: "downloads",
-        penalty: 50,
-    },
-    Marker {
-        name: "escritorio",
-        penalty: 45,
-    },
-    Marker {
-        name: "desktop",
-        penalty: 45,
-    },
-    Marker {
-        name: "backup",
-        penalty: 40,
-    },
-    Marker {
-        name: "backups",
-        penalty: 40,
-    },
-    Marker {
-        name: "copia de seguridad",
-        penalty: 40,
-    },
-    Marker {
-        name: "copias de seguridad",
-        penalty: 40,
-    },
-    Marker {
-        name: "respaldo",
-        penalty: 40,
-    },
-    Marker {
-        name: "respaldos",
-        penalty: 40,
-    },
-    Marker {
-        name: "recuperado",
-        penalty: 35,
-    },
-    Marker {
-        name: "recuperados",
-        penalty: 35,
-    },
-    Marker {
-        name: "recovered",
-        penalty: 35,
-    },
-    Marker {
-        name: "recovery",
-        penalty: 35,
-    },
-    Marker {
-        name: "temp",
-        penalty: 30,
-    },
-    Marker {
-        name: "tmp",
-        penalty: 30,
-    },
-    Marker {
-        name: "temporal",
-        penalty: 30,
-    },
-    Marker {
-        name: "temporales",
-        penalty: 30,
-    },
-    Marker {
-        name: "temporary",
-        penalty: 30,
-    },
-    Marker {
-        name: "copia",
-        penalty: 30,
-    },
-    Marker {
-        name: "copias",
-        penalty: 30,
-    },
-    Marker {
-        name: "copy",
-        penalty: 30,
-    },
-    Marker {
-        name: "nueva carpeta",
-        penalty: 30,
-    },
-    Marker {
-        name: "new folder",
-        penalty: 30,
-    },
-];
-
-/// Classify a folder name. Returns `(penalty, matched_marker)` when generic,
-/// or `None` when neutral. Deterministic and pure.
-fn classify_generic(normalized_name: &str) -> Option<(u32, &'static str)> {
-    let name = normalized_name.trim();
-    for marker in GENERIC_MARKERS {
-        if name == marker.name {
-            return Some((marker.penalty, marker.name));
-        }
-    }
-    // Common copy patterns produced by Windows Explorer and manual copies.
-    if name.ends_with(" - copia") || name.ends_with(" - copy") {
-        return Some((30, "copy-suffix"));
-    }
-    if name.starts_with("copia de ") || name.starts_with("copy of ") {
-        return Some((30, "copy-prefix"));
-    }
-    if name.starts_with("nueva carpeta") || name.starts_with("new folder") {
-        return Some((30, "new-folder"));
-    }
-    None
-}
-
 /// Classify every folder of a snapshot under the given profile and persist
 /// the result. Idempotent: rows for the snapshot are replaced.
 ///
-/// `profile` selects the marker set; only `generic` is implemented, and any
-/// unknown profile falls back to it (conservative default, §25.4).
+/// `profile` selects the marker set from `profiles/<id>/profile.json`; an
+/// unknown id falls back to `generic` (conservative default, §25.4).
 pub fn classify_folders(
     db: &mut Db,
     project_id: ProjectId,
@@ -170,8 +42,9 @@ pub fn classify_folders(
     profile: &str,
     actor: Actor,
 ) -> DfResult<ContextSummary> {
-    // Only the generic profile exists; protected markers are empty for it.
-    let _ = profile;
+    // The profile is data (ADR-0026): an unknown id falls back to `generic`,
+    // which protects nothing but also consolidates nothing by itself.
+    let profile = df_domain::Profile::load(profile)?;
 
     let snapshot = snapshot_id.to_string();
     let folders: Vec<(String, String, String)> = {
@@ -210,12 +83,16 @@ pub fn classify_folders(
         neutral_folders: 0,
     };
     for (folder_id, relative_path, normalized_name) in &folders {
-        let (kind, penalty, marker) = match classify_generic(normalized_name) {
-            Some((penalty, marker)) => {
-                summary.generic_folders += 1;
-                (ContextKind::Generic, penalty, Some(marker.to_string()))
+        let (kind, penalty, marker) = match profile.classify(normalized_name) {
+            (ContextKind::Protected, _, marker) => {
+                summary.protected_boundaries += 1;
+                (ContextKind::Protected, 0u32, marker)
             }
-            None => {
+            (ContextKind::Generic, penalty, marker) => {
+                summary.generic_folders += 1;
+                (ContextKind::Generic, penalty, marker)
+            }
+            (ContextKind::Neutral, _, _) => {
                 summary.neutral_folders += 1;
                 (ContextKind::Neutral, 0u32, None)
             }
@@ -224,12 +101,15 @@ pub fn classify_folders(
             "INSERT INTO folder_contexts
                 (folder_id, snapshot_id, relative_path, kind,
                  is_protected_boundary, penalty, marker, created_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 folder_id,
                 snapshot,
                 relative_path,
                 kind.as_str(),
+                // Derived from the kind, never hardcoded: a PROTECTED folder
+                // whose flag said 0 would be a silent security false negative.
+                (kind == ContextKind::Protected) as i64,
                 penalty as i64,
                 marker,
                 now,
@@ -304,24 +184,73 @@ mod tests {
 
     use super::*;
 
+    /// The penalties of §18.3 survived the move from hardcoded constants to
+    /// the declarative `generic` profile (ADR-0026).
     #[test]
     fn generic_markers_and_patterns_are_recognised() {
-        assert_eq!(classify_generic("descargas"), Some((50, "descargas")));
-        assert_eq!(classify_generic("escritorio"), Some((45, "escritorio")));
-        assert_eq!(classify_generic("backup"), Some((40, "backup")));
-        assert_eq!(classify_generic("recuperado"), Some((35, "recuperado")));
-        assert_eq!(classify_generic("temp"), Some((30, "temp")));
+        let generic = df_domain::Profile::load("generic").unwrap();
+        let penalty = |name: &str| {
+            let (kind, penalty, _) = generic.classify(name);
+            (kind, penalty)
+        };
+        assert_eq!(penalty("descargas"), (ContextKind::Generic, 50));
+        assert_eq!(penalty("escritorio"), (ContextKind::Generic, 45));
+        assert_eq!(penalty("backup"), (ContextKind::Generic, 40));
+        assert_eq!(penalty("recuperado"), (ContextKind::Generic, 35));
+        assert_eq!(penalty("temp"), (ContextKind::Generic, 30));
+        assert_eq!(penalty("documento - copia"), (ContextKind::Generic, 30));
+        assert_eq!(penalty("copia de informe"), (ContextKind::Generic, 30));
+        // A real materia name is neutral under the generic profile.
         assert_eq!(
-            classify_generic("documento - copia").map(|(p, _)| p),
-            Some(30)
+            generic.classify("expediente 1234-2020").0,
+            ContextKind::Neutral
         );
+        assert_eq!(generic.classify("periciales").0, ContextKind::Neutral);
+    }
+
+    /// The legal profile is what makes rule 9 bite: the same folder name is
+    /// neutral under `generic` and a protected boundary under `legal`.
+    #[test]
+    fn the_legal_profile_turns_expedientes_into_boundaries() {
+        let legal = df_domain::Profile::load("legal").unwrap();
+        assert_eq!(legal.classify("expediente").0, ContextKind::Protected);
+        assert_eq!(legal.classify("periciales").0, ContextKind::Protected);
+        // It still recognises the inherited generic containers.
         assert_eq!(
-            classify_generic("copia de informe").map(|(p, _)| p),
-            Some(30)
+            legal.classify("descargas"),
+            (ContextKind::Generic, 50, Some("descargas".to_string()))
         );
-        // A real materia name is neutral.
-        assert_eq!(classify_generic("expediente 1234-2020"), None);
-        assert_eq!(classify_generic("periciales"), None);
+
+        let generic = df_domain::Profile::load("generic").unwrap();
+        assert_eq!(generic.classify("expediente").0, ContextKind::Neutral);
+    }
+
+    /// `is_protected_boundary` must always agree with `kind`. It was once
+    /// hardcoded to 0, which would have made a PROTECTED folder look
+    /// unprotected to any reader of that column.
+    #[test]
+    fn the_protected_flag_always_agrees_with_the_kind() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project_id, snapshot_id, root_id) = seed(&mut db);
+        add_folder(&db, snapshot_id, root_id, "Expediente", "Expediente");
+        add_folder(&db, snapshot_id, root_id, "Descargas", "Descargas");
+        add_folder(&db, snapshot_id, root_id, "Informes", "Informes");
+
+        let summary =
+            classify_folders(&mut db, project_id, snapshot_id, "legal", Actor::Test).unwrap();
+        assert_eq!(summary.protected_boundaries, 1);
+        assert_eq!(summary.generic_folders, 1);
+
+        let mismatched: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM folder_contexts
+                 WHERE (kind = 'PROTECTED') != (is_protected_boundary = 1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mismatched, 0, "kind and is_protected_boundary disagree");
     }
 
     fn seed(db: &mut Db) -> (ProjectId, SnapshotId, SourceRootId) {

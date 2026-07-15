@@ -12,6 +12,7 @@ pub mod ids;
 pub mod inventory;
 pub mod manifest;
 pub mod plan;
+pub mod profile;
 pub mod project;
 pub mod raw_path;
 pub mod snapshot;
@@ -41,6 +42,7 @@ pub use plan::{
     ApprovalState, Confidence, ExecutionState, OperationErrorCode, OperationType, Plan,
     PlanOperation, PlanStatus, RiskLevel,
 };
+pub use profile::{GenericMarker, Profile, ProtectedMarker, DEFAULT_PROFILE_ID};
 pub use project::{ProfileRef, Project};
 pub use raw_path::RawPath;
 pub use snapshot::{Snapshot, SnapshotStatus};

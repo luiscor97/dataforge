@@ -20,6 +20,7 @@
 | [ADR-0023](ADR-0023-folder-merkle-signatures.md) | Firmas Merkle de carpeta y detección de clones exactos de árbol (M0.2) | Aceptada |
 | [ADR-0024](ADR-0024-folder-context-classification.md) | Clasificación de contexto de carpetas por marcadores de perfil (M0.2) | Aceptada |
 | [ADR-0025](ADR-0025-duplicate-logical-representative.md) | Representante lógico de un conjunto de duplicados (M0.2) | Aceptada |
+| [ADR-0026](ADR-0026-declarative-profiles.md) | Perfiles declarativos y fronteras protegidas (M0.2) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).
