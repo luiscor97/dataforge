@@ -672,7 +672,7 @@ mod tests {
         scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
         hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
         analyze_project(&mut db, Actor::Test).unwrap();
-        create_plan(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
         approve_plan(&mut db, Actor::Test).unwrap();
         Fixture { db, origin, output }
     }
@@ -856,7 +856,8 @@ mod tests {
         df_hash::hash_project(&mut db, Actor::Test, &df_hash::HashOptions::default(), None)
             .unwrap();
         df_planner::analyze_project(&mut db, Actor::Test).unwrap();
-        df_planner::create_plan(&mut db, Actor::Test).unwrap();
+        df_planner::create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly)
+            .unwrap();
         df_planner::approve_plan(&mut db, Actor::Test).unwrap();
 
         // The approved manifest must carry the raw path (§P0-5), not just the

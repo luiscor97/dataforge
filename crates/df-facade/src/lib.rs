@@ -11,6 +11,10 @@ use std::path::{Component, Path, PathBuf};
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
 use df_domain::{Actor, ProfileRef, Project, SourceRoot, TreeCloneSet};
+
+/// Re-exported so clients can name a policy without depending on `df-domain`
+/// (RFC-0001 rules 16/17: clients only ever talk to the facade).
+pub use df_domain::DuplicatePolicy;
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
@@ -560,11 +564,19 @@ pub fn analyze_project(project_dir: &Path, actor: Actor) -> DfResult<AnalyzeOutc
 
 /// Generate and validate the plan for the analysed snapshot (§26).
 /// Ends in `PLAN_READY`.
-pub fn create_plan(project_dir: &Path, actor: Actor) -> DfResult<PlanOutcome> {
+///
+/// `policy` decides what happens to exact duplicates (§15.4); it defaults to
+/// `REPORT_ONLY`, which copies every occurrence. No policy ever consolidates
+/// a copy that sits in a protected boundary (rule 9).
+pub fn create_plan(
+    project_dir: &Path,
+    actor: Actor,
+    policy: DuplicatePolicy,
+) -> DfResult<PlanOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_planner::create_plan(&mut db, actor)
+    df_planner::create_plan(&mut db, actor, policy)
 }
 
 /// Re-run the §26.5 invariants against the stored current plan.
@@ -919,7 +931,8 @@ mod tests {
         assert_eq!(analysis.duplicate_sets, 1);
         assert_eq!(analysis.state, "ANALYZED");
 
-        let plan = create_plan(&req.project_dir, Actor::Test).expect("plan");
+        let plan =
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
         assert_eq!(plan.copies, 2);
         assert_eq!(plan.state, "PLAN_READY");
 

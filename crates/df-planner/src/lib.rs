@@ -12,8 +12,9 @@ use std::path::Path;
 
 use df_db::{plans, repository, Db};
 use df_domain::{
-    Actor, ApprovalState, ExecutionState, ManifestEntry, OperationType, Plan, PlanOperation,
-    PlanStatus, ProjectState, RiskLevel, SourceRootId,
+    Actor, ApprovalState, DuplicateDisposition, DuplicateKind, DuplicatePolicy, ExecutionState,
+    ManifestEntry, OperationType, Plan, PlanOperation, PlanStatus, ProjectState, RiskLevel,
+    SourceRootId,
 };
 use df_error::{DfError, DfResult};
 use serde::Serialize;
@@ -46,6 +47,14 @@ pub struct PlanOutcome {
     pub directories: u64,
     pub no_action: u64,
     pub blocked: u64,
+    /// Duplicate occurrences not copied because the set's representative
+    /// already carries the content (§15.4). Always 0 under REPORT_ONLY.
+    pub skipped_represented: u64,
+    /// Duplicate occurrences copied *because* they sit in a protected
+    /// boundary that the policy must not dissolve (rule 9).
+    pub preserved_across_context: u64,
+    /// The duplicate policy this plan was generated under.
+    pub duplicate_policy: String,
     pub state: String,
 }
 
@@ -113,7 +122,11 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
 
 /// Generate, validate and persist the plan for the analyzed snapshot;
 /// moves the project `ANALYZED → PLANNING → PLAN_READY`.
-pub fn create_plan(db: &mut Db, actor: Actor) -> DfResult<PlanOutcome> {
+///
+/// `policy` governs what happens to exact duplicates (§15.4). The default,
+/// [`DuplicatePolicy::ReportOnly`], copies every occurrence; consolidation is
+/// always an explicit choice, and never dissolves a protected boundary.
+pub fn create_plan(db: &mut Db, actor: Actor, policy: DuplicatePolicy) -> DfResult<PlanOutcome> {
     let project = repository::load_project(db)?;
     if project.state != ProjectState::Analyzed {
         return Err(DfError::Validation(format!(
@@ -128,7 +141,7 @@ pub fn create_plan(db: &mut Db, actor: Actor) -> DfResult<PlanOutcome> {
 
     let version = plans::next_plan_version(db, project.id)?;
     let mut plan = Plan::new(project.id, snapshot.id, version);
-    let operations = build_operations(db, &plan)?;
+    let operations = build_operations(db, &plan, policy)?;
     validate_operations(&operations)?;
     plan.status = PlanStatus::Ready;
     plans::insert_plan(db, &plan, &operations, actor)?;
@@ -142,10 +155,15 @@ pub fn create_plan(db: &mut Db, actor: Actor) -> DfResult<PlanOutcome> {
         snapshot_id: snapshot.id.to_string(),
         version,
         operations: operations.len() as u64,
-        copies: count(OperationType::CopyActive) + count(OperationType::CopyWithSuffix),
+        copies: count(OperationType::CopyActive)
+            + count(OperationType::CopyWithSuffix)
+            + count(OperationType::PreserveAcrossContext),
         directories: count(OperationType::CreateDirectory),
         no_action: count(OperationType::NoAction),
         blocked: count(OperationType::Blocked),
+        skipped_represented: count(OperationType::SkipRepresented),
+        preserved_across_context: count(OperationType::PreserveAcrossContext),
+        duplicate_policy: policy.as_str().to_string(),
         state: project.state.as_str().to_string(),
     })
 }
@@ -312,11 +330,82 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
     }
 }
 
-fn build_operations(db: &Db, plan: &Plan) -> DfResult<Vec<PlanOperation>> {
+/// Classify a duplicate set from the contexts of its members (§15.3).
+///
+/// Conservative by construction: `WithinSameContext` is only claimed when the
+/// copies provably share a folder, because without the entity graph (§18.2)
+/// that is the only "same context" we can demonstrate. Anything else that is
+/// not clearly generic-to-canonical stays `UnknownContext`, which no policy
+/// consolidates.
+fn classify_duplicate_set(members: &[&df_db::dedup::DuplicateMember]) -> DuplicateKind {
+    if members.len() < 2 {
+        return DuplicateKind::UnknownContext;
+    }
+    // Any protected copy in a multi-copy set means consolidating would cross
+    // a boundary (rule 9).
+    if members
+        .iter()
+        .any(|m| m.context == df_domain::ContextKind::Protected)
+    {
+        return DuplicateKind::AcrossProtectedContexts;
+    }
+
+    // Provably the same context: all copies live in the same folder.
+    let first_parent = &members[0].parent_relative_path;
+    if members
+        .iter()
+        .all(|m| &m.parent_relative_path == first_parent)
+    {
+        return DuplicateKind::WithinSameContext;
+    }
+
+    let generic: Vec<_> = members
+        .iter()
+        .filter(|m| m.context == df_domain::ContextKind::Generic)
+        .collect();
+    let has_canonical = members.len() > generic.len();
+    if !generic.is_empty() && has_canonical {
+        // A backup replica is a generic copy whose marker says "backup".
+        let all_backup = generic.iter().all(|m| {
+            m.context_marker
+                .as_deref()
+                .is_some_and(|marker| marker.contains("backup"))
+        });
+        return if all_backup {
+            DuplicateKind::BackupReplica
+        } else {
+            DuplicateKind::GenericToCanonical
+        };
+    }
+
+    // Different folders, no generic/canonical split we can justify.
+    DuplicateKind::UnknownContext
+}
+
+fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<Vec<PlanOperation>> {
     let roots = repository::load_source_roots(db, plan.project_id)?;
     let root_dirs = root_destination_dirs(&roots);
     let folders = df_db::inventory::list_folders(db, plan.snapshot_id)?;
     let occurrences = plans::planning_occurrences(db, plan.snapshot_id)?;
+
+    // Duplicate membership + the kind of each set, so the policy can be
+    // applied per occurrence. Occurrences absent from this map are not
+    // duplicated and are always copied.
+    let members = df_db::dedup::duplicate_members(db, plan.snapshot_id)?;
+    let mut sets: HashMap<&str, Vec<&df_db::dedup::DuplicateMember>> = HashMap::new();
+    for member in &members {
+        sets.entry(&member.duplicate_set_id)
+            .or_default()
+            .push(member);
+    }
+    let kinds: HashMap<&str, DuplicateKind> = sets
+        .iter()
+        .map(|(set_id, members)| (*set_id, classify_duplicate_set(members)))
+        .collect();
+    let by_occurrence: HashMap<&str, &df_db::dedup::DuplicateMember> = members
+        .iter()
+        .map(|m| (m.occurrence_id.as_str(), m))
+        .collect();
 
     let sep = std::path::MAIN_SEPARATOR;
     let destination_for = |root_id: SourceRootId, relative: &str| -> Option<String> {
@@ -426,28 +515,102 @@ fn build_operations(db: &Db, plan: &Plan) -> DfResult<Vec<PlanOperation>> {
                                     occurrence.relative_path
                                 ))
                             })?;
-                    // Same-destination collision (e.g. names differing only
-                    // by case): deterministic suffix, decided at plan time.
-                    if taken_destinations.insert(planned.to_lowercase()) {
+
+                    // Duplicate policy (§15.3/§15.4). Non-duplicated files are
+                    // absent from the map and fall through to a plain copy.
+                    let duplicate = by_occurrence.get(occurrence_key.as_str()).map(|member| {
+                        let kind = kinds
+                            .get(member.duplicate_set_id.as_str())
+                            .copied()
+                            .unwrap_or(DuplicateKind::UnknownContext);
+                        let placement = df_domain::Placement {
+                            is_representative: member.is_representative,
+                            in_protected_context: member.context
+                                == df_domain::ContextKind::Protected,
+                            in_generic_context: member.context == df_domain::ContextKind::Generic,
+                        };
                         (
+                            kind,
+                            *member,
+                            df_domain::decide_duplicate(policy, kind, placement),
+                        )
+                    });
+
+                    match duplicate {
+                        Some((kind, _, DuplicateDisposition::SkipRepresented)) => (
+                            OperationType::SkipRepresented,
+                            None,
+                            RiskLevel::Medium,
+                            format!(
+                                "exact duplicate ({}) already represented by the set's canonical \
+                                 copy; not copied under policy {} — the source keeps it",
+                                kind.as_str(),
+                                policy.as_str()
+                            ),
+                        ),
+                        Some((kind, member, DuplicateDisposition::PreserveAcrossContext)) => {
+                            let marker = member
+                                .context_marker
+                                .as_deref()
+                                .unwrap_or("protected boundary");
+                            if taken_destinations.insert(planned.to_lowercase()) {
+                                (
+                                    OperationType::PreserveAcrossContext,
+                                    Some(planned),
+                                    RiskLevel::Low,
+                                    format!(
+                                        "exact duplicate ({}) preserved: it lives in a protected \
+                                         context (`{marker}`) that policy {} must not dissolve \
+                                         (RFC-0001 rule 9, §15.2)",
+                                        kind.as_str(),
+                                        policy.as_str()
+                                    ),
+                                )
+                            } else {
+                                let suffixed = suffixed_destination(&planned, sha256);
+                                taken_destinations.insert(suffixed.to_lowercase());
+                                (
+                                    OperationType::CopyWithSuffix,
+                                    Some(suffixed),
+                                    RiskLevel::Medium,
+                                    format!(
+                                        "protected duplicate whose destination `{planned}` \
+                                         collides; deterministic suffix applied (§27.3)"
+                                    ),
+                                )
+                            }
+                        }
+                        // Copy: representative, preserved policy, or not a duplicate.
+                        _ if taken_destinations.insert(planned.to_lowercase()) => (
                             OperationType::CopyActive,
                             Some(planned),
                             RiskLevel::Low,
-                            "verified copy preserving source structure (REPORT_ONLY policy)"
-                                .to_string(),
-                        )
-                    } else {
-                        let suffixed = suffixed_destination(&planned, sha256);
-                        taken_destinations.insert(suffixed.to_lowercase());
-                        (
-                            OperationType::CopyWithSuffix,
-                            Some(suffixed),
-                            RiskLevel::Medium,
-                            format!(
-                                "destination `{planned}` collides with another occurrence; \
-                                 deterministic suffix applied (RFC-0001 §27.3)"
-                            ),
-                        )
+                            match &duplicate {
+                                Some((kind, _, _)) => format!(
+                                    "verified copy of the canonical occurrence of an exact \
+                                     duplicate set ({}) under policy {}",
+                                    kind.as_str(),
+                                    policy.as_str()
+                                ),
+                                None => format!(
+                                    "verified copy preserving source structure (policy {})",
+                                    policy.as_str()
+                                ),
+                            },
+                        ),
+                        _ => {
+                            let suffixed = suffixed_destination(&planned, sha256);
+                            taken_destinations.insert(suffixed.to_lowercase());
+                            (
+                                OperationType::CopyWithSuffix,
+                                Some(suffixed),
+                                RiskLevel::Medium,
+                                format!(
+                                    "destination `{planned}` collides with another occurrence; \
+                                     deterministic suffix applied (RFC-0001 §27.3)"
+                                ),
+                            )
+                        }
                     }
                 }
                 _ => (
@@ -582,7 +745,7 @@ mod tests {
 
     fn analyzed_and_planned(db: &mut Db) -> PlanOutcome {
         analyze_project(db, Actor::Test).unwrap();
-        create_plan(db, Actor::Test).unwrap()
+        create_plan(db, Actor::Test, DuplicatePolicy::ReportOnly).unwrap()
     }
 
     #[test]
@@ -669,7 +832,7 @@ mod tests {
     fn planning_requires_the_analyzed_state() {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = hashed_project(tmp.path());
-        let err = create_plan(&mut db, Actor::Test).unwrap_err();
+        let err = create_plan(&mut db, Actor::Test, DuplicatePolicy::ReportOnly).unwrap_err();
         assert!(matches!(err, DfError::Validation(_)));
         let err = approve_plan(&mut db, Actor::Test).unwrap_err();
         assert!(matches!(err, DfError::Validation(_)));
@@ -741,5 +904,85 @@ mod tests {
         assert!(validate_operations(std::slice::from_ref(&op)).is_err());
         op.destination_relative_path = Some(PathBuf::from("C:\\absoluta").display().to_string());
         assert!(validate_operations(std::slice::from_ref(&op)).is_err());
+    }
+
+    /// Two identical files in the SAME folder: provably one context, so
+    /// CONSOLIDATE_WITHIN_CONTEXT may drop the non-representative copy.
+    fn project_with_two_copies_in_one_folder(tmp: &Path) -> Db {
+        let origin = tmp.join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("informe.txt"), b"same payload").unwrap();
+        std::fs::write(origin.join("informe copia.txt"), b"same payload").unwrap();
+
+        let mut db = Db::open(&tmp.join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Duplicados en una carpeta",
+            ProfileRef::default(),
+            tmp.join("salida"),
+            tmp.join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        db
+    }
+
+    #[test]
+    fn report_only_copies_every_duplicate_and_skips_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = project_with_two_copies_in_one_folder(tmp.path());
+        let outcome = create_plan(&mut db, Actor::Test, DuplicatePolicy::ReportOnly).unwrap();
+        assert_eq!(outcome.copies, 2, "both copies must be planned");
+        assert_eq!(outcome.skipped_represented, 0);
+        assert_eq!(outcome.duplicate_policy, "REPORT_ONLY");
+    }
+
+    #[test]
+    fn consolidate_within_context_skips_the_non_representative_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = project_with_two_copies_in_one_folder(tmp.path());
+        let outcome = create_plan(
+            &mut db,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateWithinContext,
+        )
+        .unwrap();
+
+        // One copy survives (the representative); the other is represented.
+        assert_eq!(outcome.copies, 1);
+        assert_eq!(outcome.skipped_represented, 1);
+
+        // Coverage still holds: the skipped occurrence is IN the plan (§26.2),
+        // it simply carries a non-executable operation.
+        let report = validate_plan(&db).unwrap();
+        assert!(report.ok, "{:?}", report.problems);
+
+        // And the decision is explained, never silent (§5.3).
+        let project = repository::load_project(&db).unwrap();
+        let plan = plans::current_plan(&db, project.id).unwrap().unwrap();
+        let skipped = plans::list_operations(&db, plan.id)
+            .unwrap()
+            .into_iter()
+            .find(|o| o.operation_type == OperationType::SkipRepresented)
+            .expect("a SKIP_REPRESENTED operation");
+        assert!(skipped.destination_relative_path.is_none());
+        assert!(skipped.reason.contains("WITHIN_SAME_CONTEXT"));
+        assert!(skipped.reason.contains("CONSOLIDATE_WITHIN_CONTEXT"));
+    }
+
+    /// §15.2: copies in different folders cannot be proven to share a context
+    /// without the entity graph, so no policy consolidates them.
+    #[test]
+    fn duplicates_across_unproven_contexts_are_never_consolidated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = hashed_project(tmp.path());
+        analyze_project(&mut db, Actor::Test).unwrap();
+        let outcome = create_plan(&mut db, Actor::Test, DuplicatePolicy::ConsolidateAll).unwrap();
+        // a.txt and sub/b.txt are identical but live in different folders.
+        assert_eq!(outcome.skipped_represented, 0);
+        assert_eq!(outcome.copies, 3);
     }
 }

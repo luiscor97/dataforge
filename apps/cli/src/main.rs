@@ -125,6 +125,11 @@ enum PlanCommand {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// What to do with exact duplicates (RFC-0001 §15.4). The default
+        /// copies every occurrence. No policy ever consolidates a copy that
+        /// lives in a protected context.
+        #[arg(long, value_name = "POLICY", default_value = "REPORT_ONLY")]
+        duplicate_policy: String,
     },
     /// Re-check the plan invariants (destinations, collisions, coverage).
     Validate {
@@ -224,8 +229,12 @@ fn run(cli: &Cli) -> DfResult<Output> {
             df_facade::analyze_project(path, Actor::Cli).map(Output::Analyze)
         }
         Command::Plan { command } => match command {
-            PlanCommand::Create { path } => {
-                df_facade::create_plan(path, Actor::Cli).map(Output::Plan)
+            PlanCommand::Create {
+                path,
+                duplicate_policy,
+            } => {
+                let policy = df_facade::DuplicatePolicy::parse(duplicate_policy)?;
+                df_facade::create_plan(path, Actor::Cli, policy).map(Output::Plan)
             }
             PlanCommand::Validate { path } => {
                 df_facade::validate_plan(path).map(Output::PlanValidation)

@@ -514,7 +514,7 @@ mod tests {
         scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
         hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
         analyze_project(&mut db, Actor::Test).unwrap();
-        create_plan(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
         approve_plan(&mut db, Actor::Test).unwrap();
         execute_plan(&mut db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
         Fixture { db, origin, output }
