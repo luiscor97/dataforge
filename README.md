@@ -9,11 +9,37 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
-**Estado actual: Milestone 0.1 — Safe Inventory Core (en curso).**
+**Estado actual: `v0.1.1-dev` — Filesystem Safety Hardening (en curso).**
+
+DataForge **no está listo para producción general**. Lo que hay hoy es una
+**réplica segura y verificable**: inventaría un origen sin tocarlo, produce una
+copia verificada criptográficamente y la audita. La reconstrucción documental
+—contextos, perfiles, relaciones, búsqueda— **todavía no existe**.
+
+Qué debes saber antes de apuntarlo a datos reales:
+
+- **Windows es la única plataforma con la seguridad implementada.** En Linux y
+  macOS la ejecución **se bloquea** en lugar de fingir garantías que no
+  tenemos.
+- **NAS/UNC es experimental** y no está validado: sin identidad física del
+  filesystem, la detección de sustituciones baja a *degradada*.
+- **Las garantías dependen de lo que ofrezca el filesystem.** DataForge lo dice
+  explícitamente en cada fingerprint en vez de suponerlo.
+- Frente a quien pueda editar la base del proyecto, la garantía es de
+  **detección**, no de prevención.
+
+Detalle completo en
+[`docs/threat-model/filesystem-hardening.md`](docs/threat-model/filesystem-hardening.md).
 
 Qué existe hoy (real, con pruebas):
 
-- Monorepo Rust (workspace de 12 crates) + pnpm.
+- Monorepo Rust (workspace de 13 crates) + pnpm.
+- **Frontera segura del sistema de archivos** (`df-fs-safety`): ninguna
+  escritura sale del output root a través de junctions, symlinks o reparse
+  points; el finalize no sobrescribe por semántica de plataforma, no por una
+  comprobación previa; el verificador nunca sigue enlaces.
+- **Manifiesto de ejecución inmutable**: lo aprobado es exactamente lo
+  ejecutado, y manipularlo se detecta criptográficamente.
 - Dominio: IDs tipados, `Project`, `SourceRoot`, `Snapshot`, `AuditEvent`,
   inventario (`PathOccurrence`, `ContentObject`, fingerprints) y la máquina
   de estados completa de RFC-0001 §11.
@@ -50,8 +76,8 @@ Qué existe hoy (real, con pruebas):
   comandos de `df-facade` que la CLI.
 
 Qué **no** existe todavía (y no está simulado): contextos y perfiles,
-consolidación de duplicados, similitud, búsqueda, informes exportables,
-plugins, IA.
+reconstrucción documental, consolidación de duplicados, similitud, búsqueda,
+informes exportables, plugins, IA.
 Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro).
 
 ## Inicio rápido (Windows)
@@ -97,7 +123,7 @@ pnpm --filter dataforge-desktop tauri dev
 ```text
 apps/cli/        CLI `dataforge`
 apps/desktop/    Tauri 2 + React + TS strict (cliente de df-facade)
-crates/df-*      motor: error, domain, ledger, db, scan, hash,
+crates/df-*      motor: error, domain, fs-safety, ledger, db, scan, hash,
                  planner, executor, verifier, facade
 docs/            RFCs, ADRs, arquitectura, threat model, guías
 scripts/         bootstrap reproducible del entorno (PowerShell)

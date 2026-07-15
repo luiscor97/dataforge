@@ -3,7 +3,82 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 Versionado: [SemVer](https://semver.org/lang/es/).
 
-## [Unreleased] — Milestone 0.1 "Safe Inventory Core" (en curso)
+## [Unreleased]
+
+### Hardening de seguridad del sistema de archivos (v0.1.1-dev)
+
+Endurece el núcleo para poder probarlo sobre colecciones reales supervisadas.
+No añade funcionalidad de producto. Modelo de amenazas completo en
+[`docs/threat-model/filesystem-hardening.md`](docs/threat-model/filesystem-hardening.md).
+
+- **Frontera segura del sistema de archivos** (crate nuevo `df-fs-safety`,
+  ADR-0017): toda escritura pasa por él. El output root se valida y se
+  identifica **físicamente** (volume serial + file id) antes de escribir y se
+  revalida durante la ejecución; los destinos se resuelven **componente a
+  componente** rechazando cualquiera que sea reparse point (symlink, junction o
+  mount point). Sustituye `create_dir_all` y `File::create` por equivalentes
+  que comprueban cada nivel. Motivo: validar que una ruta es relativa y sin
+  `..` es *texto*, y el texto no dice nada del disco — una junction preexistente
+  dentro de la salida redirigía la escritura fuera de ella.
+- **Finalize sin reemplazo real** (ADR-0021): `MoveFileExW` **sin**
+  `MOVEFILE_REPLACE_EXISTING`. Corrige una ventana real de sobrescritura
+  silenciosa: en Windows `std::fs::rename` **sí sobrescribe**, y el
+  `destination.exists()` previo era una comprobación TOCTOU — el código
+  afirmaba una garantía que en esta plataforma no tenía (regla 3).
+- **El verificador nunca sigue enlaces** (§28.2): recorrido con
+  `symlink_metadata`, reparse points reportados y jamás traspasados, ciclos
+  cortados por identidad física, y errores de lectura convertidos en hallazgos
+  (`OUTPUT_REPARSE_POINT`, `OUTPUT_SUBTREE_UNREADABLE`) en vez de un `continue`
+  silencioso. Antes podía leer **fuera** del output root y aun así certificarlo.
+- **Manifiesto de ejecución inmutable** (migración `0004_execution_manifest`,
+  ADR-0018): la aprobación congela el contrato completo —qué se lee, qué
+  contenido se espera, dónde se escribe y qué operación corre— y el SHA-256 lo
+  cubre entero. El executor ejecuta **solo** el manifiesto; las tablas de
+  inventario vuelven a ser evidencia. Inmutabilidad impuesta por triggers.
+  Antes, editar `content_objects.sha256` tras aprobar cambiaba lo ejecutado
+  **sin mover el hash del plan** (la regla 10 era medio verdad).
+- **Fingerprint físico v2** (ADR-0019): enum versionado `V1`/`V2`; v2 añade
+  identidad física, `ChangeTime` de NTFS y atributos. Detecta la sustitución de
+  un archivo por otro **del mismo tamaño y mismo mtime**, que v1 no veía. La
+  comparación es un veredicto explícito (`SamePhysical`/`SameDegraded`/
+  `Changed`), no `PartialEq`: identidad degradada **no** es "sin cambios", y v1
+  y v2 nunca se declaran equivalentes. Los tokens v1 existentes siguen
+  leyéndose.
+- **Rutas raw reversibles** (migración `0005_path_identity`, ADR-0020): se
+  conservan las unidades UTF-16 exactas (BLOB LE; hex en el JSON del
+  manifiesto). Display, comparación y raw son tres cosas distintas y solo la
+  raw abre archivos. Antes, un nombre con un surrogate suelto —legal en
+  Windows— podía quedar inabrible o, peor, abrir **otro** archivo.
+- **Creación atómica de proyectos y marker endurecido** (ADR-0022): el proyecto
+  se construye en `<dir>.init-<uuid>` y se finaliza con un rename atómico; el
+  marker se escribe el último y solo tras el integrity check. Un fallo no deja
+  medio proyecto y el reintento funciona; **nunca** se limpia una carpeta
+  preexistente del usuario. El marker deja de ser autoritativo para la ruta de
+  la base (en Windows `join` con ruta absoluta descartaba la base y permitía
+  redirigir SQLite fuera del proyecto), y `schema_version` gobierna la apertura
+  con política explícita para versión futura, antigua o manipulada.
+- CI: jobs Windows específicos de hardening, tests de manipulación y
+  compatibilidad de migraciones.
+- `cargo deny` vuelve a estar verde: llevaba roto desde M0.0 sin detectarse
+  porque la CI nunca había llegado a ejecutarse. Los wildcards se eliminan
+  dando versión explícita a las dependencias internas (sin excepción de
+  configuración); los cinco advisories `unmaintained` de `unic-*` —que llegan
+  transitivamente desde Tauri— se ignoran **uno a uno**, documentados y con
+  condición de retirada y fecha de revisión.
+
+### Limitaciones de este incremento
+
+- **Windows es la única plataforma con seguridad implementada.** En el resto,
+  la ejecución se **bloquea** en lugar de fingir garantías (regla 19).
+- NAS/UNC sigue **experimental**: sin `file_id` la identidad es *degradada* y no
+  se puede descartar sustitución.
+- La garantía frente a quien pueda editar la base es de **detección**, no de
+  prevención.
+- Sin durabilidad garantizada ante fallo físico del hardware.
+- Queda ventana TOCTOU residual entre validación y escritura: se reduce a
+  "falla, no pisa", no se elimina.
+
+## [Anterior] — Milestone 0.1 "Safe Inventory Core"
 
 ### Añadido
 
