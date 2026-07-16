@@ -34,7 +34,7 @@ pub struct ContextSummary {
 /// the result. Idempotent: rows for the snapshot are replaced.
 ///
 /// `profile` selects the marker set from `profiles/<id>/profile.json`; an
-/// unknown id falls back to `generic` (conservative default, §25.4).
+/// unknown id is rejected rather than silently losing domain protections.
 pub fn classify_folders(
     db: &mut Db,
     project_id: ProjectId,
@@ -42,8 +42,8 @@ pub fn classify_folders(
     profile: &str,
     actor: Actor,
 ) -> DfResult<ContextSummary> {
-    // The profile is data (ADR-0026): an unknown id falls back to `generic`,
-    // which protects nothing but also consolidates nothing by itself.
+    // The profile is data (ADR-0026): typos must fail closed rather than
+    // silently selecting a different marker set.
     let profile = df_domain::Profile::load(profile)?;
 
     let snapshot = snapshot_id.to_string();
@@ -83,25 +83,29 @@ pub fn classify_folders(
         neutral_folders: 0,
     };
     for (folder_id, relative_path, normalized_name) in &folders {
-        let (kind, penalty, marker) = match profile.classify(normalized_name) {
+        let (kind, penalty, marker, reason) = match profile.classify(normalized_name) {
             (ContextKind::Protected, _, marker) => {
                 summary.protected_boundaries += 1;
-                (ContextKind::Protected, 0u32, marker)
+                let reason = marker
+                    .as_deref()
+                    .and_then(|name| profile.protected_reason(name))
+                    .map(str::to_owned);
+                (ContextKind::Protected, 0u32, marker, reason)
             }
             (ContextKind::Generic, penalty, marker) => {
                 summary.generic_folders += 1;
-                (ContextKind::Generic, penalty, marker)
+                (ContextKind::Generic, penalty, marker, None)
             }
             (ContextKind::Neutral, _, _) => {
                 summary.neutral_folders += 1;
-                (ContextKind::Neutral, 0u32, None)
+                (ContextKind::Neutral, 0u32, None, None)
             }
         };
         tx.execute(
             "INSERT INTO folder_contexts
                 (folder_id, snapshot_id, relative_path, kind,
-                 is_protected_boundary, penalty, marker, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 is_protected_boundary, penalty, marker, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 folder_id,
                 snapshot,
@@ -112,6 +116,7 @@ pub fn classify_folders(
                 (kind == ContextKind::Protected) as i64,
                 penalty as i64,
                 marker,
+                reason,
                 now,
             ],
         )
@@ -136,6 +141,15 @@ pub struct GenericFolder {
     pub path: String,
     pub marker: Option<String>,
     pub penalty: u32,
+}
+
+/// A protected domain boundary with the exact profile evidence that created
+/// it. These rows explain why duplicate consolidation stops at the folder.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProtectedFolder {
+    pub path: String,
+    pub marker: String,
+    pub reason: String,
 }
 
 /// Read the generic folders of a snapshot, worst (highest penalty) first.
@@ -166,6 +180,39 @@ pub fn generic_folders(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Generic
                 path,
                 marker,
                 penalty: penalty as u32,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
+pub fn protected_folders(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<ProtectedFolder>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT r.absolute_path, fc.relative_path, fc.marker, fc.reason
+             FROM folder_contexts fc
+             JOIN folders f ON f.id = fc.folder_id
+             JOIN source_roots r ON r.id = f.source_root_id
+             WHERE fc.snapshot_id = ?1 AND fc.kind = 'PROTECTED'
+             ORDER BY r.absolute_path, fc.relative_path",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            let root: String = row.get(0)?;
+            let relative: String = row.get(1)?;
+            let path = if relative.is_empty() {
+                root
+            } else {
+                format!("{root}{}{relative}", std::path::MAIN_SEPARATOR)
+            };
+            Ok(ProtectedFolder {
+                path,
+                marker: row.get(2)?,
+                reason: row.get(3)?,
             })
         })
         .map_err(db_err)?
@@ -251,6 +298,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mismatched, 0, "kind and is_protected_boundary disagree");
+        let protected = protected_folders(&db, snapshot_id).unwrap();
+        assert_eq!(protected.len(), 1);
+        assert!(protected[0].reason.contains("expediente"));
     }
 
     fn seed(db: &mut Db) -> (ProjectId, SnapshotId, SourceRootId) {

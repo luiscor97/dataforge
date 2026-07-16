@@ -57,6 +57,10 @@ pub struct FolderRecord {
     pub source_root_id: SourceRootId,
     /// Path relative to the source root; empty string for the root itself.
     pub relative_path: String,
+    /// Exact UTF-16 representation of `relative_path` (ADR-0020). The display
+    /// path above is retained for reports and comparison only. `None` is
+    /// accepted for snapshots created before exact folder paths were captured.
+    pub raw_relative_path: Option<crate::raw_path::RawPath>,
     pub parent_relative_path: Option<String>,
     pub name: String,
     pub normalized_name: String,

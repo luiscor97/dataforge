@@ -11,9 +11,10 @@ use clap::{Parser, Subcommand};
 use df_domain::Actor;
 use df_error::DfResult;
 use df_facade::{
-    AnalyzeOutcome, ApproveOutcome, AuditReport, ContextReport, CreateProjectRequest,
-    DuplicateReport, ExecuteOutcome, HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus,
-    ScanOutcome, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    AnalyzeOutcome, AnomalyReport, ApproveOutcome, AuditReport, ContextReport,
+    CreateProjectRequest, DuplicateReport, ExecuteOutcome, HashOutcome, PlanOutcome,
+    PlanValidationReport, ProjectStatus, ReviewQueue, ScanOutcome, TreeCloneReport,
+    TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -78,6 +79,11 @@ enum Command {
     Report {
         #[command(subcommand)]
         command: ReportCommand,
+    },
+    /// Review ambiguous structural findings before creating a plan.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
     },
     /// Audit ledger operations.
     Audit {
@@ -171,6 +177,38 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Structural anomalies with the evidence behind each finding.
+    Anomalies {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewCommand {
+    /// List pending and decided structural review items.
+    List {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Append a human decision before generating the plan.
+    Decide {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// Review item identifier shown by `review list`.
+        #[arg(long)]
+        item: String,
+        /// Safe copy action: COPY_ACTIVE, COPY_REVIEW, COPY_SEPARATED or
+        /// COPY_TEMPORARY. Destructive actions do not exist.
+        #[arg(long)]
+        decision: String,
+        /// Human explanation preserved in the append-only ledger.
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -200,6 +238,8 @@ enum Output {
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
+    Anomalies(AnomalyReport),
+    Review(ReviewQueue),
     Audit(AuditReport),
 }
 
@@ -267,6 +307,24 @@ fn run(cli: &Cli) -> DfResult<Output> {
             ReportCommand::Contexts { path } => {
                 df_facade::context_report(path).map(Output::Contexts)
             }
+            ReportCommand::Anomalies { path } => {
+                df_facade::structural_anomaly_report(path).map(Output::Anomalies)
+            }
+        },
+        Command::Review { command } => match command {
+            ReviewCommand::List { path } => {
+                df_facade::structural_review_queue(path).map(Output::Review)
+            }
+            ReviewCommand::Decide {
+                path,
+                item,
+                decision,
+                reason,
+            } => {
+                let decision = df_facade::RuleAction::parse(decision)?;
+                df_facade::decide_structural_review(path, item, decision, reason, Actor::Cli)
+                    .map(Output::Review)
+            }
         },
         Command::Audit { command } => match command {
             AuditCommand::Verify { path } => df_facade::verify_audit(path).map(Output::Audit),
@@ -319,6 +377,29 @@ fn print_status(status: &ProjectStatus) {
             }
         }
     }
+    if let Some(diagnostic) = &status.structural_diagnostics {
+        println!(
+            "Structural: {} | {} signature(s), {} exact clone set(s), {} partial, {} embedded",
+            if diagnostic.analysis_complete {
+                "complete"
+            } else {
+                "not analysed"
+            },
+            diagnostic.folder_signatures,
+            diagnostic.exact_tree_clone_sets,
+            diagnostic.partial_tree_clones,
+            diagnostic.embedded_trees
+        );
+        println!(
+            "Diagnostic: {} protected, {} generic, {} rule match(es), {} anomaly/anomalies ({} high), {} pending review",
+            diagnostic.protected_boundaries,
+            diagnostic.generic_folders,
+            diagnostic.rule_matches,
+            diagnostic.anomalies,
+            diagnostic.high_anomalies,
+            diagnostic.pending_review
+        );
+    }
 }
 
 fn print_scan(outcome: &ScanOutcome) {
@@ -356,7 +437,14 @@ fn print_analyze(outcome: &AnalyzeOutcome) {
     println!("Folder signatures: {}", outcome.folder_signatures);
     println!("Tree clone sets  : {}", outcome.tree_clone_sets);
     println!("Generic folders  : {}", outcome.generic_folders);
+    println!("Protected bounds : {}", outcome.protected_boundaries);
     println!("Representatives  : {}", outcome.duplicate_representatives);
+    println!("Rule matches     : {}", outcome.rule_matches);
+    println!(
+        "Anomalies        : {} ({} high)",
+        outcome.anomalies, outcome.high_anomalies
+    );
+    println!("Review items     : {}", outcome.review_items);
     println!("State            : {}", outcome.state);
 }
 
@@ -365,6 +453,9 @@ fn print_plan(outcome: &PlanOutcome) {
     println!("Snapshot    : {}", outcome.snapshot_id);
     println!("Operations  : {}", outcome.operations);
     println!("  copies      : {}", outcome.copies);
+    println!("    review    : {}", outcome.review_copies);
+    println!("    separated : {}", outcome.separated_copies);
+    println!("    temporary : {}", outcome.temporary_copies);
     println!("  directories : {}", outcome.directories);
     println!("  no action   : {}", outcome.no_action);
     println!("  blocked     : {}", outcome.blocked);
@@ -521,6 +612,76 @@ fn print_contexts(report: &ContextReport) {
     if report.generic_folders.is_empty() {
         println!("No generic low-value folders found.");
     }
+    println!("Protected bounds : {}", report.protected_folders.len());
+    for folder in &report.protected_folders {
+        println!(
+            "  ! [{}] {} — {}",
+            folder.marker, folder.path, folder.reason
+        );
+    }
+}
+
+fn print_anomalies(report: &AnomalyReport) {
+    println!("Snapshot      : {}", report.snapshot_id);
+    println!(
+        "Anomalies     : {} high, {} warning(s), {} information",
+        report.high, report.warnings, report.information
+    );
+    for anomaly in &report.anomalies {
+        println!();
+        println!(
+            "  [{}] {} — {}",
+            anomaly.severity, anomaly.kind, anomaly.summary
+        );
+        println!("    id: {}", anomaly.id);
+        if anomaly.requires_review {
+            println!("    review required");
+        }
+    }
+    if report.anomalies.is_empty() {
+        println!("No structural anomalies found.");
+    }
+}
+
+fn print_review(queue: &ReviewQueue) {
+    println!("Snapshot : {}", queue.snapshot_id);
+    println!("Pending  : {}", queue.pending);
+    println!("Decided  : {}", queue.decided);
+    for item in &queue.items {
+        println!();
+        println!(
+            "  [{}] {} {} — {}",
+            item.risk, item.status, item.kind, item.reason
+        );
+        println!("    id          : {}", item.id);
+        if let Some(occurrence) = &item.occurrence_id {
+            println!("    occurrence  : {occurrence}");
+        }
+        if let Some(folder) = &item.folder_a {
+            println!("    folder a    : {folder}");
+        }
+        if let Some(folder) = &item.folder_b {
+            println!("    folder b    : {folder}");
+        }
+        println!("    recommended : {}", item.recommended_action);
+        if !item.materializable {
+            println!(
+                "    next step   : repair source access and rescan; bucket decisions are disabled"
+            );
+        }
+        if let Some(decision) = &item.decision {
+            println!("    decision    : {decision}");
+        }
+        if let Some(rationale) = &item.rationale {
+            println!("    rationale   : {rationale}");
+        }
+        if let Some(evidence) = &item.evidence {
+            println!(
+                "    evidence    : {}",
+                serde_json::to_string(evidence).unwrap_or_else(|_| "<invalid>".to_string())
+            );
+        }
+    }
 }
 
 fn print_audit(report: &AuditReport) {
@@ -551,6 +712,8 @@ fn print_human(output: &Output) {
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
+        Output::Anomalies(report) => print_anomalies(report),
+        Output::Review(queue) => print_review(queue),
         Output::Audit(report) => print_audit(report),
     }
 }
@@ -631,6 +794,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,
+        Output::Anomalies(_) | Output::Review(_) => 0,
     }
 }
 
@@ -758,6 +922,13 @@ mod tests {
             _ => panic!("hash returns a hash outcome"),
         }
 
+        let analyze = run(&Cli::parse_from(["dataforge", "analyze", "--path", path]))
+            .expect("analyze succeeds");
+        match &analyze {
+            Output::Analyze(outcome) => assert_eq!(outcome.state, "ANALYZED"),
+            _ => panic!("analyze returns an analyze outcome"),
+        }
+
         let dupes = run(&Cli::parse_from([
             "dataforge",
             "report",
@@ -772,13 +943,6 @@ mod tests {
                 assert_eq!(report.redundant_files, 1);
             }
             _ => panic!("report returns duplicates"),
-        }
-
-        let analyze = run(&Cli::parse_from(["dataforge", "analyze", "--path", path]))
-            .expect("analyze succeeds");
-        match &analyze {
-            Output::Analyze(outcome) => assert_eq!(outcome.state, "ANALYZED"),
-            _ => panic!("analyze returns an analyze outcome"),
         }
 
         let plan = run(&Cli::parse_from([

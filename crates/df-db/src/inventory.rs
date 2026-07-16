@@ -93,8 +93,9 @@ fn insert_folder(tx: &Transaction<'_>, folder: &FolderRecord) -> DfResult<()> {
     tx.execute(
         "INSERT INTO folders
             (id, snapshot_id, source_root_id, relative_path, parent_relative_path,
-             name, normalized_name, depth, status, error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             name, normalized_name, depth, status, error, raw_relative_path,
+             created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             folder.id.to_string(),
             folder.snapshot_id.to_string(),
@@ -106,6 +107,7 @@ fn insert_folder(tx: &Transaction<'_>, folder: &FolderRecord) -> DfResult<()> {
             folder.depth as i64,
             folder.status.as_str(),
             folder.error,
+            folder.raw_relative_path.as_ref().map(|r| r.to_blob()),
             to_stored_timestamp(chrono::Utc::now()),
         ],
     )
@@ -354,7 +356,8 @@ pub fn list_folders(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<FolderReco
         .conn()
         .prepare(
             "SELECT id, snapshot_id, source_root_id, relative_path,
-                    parent_relative_path, name, normalized_name, depth, status, error
+                    parent_relative_path, name, normalized_name, depth, status,
+                    error, raw_relative_path
              FROM folders
              WHERE snapshot_id = ?1
              ORDER BY depth, relative_path",
@@ -373,17 +376,33 @@ pub fn list_folders(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<FolderReco
                 row.get::<_, i64>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (id, snapshot, root, relative, parent, name, normalized, depth, status, error) =
-                raw.map_err(db_err)?;
+            let (
+                id,
+                snapshot,
+                root,
+                relative,
+                parent,
+                name,
+                normalized,
+                depth,
+                status,
+                error,
+                raw_relative_path,
+            ) = raw.map_err(db_err)?;
             Ok(FolderRecord {
                 id: df_domain::FolderId::from_str(&id)?,
                 snapshot_id: SnapshotId::from_str(&snapshot)?,
                 source_root_id: SourceRootId::from_str(&root)?,
                 relative_path: relative,
+                raw_relative_path: raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 parent_relative_path: parent,
                 name,
                 normalized_name: normalized,
@@ -560,6 +579,9 @@ pub struct PendingHashJob {
     pub snapshot_id: SnapshotId,
     /// Absolute path of the source root that contains the file.
     pub root_path: PathBuf,
+    /// Exact path captured by the scanner. This is authoritative whenever it
+    /// exists; `relative_path` below is display/legacy evidence only.
+    pub raw_relative_path: Option<df_domain::RawPath>,
     pub relative_path: String,
     pub size_bytes: u64,
     /// Fingerprint captured at scan time (RFC-0001 §14.5 pre-check).
@@ -576,7 +598,7 @@ pub fn pending_hash_jobs(
         .conn()
         .prepare(
             "SELECT j.id, j.occurrence_id, o.relative_path, o.size_bytes,
-                    o.fingerprint, r.absolute_path
+                    o.fingerprint, r.absolute_path, o.raw_relative_path
              FROM hash_jobs j
              JOIN path_occurrences o ON o.id = j.occurrence_id
              JOIN source_roots r ON r.id = o.source_root_id
@@ -594,16 +616,22 @@ pub fn pending_hash_jobs(
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (job, occurrence, relative, size, fingerprint, root) = raw.map_err(db_err)?;
+            let (job, occurrence, relative, size, fingerprint, root, raw_relative) =
+                raw.map_err(db_err)?;
             Ok(PendingHashJob {
                 job_id: HashJobId::from_str(&job)?,
                 occurrence_id: OccurrenceId::from_str(&occurrence)?,
                 snapshot_id,
                 root_path: PathBuf::from(root),
+                raw_relative_path: raw_relative
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 relative_path: relative,
                 size_bytes: size as u64,
                 fingerprint,

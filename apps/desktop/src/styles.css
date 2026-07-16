@@ -4,6 +4,7 @@
   --accent: #2563eb;
   --danger: #b91c1c;
   --ok: #15803d;
+  --warning: #a16207;
   --border: #d1d5db;
 }
 
@@ -31,7 +32,16 @@ body {
 
 .topbar h1 {
   font-size: 1.4rem;
-  cursor: pointer;
+  margin: 0.7rem 0;
+}
+
+.brand-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+  font-weight: 700;
 }
 
 .version {
@@ -54,7 +64,8 @@ form label {
 }
 
 form input,
-form textarea {
+form textarea,
+form select {
   display: block;
   width: 100%;
   margin-top: 0.3rem;
@@ -63,6 +74,15 @@ form textarea {
   font-weight: 400;
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+
+.field-help {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.85rem;
+  font-weight: 400;
+  line-height: 1.4;
+  opacity: 0.78;
 }
 
 .actions {
@@ -90,6 +110,14 @@ button[type="button"]:not(:first-child) {
 button:disabled {
   opacity: 0.6;
   cursor: wait;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 2px;
 }
 
 .error {
@@ -135,4 +163,129 @@ button:disabled {
 
 .problems {
   color: var(--danger);
+}
+
+.diagnostics {
+  margin-top: 1.6rem;
+  padding-top: 1.35rem;
+  border-top: 1px solid var(--border);
+}
+
+.section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.section-heading h3,
+.diagnostic-group h4 {
+  margin: 0;
+}
+
+.section-heading p,
+.diagnostic-group p {
+  margin: 0.35rem 0 0;
+  line-height: 1.45;
+  opacity: 0.78;
+}
+
+.diagnostic-badge {
+  flex: none;
+  padding: 0.2rem 0.65rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.diagnostic-complete {
+  color: var(--ok);
+}
+
+.diagnostic-status {
+  margin: 0;
+  padding: 0.8rem 0.95rem;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 6px;
+  line-height: 1.5;
+}
+
+.diagnostic-pending {
+  border-left-color: var(--warning);
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.9rem;
+}
+
+.diagnostic-group {
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+}
+
+.metric-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 0.4rem 0.8rem;
+  margin: 0.9rem 0 0;
+}
+
+.metric-list dt {
+  min-width: 0;
+}
+
+.metric-list dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  text-align: right;
+}
+
+.metric-alert {
+  color: var(--danger);
+}
+
+.metric-warning {
+  color: var(--warning);
+}
+
+.diagnostic-note {
+  margin: 0.9rem 0 0;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  opacity: 0.82;
+}
+
+@media (max-width: 600px) {
+  .shell {
+    padding-inline: 1rem;
+  }
+
+  .facts {
+    grid-template-columns: 1fr;
+  }
+
+  .facts dt:not(:first-child) {
+    margin-top: 0.55rem;
+  }
+
+  .section-heading {
+    display: block;
+  }
+
+  .diagnostic-badge {
+    display: inline-block;
+    margin-top: 0.7rem;
+  }
+
+  .actions {
+    flex-wrap: wrap;
+  }
 }

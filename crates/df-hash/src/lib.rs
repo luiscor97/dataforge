@@ -123,7 +123,12 @@ pub fn hash_project(
 
 /// Hash one file; only infrastructure (database) errors propagate.
 fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfResult<()> {
-    let path = compose_path(&job.root_path, &job.relative_path);
+    let relative = job
+        .raw_relative_path
+        .as_ref()
+        .map(|raw| PathBuf::from(raw.to_os_string()))
+        .unwrap_or_else(|| PathBuf::from(&job.relative_path));
+    let path = compose_path(&job.root_path, &relative);
 
     let pre = match current_fingerprint(&path) {
         Ok(fingerprint) => fingerprint,
@@ -221,8 +226,8 @@ fn current_fingerprint(path: &Path) -> DfResult<FileFingerprint> {
 
 /// Mirror of the scanner's path composition, including the Windows
 /// extended-length prefix for long paths.
-fn compose_path(root: &Path, relative: &str) -> PathBuf {
-    let joined = if relative.is_empty() {
+fn compose_path(root: &Path, relative: &Path) -> PathBuf {
+    let joined = if relative.as_os_str().is_empty() {
         root.to_path_buf()
     } else {
         root.join(relative)
@@ -387,5 +392,60 @@ mod tests {
         assert!(types.contains(&"HASH_STARTED"));
         assert!(types.contains(&"HASH_COMPLETED"));
         df_ledger::verify_chain(&events).expect("ledger stays valid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_utf16_source_path_is_reopened_from_raw_identity() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        let name = std::ffi::OsString::from_wide(&[
+            b'i' as u16,
+            b'n' as u16,
+            b'v' as u16,
+            0xD800,
+            b'.' as u16,
+            b'b' as u16,
+            b'i' as u16,
+            b'n' as u16,
+        ]);
+        let source = origin.join(&name);
+        std::fs::write(&source, b"raw utf16 identity").unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "UTF-16 no representable",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        repository::create_project(
+            &mut db,
+            &project,
+            &[SourceRoot::new(project.id, origin)],
+            Actor::Test,
+        )
+        .unwrap();
+        let scanned = scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        assert_eq!(scanned.files, 1);
+        assert_eq!(scanned.errors, 0);
+        let snapshot_id = scanned.snapshot_id.parse().unwrap();
+        let occurrences = list_occurrences(&db, snapshot_id).unwrap();
+        assert_eq!(occurrences.len(), 1);
+        assert!(occurrences[0]
+            .raw_relative_path
+            .as_ref()
+            .is_some_and(df_domain::RawPath::is_lossy));
+
+        let hashed = hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        assert_eq!(hashed.hashed, 1);
+        assert_eq!(hashed.failed, 0);
+        assert_eq!(hashed.source_changed, 0);
+        let summary = inventory::inventory_summary(&db, snapshot_id).unwrap();
+        assert_eq!(summary.hash_done, 1);
     }
 }

@@ -5,6 +5,71 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.2 — Structural Intelligence (objetivo 0.2.0)
+
+#### Añadido
+
+- Firmas Merkle BLAKE3 para carpetas completas y conjuntos
+  `EXACT_TREE_CLONE` sobre identidades SHA-256 ya inventariadas
+  (`0006_structure.sql`, ADR-0023).
+- Clasificación determinista de carpetas `GENERIC`/`PROTECTED`/`NEUTRAL`,
+  representante lógico explicado para cada conjunto de duplicados y perfiles
+  declarativos embebidos `generic` y `legal` (`0007_contexts.sql`,
+  `0008_representatives.sql`, ADR-0024–0026). Un id de perfil desconocido se
+  rechaza en creación, apertura y análisis.
+- Relaciones estructurales `PARTIAL_TREE_CLONE` y `TREE_EMBEDDED` sobre
+  conjuntos de contenidos exactos (`0009_tree_relations.sql`, ADR-0027).
+  Solo participan ramas completas; se excluyen ancestros de la misma raíz,
+  componentes presentes en más de 32 carpetas y carpetas con menos de dos
+  contenidos; los candidatos son estables y están limitados a 200 000. Se
+  persisten recuentos de contenido exclusivo en ambos lados.
+- Esquema de perfil `1.1.0` con reglas ordenadas y versionadas sobre el nombre
+  de archivo. Sus únicas acciones son `COPY_ACTIVE`, `COPY_REVIEW`,
+  `COPY_SEPARATED` y `COPY_TEMPORARY`; no existe acción declarativa
+  destructiva (ADR-0028).
+- Evidencia append-only para coincidencias de reglas, anomalías estructurales,
+  cola de revisión y decisiones humanas justificadas
+  (`0010_structural_review.sql`). El planner consume la última decisión; una
+  revisión pendiente conserva la aparición como `COPY_REVIEW`.
+- Anomalías deterministas para mismo nombre con contenido distinto, identidad
+  visual de ruta degradada, entradas no leídas, rutas extremas, árboles
+  parciales con contenido exclusivo y árboles embebidos.
+- Marcador `analysis_completions` y evento único
+  `STRUCTURAL_ANALYSIS_COMPLETED`. Los informes de duplicados, clones,
+  relaciones, contextos, anomalías y revisión fallan cerrados hasta que el
+  snapshot tenga marcador final y estado estable (ADR-0029).
+- CLI: `report tree-relations`, `report anomalies`, `review list` y
+  `review decide`; `project status` y la app de escritorio muestran un resumen
+  estructural M0.2.
+
+#### Cambiado
+
+- La planificación acepta cinco políticas de duplicado. `REPORT_ONLY` sigue
+  siendo la opción segura por defecto; las políticas de consolidación son
+  opt-in, conservan todo contexto desconocido y nunca atraviesan una frontera
+  protegida. Reglas y revisión pueden seleccionar operaciones de copia, pero
+  no omitir una aparición ambigua.
+- `analyze` se puede reanudar desde `ANALYZING`; `plan create`, desde
+  `PLANNING`; y `plan approve`, desde `PLAN_REVIEW`. Un plan `READY` ya
+  persistido se valida y reutiliza sin crear otra versión, y una aprobación ya
+  persistida reutiliza el mismo manifiesto/hash sin duplicar el evento
+  (ADR-0029).
+- El análisis estructural termina ahora después de duplicados, firmas,
+  contextos, relaciones, representantes, reglas y anomalías; el antiguo evento
+  `ANALYSIS_COMPLETED` de la etapa de duplicados no se usa como marcador final.
+
+#### Límites
+
+- M0.2 trabaja con hashes exactos, estructura de carpetas y nombres declarados.
+  No extrae el contenido documental, no infiere asuntos por significado y no
+  construye un grafo semántico.
+- Las relaciones entre árboles son evidencia de conservación/revisión. No
+  consolidan automáticamente una rama y aceptan falsos negativos por sus
+  límites explícitos de candidatos y componentes ubicuos.
+- Las fronteras del perfil `legal` son coincidencias de nombre exactas o
+  prefijos acotados; no detectan un expediente cuyo nombre no contenga un
+  marcador declarado.
+
 ### Hardening de seguridad del sistema de archivos (v0.1.1-dev)
 
 Endurece el núcleo para poder probarlo sobre colecciones reales supervisadas.
@@ -125,60 +190,6 @@ No añade funcionalidad de producto. Modelo de amenazas completo en
 - CLI: `dataforge analyze`, `plan create/validate/approve`, `execute`,
   `verify` — el pipeline completo del RFC §33 para 0.1.
 - ADR-0016 con las decisiones del incremento de plan/ejecución/verificación.
-- Migración `0004_structure`: tablas `folder_signatures` y `tree_clone_sets`
-  (RFC-0001 §19), STRICT, evidencia derivada del inventario sin bytes de
-  archivo.
-- `df-db::structure` (Milestone 0.2): firmas Merkle de carpeta calculadas de
-  abajo hacia arriba con BLAKE3 (§19.2, ADR-0007) sobre entradas
-  NUL-separadas (`F\0nombre\0sha256`, `D\0nombre\0firma_hija`), a prueba de
-  inyección porque NUL es ilegal en nombres de archivo. Regla de
-  completitud (§19.4): una carpeta solo tiene firma válida si todos sus
-  archivos descendientes están hasheados y el subárbol no tiene errores ni
-  reparse points sin seguir; incompleta implica firma `NULL` y exclusión de
-  cualquier conjunto de clones.
-- Detección de clones exactos de árbol (`EXACT_TREE_CLONE`, §19.3): dos o
-  más carpetas completas y no vacías que comparten firma se materializan en
-  `tree_clone_sets` como informe de evidencia — sin proponer ni ejecutar
-  ninguna acción (§19.4). Las relaciones `PARTIAL_TREE_CLONE`,
-  `TREE_EMBEDDED`, `REPEATED_COMPONENT_ONLY` y `UNIQUE_CONTENT_IN_CLONE` del
-  §19.3 quedan nombradas en el vocabulario y se aplazan a un incremento
-  posterior. El cómputo corre dentro de `analyze` (`HASHED → ANALYZING →
-  ANALYZED`), justo después de materializar los duplicados exactos, y es
-  idempotente (recomputable tras más hashing).
-- Evento de auditoría `STRUCTURE_ANALYZED` con el recuento de carpetas
-  firmadas, carpetas completas y conjuntos de clones detectados.
-- `df-facade::tree_clone_report`; CLI `dataforge report tree-clones` para
-  listar los conjuntos de clones exactos de árbol.
-- ADR-0018 con las decisiones del incremento de firmas de carpeta y
-  detección de clones de árbol.
-- Migración `0005_contexts`: tabla `folder_contexts` (RFC-0001 §18), STRICT.
-- `df-db::context` (Milestone 0.2): clasificación de contexto de carpetas por
-  marcadores del perfil, determinista. El perfil `generic` marca contenedores
-  de bajo valor —Descargas, Escritorio, Backup, Recuperado, Copia,
-  Temporales y patrones de copia— con la penalización de ubicación del §18.3
-  (50/45/40/35/30). Solo evidencia: baja el ranking de una carpeta como
-  representante (§15.5) pero no marca nada para eliminación. Perfil
-  conservador sin fronteras protegidas (§25.4); `ContextKind::Protected`
-  queda en el vocabulario para un perfil jurídico posterior. Corre dentro de
-  `analyze` tras las firmas de carpeta y es idempotente.
-- Evento de auditoría `CONTEXTS_CLASSIFIED`; `df-facade::context_report`; CLI
-  `dataforge report contexts` para listar carpetas genéricas por penalización.
-- ADR-0019 con las decisiones de la clasificación de contexto por marcadores.
-- Migración `0006_representatives`: tabla `duplicate_representatives`
-  (RFC-0001 §15.5), STRICT, con la razón legible de cada decisión.
-- `df-db::dedup` (Milestone 0.2): representante lógico de cada conjunto de
-  duplicados exactos. Coste determinista `penalización_ubicación*100 + marca
-  de copia*10 + profundidad`, donde la penalización es la peor de las carpetas
-  ancestras (§18.3); desempate estable por ruta. Implementa las señales
-  `- Descargas/Escritorio/Backup/Copia/temporal`, `+ nombre limpio` y
-  `+ ruta canónica` del §15.5; aplaza `+ contexto específico`, `+ fecha
-  coherente`, `+ menor anomalía` y `- ruta injertada` por falta de señal.
-  **Elegir representante no implica borrar las demás apariciones** (§15.5,
-  regla 8): no genera ninguna operación de plan. Corre en `analyze` tras la
-  clasificación de contexto y es idempotente.
-- Evento `DUPLICATE_REPRESENTATIVES_SCORED`; `report duplicates` marca la copia
-  representante con `*` y muestra la razón de la elección (§5.3).
-- ADR-0020 con las decisiones del representante lógico.
 
 ### Seguridad
 

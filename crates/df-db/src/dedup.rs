@@ -321,9 +321,13 @@ mod tests {
 pub struct DuplicateMember {
     pub duplicate_set_id: String,
     pub occurrence_id: String,
+    /// Source root containing this occurrence. Relative paths are only
+    /// comparable as locations within the same root.
+    pub source_root_id: String,
     /// Folder holding this occurrence, relative to its source root. Two
-    /// copies sharing it are provably in the same context; without the entity
-    /// graph (§18.2) that is the only "same context" we can *prove*.
+    /// copies sharing both root and parent are provably in the same context;
+    /// without the entity graph (§18.2) that is the only "same context" we
+    /// can *prove*.
     pub parent_relative_path: String,
     /// This occurrence is the set's logical representative (§15.5).
     pub is_representative: bool,
@@ -420,6 +424,7 @@ pub fn duplicate_members(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Dupli
                 DuplicateMember {
                     duplicate_set_id: set_id,
                     occurrence_id,
+                    source_root_id: root_id,
                     parent_relative_path: parent,
                     is_representative,
                     context,

@@ -104,6 +104,10 @@ pub struct PlanningOccurrence {
     pub occurrence_id: OccurrenceId,
     pub source_root_id: df_domain::SourceRootId,
     pub relative_path: String,
+    /// Exact path captured by the scanner. The display path is suitable for
+    /// reports, but this value is what lets the planner derive a stable,
+    /// portable destination for names Win32 cannot safely create.
+    pub raw_relative_path: Option<df_domain::RawPath>,
     pub file_name: String,
     pub size_bytes: u64,
     pub scan_status: df_domain::ScanEntryStatus,
@@ -121,7 +125,8 @@ pub fn planning_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Pl
         .conn()
         .prepare(
             "SELECT o.id, o.source_root_id, o.relative_path, o.file_name,
-                    o.size_bytes, o.scan_status, j.status, j.error, c.id, c.sha256
+                    o.size_bytes, o.scan_status, j.status, j.error, c.id, c.sha256,
+                    o.raw_relative_path
              FROM path_occurrences o
              LEFT JOIN hash_jobs j ON j.occurrence_id = o.id
              LEFT JOIN occurrence_content oc ON oc.occurrence_id = o.id
@@ -143,16 +148,32 @@ pub fn planning_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Pl
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (id, root, relative, name, size, scan, hash_status, hash_error, content, sha) =
-                raw.map_err(db_err)?;
+            let (
+                id,
+                root,
+                relative,
+                name,
+                size,
+                scan,
+                hash_status,
+                hash_error,
+                content,
+                sha,
+                raw_relative_path,
+            ) = raw.map_err(db_err)?;
             Ok(PlanningOccurrence {
                 occurrence_id: OccurrenceId::from_str(&id)?,
                 source_root_id: df_domain::SourceRootId::from_str(&root)?,
                 relative_path: relative,
+                raw_relative_path: raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 file_name: name,
                 size_bytes: size as u64,
                 scan_status: df_domain::ScanEntryStatus::parse(&scan)?,
@@ -659,6 +680,9 @@ pub struct ExecutableOperation {
     pub destination_relative_path: String,
     /// Source file, for copies: absolute root + relative path.
     pub source_root_path: Option<PathBuf>,
+    /// Physical root identity frozen at approval. Execution rechecks it for
+    /// every copy so a source-root swap after the run preflight is detected.
+    pub source_root_identity: Option<String>,
     /// Display form; never used to open anything (ADR-0020).
     pub source_relative_path: Option<String>,
     /// The exact bytes to reopen the source with.
@@ -695,14 +719,14 @@ pub fn executable_operations(
                     m.destination_relative_path, m.source_root_path_snapshot,
                     m.source_relative_path_exact, m.source_fingerprint,
                     m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
-                    m.source_raw_relative_path
+                    m.source_raw_relative_path, m.source_root_identity
              FROM execution_manifest m
              JOIN plan_operations p ON p.id = m.operation_id
              WHERE m.plan_id = ?1
                AND p.approval = 'APPROVED'
                AND m.operation_type IN
                    ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                    'COPY_WITH_SUFFIX', 'CREATE_DIRECTORY')
+                    'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')
                AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
              ORDER BY m.sequence
              LIMIT ?2",
@@ -722,6 +746,7 @@ pub fn executable_operations(
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, Option<Vec<u8>>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })
         .map_err(db_err)?
@@ -738,6 +763,7 @@ pub fn executable_operations(
                 sha,
                 blake,
                 raw_relative,
+                source_root_identity,
             ) = raw.map_err(db_err)?;
             let destination = destination.ok_or_else(|| {
                 DfError::Database(format!("executable operation {id} has no destination"))
@@ -748,6 +774,7 @@ pub fn executable_operations(
                 operation_type: OperationType::parse(&op_type)?,
                 destination_relative_path: destination,
                 source_root_path: root.map(PathBuf::from),
+                source_root_identity,
                 source_relative_path: relative,
                 source_raw_relative_path: raw_relative
                     .as_deref()
@@ -856,7 +883,7 @@ pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
                 COUNT(*),
                 COUNT(*) FILTER (WHERE operation_type IN
                     ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                     'COPY_WITH_SUFFIX', 'CREATE_DIRECTORY')),
+                     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')),
                 COUNT(*) FILTER (WHERE execution_state = 'PENDING'),
                 COUNT(*) FILTER (WHERE execution_state = 'RUNNING'),
                 COUNT(*) FILTER (WHERE execution_state = 'COMPLETED'),

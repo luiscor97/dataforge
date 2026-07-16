@@ -5,12 +5,14 @@ import { StatusView } from "./screens/StatusView";
 import { type ErrorDto, type ProjectStatus, isErrorDto } from "./types";
 
 type Screen = "home" | "create" | "open" | "status";
+type BuiltInProfile = "generic" | "legal";
 
 interface CreateFormState {
   name: string;
   projectDir: string;
   outputRoot: string;
   sources: string;
+  profile: BuiltInProfile;
 }
 
 const EMPTY_FORM: CreateFormState = {
@@ -18,6 +20,7 @@ const EMPTY_FORM: CreateFormState = {
   projectDir: "",
   outputRoot: "",
   sources: "",
+  profile: "generic",
 };
 
 export default function App(): React.JSX.Element {
@@ -47,6 +50,7 @@ export default function App(): React.JSX.Element {
         name: form.name,
         project_dir: form.projectDir,
         output_root: form.outputRoot,
+        profile: form.profile,
         source_roots: form.sources
           .split("\n")
           .map((line) => line.trim())
@@ -99,7 +103,11 @@ export default function App(): React.JSX.Element {
   return (
     <main className="shell">
       <header className="topbar">
-        <h1 onClick={goHome}>DataForge</h1>
+        <h1>
+          <button type="button" className="brand-button" onClick={goHome}>
+            DataForge
+          </button>
+        </h1>
         <span className="version">{version !== "" ? `engine ${version}` : ""}</span>
       </header>
 
@@ -161,6 +169,23 @@ export default function App(): React.JSX.Element {
                 placeholder="D:\salidas\migracion-2026"
                 required
               />
+            </label>
+            <label>
+              Perfil de análisis
+              <select
+                value={form.profile}
+                onChange={(event) =>
+                  setForm({ ...form, profile: event.target.value as BuiltInProfile })
+                }
+                aria-describedby="profile-help"
+              >
+                <option value="generic">Genérico</option>
+                <option value="legal">Jurídico</option>
+              </select>
+              <span id="profile-help" className="field-help">
+                El perfil jurídico protege expedientes, procedimientos y otras fronteras del
+                dominio. El genérico no presupone esas fronteras.
+              </span>
             </label>
             <label>
               Orígenes (uno por línea, solo lectura; opcional)

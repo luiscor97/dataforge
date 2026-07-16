@@ -4,6 +4,7 @@
 //! Every state change flows through the [`state::ProjectState`] machine and
 //! is later persisted and audited by `df-db` / `df-ledger`.
 
+pub mod analysis;
 pub mod context;
 pub mod duplicate_policy;
 pub mod event;
@@ -20,6 +21,9 @@ pub mod source_root;
 pub mod state;
 pub mod structure;
 
+pub use analysis::{
+    AnomalyKind, AnomalySeverity, RuleAction, RuleClassification, RuleDefinition, RuleMatch,
+};
 pub use context::{ContextKind, FolderContext};
 pub use duplicate_policy::{
     decide as decide_duplicate, DuplicateDisposition, DuplicateKind, DuplicatePolicy, Placement,

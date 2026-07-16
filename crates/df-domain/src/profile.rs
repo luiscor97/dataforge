@@ -21,11 +21,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::ContextKind;
+use crate::{context::ContextKind, RuleDefinition};
 
 const SCHEMA: &str = "dataforge.profile";
+const SCHEMA_VERSION: &str = "1.1.0";
 
-/// The conservative default. Any unknown profile falls back to it.
+/// The conservative default used when a project does not select a profile.
 pub const DEFAULT_PROFILE_ID: &str = "generic";
 
 const GENERIC_JSON: &str = include_str!("../../../profiles/generic/profile.json");
@@ -94,7 +95,7 @@ pub struct ProtectedMarker {
 }
 
 /// A parsed, resolved profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     pub schema: String,
     pub schema_version: String,
@@ -108,27 +109,28 @@ pub struct Profile {
     pub generic_markers: Vec<GenericMarker>,
     #[serde(default)]
     pub protected_markers: Vec<ProtectedMarker>,
+    /// Ordered metadata rules. The first matching rule is the default action;
+    /// every match remains evidence even when human review overrides it.
+    #[serde(default)]
+    pub rules: Vec<RuleDefinition>,
 }
 
 impl Profile {
     /// Load a built-in profile by id, resolving inheritance.
     ///
-    /// An unknown id falls back to [`DEFAULT_PROFILE_ID`]: a profile we cannot
-    /// resolve must never silently grant *fewer* protections than expected, and
-    /// `generic` is the most conservative one (it protects nothing but also
-    /// consolidates nothing by itself).
+    /// Unknown ids are rejected. Falling back to [`DEFAULT_PROFILE_ID`] would
+    /// turn a typo such as `legla` into a project with none of the protections
+    /// the user selected.
     pub fn load(id: &str) -> df_error::DfResult<Self> {
         let json = BUILT_IN
             .iter()
             .find(|(name, _)| *name == id)
-            .or_else(|| {
-                BUILT_IN
-                    .iter()
-                    .find(|(name, _)| *name == DEFAULT_PROFILE_ID)
-            })
             .map(|(_, json)| *json)
             .ok_or_else(|| {
-                df_error::DfError::Validation("no built-in profile is available".to_string())
+                df_error::DfError::Validation(format!(
+                    "unknown profile `{id}`; available built-in profiles: {}",
+                    Self::built_in_ids().join(", ")
+                ))
             })?;
 
         let mut profile: Profile = serde_json::from_str(json).map_err(|e| {
@@ -138,6 +140,18 @@ impl Profile {
             return Err(df_error::DfError::Validation(format!(
                 "profile `{id}` has unexpected schema `{}`",
                 profile.schema
+            )));
+        }
+        if profile.schema_version != SCHEMA_VERSION {
+            return Err(df_error::DfError::Validation(format!(
+                "profile `{id}` has unsupported schema version `{}` (expected {SCHEMA_VERSION})",
+                profile.schema_version
+            )));
+        }
+        if profile.id != id {
+            return Err(df_error::DfError::Validation(format!(
+                "profile `{id}` declares mismatched id `{}`",
+                profile.id
             )));
         }
 
@@ -175,6 +189,21 @@ impl Profile {
                 {
                     profile.generic_markers.push(inherited);
                 }
+            }
+            for inherited in parent.rules {
+                if !profile.rules.iter().any(|rule| rule.id == inherited.id) {
+                    profile.rules.push(inherited);
+                }
+            }
+        }
+        let mut rule_ids = std::collections::HashSet::new();
+        for rule in &profile.rules {
+            rule.validate()?;
+            if !rule_ids.insert(rule.id.as_str()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares rule `{}` more than once",
+                    rule.id
+                )));
             }
         }
         Ok(profile)
@@ -238,6 +267,7 @@ mod tests {
             let profile = Profile::load(id).unwrap_or_else(|e| panic!("profile `{id}`: {e}"));
             assert_eq!(profile.id, id);
             assert_eq!(profile.schema, SCHEMA);
+            assert_eq!(profile.schema_version, SCHEMA_VERSION);
             assert!(!profile.description.is_empty());
             // Every protected marker explains itself (§5.3).
             for marker in &profile.protected_markers {
@@ -255,6 +285,9 @@ mod tests {
             for marker in &profile.protected_markers {
                 assert_eq!(marker.name, marker.name.to_lowercase());
             }
+            for rule in &profile.rules {
+                rule.validate().unwrap();
+            }
         }
     }
 
@@ -265,13 +298,20 @@ mod tests {
         let generic = Profile::load("generic").unwrap();
         assert!(generic.protected_markers.is_empty());
         assert!(!generic.generic_markers.is_empty());
+        assert!(!generic.rules.is_empty());
     }
 
     #[test]
-    fn an_unknown_profile_falls_back_to_generic() {
-        let profile = Profile::load("does-not-exist").unwrap();
-        assert_eq!(profile.id, "generic");
-        assert!(profile.protected_markers.is_empty());
+    fn an_unknown_profile_is_rejected_instead_of_falling_back_to_generic() {
+        let error = Profile::load("does-not-exist").unwrap_err();
+        match error {
+            df_error::DfError::Validation(message) => {
+                assert!(message.contains("does-not-exist"));
+                assert!(message.contains("generic"));
+                assert!(message.contains("legal"));
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -286,6 +326,11 @@ mod tests {
             .iter()
             .any(|m| m.name == "expediente"));
         assert!(legal.protected_markers.iter().any(|m| m.name == "pericial"));
+        assert!(legal.rules.iter().any(|r| r.id == "temporary.office-lock"));
+        assert!(legal
+            .rules
+            .iter()
+            .any(|r| r.id == "legal.correspondence-eml"));
     }
 
     #[test]
@@ -394,5 +439,27 @@ mod tests {
         // classifying a name that is both declared protected and copy-like.
         assert_eq!(legal.classify("expediente").0, ContextKind::Protected);
         assert_eq!(legal.classify("backup").0, ContextKind::Generic);
+    }
+
+    #[test]
+    fn built_in_rules_classify_without_authorizing_destructive_actions() {
+        let generic = Profile::load("generic").unwrap();
+        let lock = generic
+            .rules
+            .iter()
+            .find(|rule| rule.matches_file_name("~$Contrato.docx"))
+            .expect("office lock rule");
+        assert_eq!(lock.action.as_str(), "COPY_TEMPORARY");
+
+        let backup = generic
+            .rules
+            .iter()
+            .find(|rule| rule.matches_file_name("contrato.bak"))
+            .expect("backup review rule");
+        assert_eq!(backup.action.as_str(), "COPY_REVIEW");
+        assert!(generic
+            .rules
+            .iter()
+            .all(|rule| rule.action.operation_type().is_executable()));
     }
 }

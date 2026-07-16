@@ -1,6 +1,6 @@
 {
   "schema": "dataforge.profile",
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "id": "legal",
   "name": "Jurídico",
   "description": "Perfil para despachos, asesorías y gestorías. Hereda los contenedores genéricos y declara las fronteras protegidas del dominio jurídico: un expediente, una pericial o un procedimiento son límites que la deduplicación no debe disolver, aunque dos de ellos contengan archivos byte a byte idénticos. Dos copias del mismo documento en expedientes distintos NO son redundancia: cada expediente debe poder sostenerse por sí mismo como unidad probatoria (RFC-0001 regla 9, §15.2, §15.3 ACROSS_PROTECTED_CONTEXTS). Los marcadores usan match \"prefix\" porque las carpetas reales se llaman \"Expediente 1234-2020\", no \"Expediente\" a secas; el prefijo exige separador o dígito detrás, de modo que \"expediente\" no engulle \"expedientes\".",
@@ -57,6 +57,39 @@
     {
       "name": "asuntos",
       "reason": "contenedor de asuntos, cada uno independiente"
+    },
+    {
+      "name": "cliente",
+      "match": "prefix",
+      "reason": "la documentación de una persona cliente constituye una frontera de contexto"
+    },
+    {
+      "name": "clientes",
+      "reason": "contenedor de personas cliente cuyas carpetas no deben fusionarse"
+    },
+    {
+      "name": "persona",
+      "match": "prefix",
+      "reason": "una carpeta personal identificada es una frontera jurídica y de privacidad"
+    },
+    {
+      "name": "personas",
+      "reason": "contenedor de personas con contextos independientes"
+    },
+    {
+      "name": "correspondencia",
+      "match": "prefix",
+      "reason": "la correspondencia conserva valor contextual y cronológico propio"
+    }
+  ],
+  "rules": [
+    {
+      "id": "legal.correspondence-eml",
+      "version": 1,
+      "match": { "file_name_glob": "*.eml" },
+      "classification": { "category": "correspondence", "confidence": 1.0 },
+      "action": "COPY_ACTIVE",
+      "risk": "LOW"
     }
   ]
 }

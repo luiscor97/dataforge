@@ -21,6 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+df-db = { workspace = true, features = ["test-support"] }
 df-scan = { workspace = true }
 df-hash = { workspace = true }
+df-executor = { workspace = true }
 tempfile = { workspace = true }

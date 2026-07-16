@@ -119,6 +119,7 @@ impl OperationType {
                 | Self::CopySeparated
                 | Self::CopyTemporary
                 | Self::CopyWithSuffix
+                | Self::PreserveAcrossContext
                 | Self::CreateDirectory
         )
     }
@@ -364,6 +365,7 @@ mod tests {
     #[test]
     fn executable_types_are_the_copy_and_directory_ones() {
         assert!(OperationType::CopyActive.is_executable());
+        assert!(OperationType::PreserveAcrossContext.is_executable());
         assert!(OperationType::CreateDirectory.is_executable());
         assert!(!OperationType::NoAction.is_executable());
         assert!(!OperationType::Blocked.is_executable());

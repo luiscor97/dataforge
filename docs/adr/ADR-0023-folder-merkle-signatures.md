@@ -2,7 +2,11 @@
 
 **Estado:** Aceptada
 **Fecha:** 2026-07-14
-**Relacionada con:** RFC-0001 §19, §18, ADR-0007
+**Relacionada con:** RFC-0001 §19, §18; ADR-0027
+
+**Revisada:** 2026-07-16 para reflejar que ADR-0027 amplió el análisis con
+`PARTIAL_TREE_CLONE` y `TREE_EMBEDDED`, sin cambiar la decisión de firmas ni
+clones exactos.
 
 ## Contexto
 
@@ -35,7 +39,7 @@ y más segura del §19.3.
    modo que la firma es independiente del orden de lectura del directorio.
 
 2. **BLAKE3 para la firma, SHA-256 como identidad de contenido de entrada.**
-   La firma de carpeta usa BLAKE3, consistente con ADR-0007 (RFC-0001 §6):
+   La firma de carpeta usa BLAKE3, consistente con RFC-0001 §6:
    BLAKE3 es el hash operativo de DataForge para caché, árboles y chunks;
    SHA-256 sigue siendo la identidad canónica de auditoría por archivo. Las
    entradas de tipo archivo llevan el SHA-256 ya calculado por `df-hash`
@@ -52,25 +56,25 @@ y más segura del §19.3.
    parcialmente hasheada nunca se declara idéntica a otra, aunque coincida
    en lo que sí se ha observado hasta el momento.
 
-4. **Alcance de esta rebanada: solo `EXACT_TREE_CLONE`.** Dos o más carpetas
-   completas y no vacías que comparten la misma firma forman un conjunto
-   `EXACT_TREE_CLONE`. Las relaciones `PARTIAL_TREE_CLONE`, `TREE_EMBEDDED`,
-   `REPEATED_COMPONENT_ONLY` y `UNIQUE_CONTENT_IN_CLONE` del §19.3 quedan
-   nombradas en el vocabulario (`TreeRelationship`) para que sea estable,
-   pero su cómputo se aplaza a una rebanada posterior.
+4. **La firma resuelve `EXACT_TREE_CLONE`.** Dos o más carpetas completas y
+   no vacías que comparten la misma firma forman un conjunto
+   `EXACT_TREE_CLONE`. Las relaciones parciales y embebidas no se deducen de
+   una firma igual: ADR-0027 las calcula después mediante conjuntos de
+   identidades exactas de contenido. `REPEATED_COMPONENT_ONLY` permanece en
+   el vocabulario, pero no se persiste sin evidencia adicional.
 
 5. **Solo informe, sin proponer ni ejecutar nada.** La detección de clones
    de árbol es evidencia: lista los conjuntos y los bytes redundantes que
    implicarían, pero no genera operaciones de plan ni marca ninguna copia
    para eliminación. El §19.4 prohíbe retirar una rama completa antes de
-   identificar su contenido único, y ese análisis depende de perfiles y del
-   grafo contextual (§18), que no existen todavía. La consolidación se
-   pospone a una rebanada con esos prerrequisitos.
+   identificar su contenido exclusivo. La consolidación automática de ramas
+   sigue fuera de alcance aun cuando ADR-0027 aporte sus recuentos: compartir
+   bytes no demuestra que el contexto de una carpeta sea prescindible.
 
 6. **Dónde se ejecuta.** El cómputo corre dentro del paso `analyze` ya
    existente, inmediatamente después de materializar los duplicados exactos
    (§15), como parte de la transición `HASHED → ANALYZING → ANALYZED`. Se
-   persiste en dos tablas nuevas de la migración `0004_structure.sql`:
+   persiste en dos tablas de la migración `0006_structure.sql`:
    `folder_signatures` (una fila por carpeta del snapshot, con
    `signature`/`is_complete`/tamaño de subárbol) y `tree_clone_sets`
    (conjuntos materializados de dos o más carpetas con la misma firma). El
@@ -78,7 +82,7 @@ y más segura del §19.3.
    volver a analizar tras hashear más archivos simplemente actualiza la
    evidencia. Se emite el evento de auditoría `STRUCTURE_ANALYZED` con el
    recuento de carpetas firmadas, carpetas completas y conjuntos de clones.
-   Un nuevo informe de CLI, `dataforge report tree-clones`, lista los
+   El informe `dataforge report tree-clones` lista los
    conjuntos detectados.
 
 ## Alternativas consideradas
@@ -89,7 +93,7 @@ y más segura del §19.3.
   elimina la ambigüedad porque es un byte que ningún nombre de archivo real
   puede contener.
 - **SHA-256 también para la firma de carpeta** — descartada: RFC-0001 §6
-  (ADR-0007) reserva SHA-256 para la identidad canónica por archivo y
+  reserva SHA-256 para la identidad canónica por archivo y
   BLAKE3 para árboles y estructuras derivadas; usar SHA-256 aquí duplicaría
   el rol de BLAKE3 sin aportar nada y se apartaría de la convención ya
   fijada.
@@ -97,17 +101,15 @@ y más segura del §19.3.
   hasheados** — descartada: viola directamente la regla de seguridad del
   §19.4; un umbral parcial podría declarar clon exacto algo que en realidad
   difiere en el contenido todavía no observado.
-- **Implementar las cinco relaciones del §19.3 en esta misma rebanada** —
-  descartada por alcance: `PARTIAL_TREE_CLONE` y `TREE_EMBEDDED` requieren
-  comparar subconjuntos de entradas entre carpetas, no solo la firma
-  completa, y `UNIQUE_CONTENT_IN_CLONE` requiere el resultado de esa
-  comparación; `EXACT_TREE_CLONE` es la variante mínima que ya aporta valor
-  como evidencia y no compromete la seguridad del §19.4.
+- **Derivar todas las relaciones de la firma completa** — descartada:
+  `PARTIAL_TREE_CLONE` y `TREE_EMBEDDED` exigen comparar conjuntos de
+  contenidos, no firmas iguales. ADR-0027 incorpora esa comparación como una
+  decisión separada, acotada y determinista.
 - **Proponer consolidación (representar una copia, marcar las demás) ya en
-  esta rebanada** — descartada: sin contextos ni perfiles (§18), DataForge
-  no puede distinguir todavía qué copia es la "activa" ni qué rama contiene
-  contenido único fuera del clon; proponer aquí sería adelantarse a la regla
-  de seguridad del §19.4.
+  esta rebanada** — descartada: una firma igual prueba bytes y estructura,
+  pero no demuestra que el contexto de una rama sea prescindible. Los
+  perfiles incorporados después protegen límites explícitos; no convierten
+  los clones de árbol en una autorización automática (§19.4).
 
 ## Consecuencias
 
@@ -118,13 +120,12 @@ y más segura del §19.3.
   §14 en lugar de releer archivos, así que el coste adicional del análisis
   estructural es proporcional al número de carpetas y ocurrencias del
   snapshot, no a sus bytes.
-- Deuda aceptada, a registrar en el backlog de Milestone 0.2: las
-  relaciones `PARTIAL_TREE_CLONE`, `TREE_EMBEDDED`, `REPEATED_COMPONENT_ONLY`
-  y `UNIQUE_CONTENT_IN_CLONE`; la consolidación de duplicados guiada por
-  firmas de carpeta; y el uso de firmas de carpeta en la planificación
-  (§26). Ninguna de estas piezas existe todavía ni se insinúa en el plan
-  generado por `df-planner`.
-- Condición de revisión: cuando el grafo contextual (§18) y los perfiles
-  existan, esta ADR debe revisarse para decidir si la consolidación de
-  clones se apoya en las mismas tablas (`folder_signatures`,
-  `tree_clone_sets`) o si requiere un esquema adicional.
+- ADR-0027 entrega `PARTIAL_TREE_CLONE` y `TREE_EMBEDDED`; no cambia el hecho
+  de que los conjuntos exactos y las relaciones son evidencia, no operaciones
+  de consolidación de una rama.
+- Deuda aceptada: no se materializa `REPEATED_COMPONENT_ONLY`, no se listan
+  las rutas exclusivas de cada relación parcial y las firmas de carpeta no
+  autorizan omitir árboles en el plan.
+- Condición de revisión: cualquier consolidación futura de árboles deberá
+  demostrar cobertura del contenido exclusivo y respeto de fronteras
+  protegidas; no basta con reutilizar `tree_clone_sets`.

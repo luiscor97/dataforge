@@ -2,7 +2,10 @@
 
 **Estado:** Aceptada
 **Fecha:** 2026-07-14
-**Relacionada con:** RFC-0001 §18, §15.5, §25.2, §25.4, regla 9
+**Relacionada con:** RFC-0001 §18, §15.5, §25.2, §25.4, regla 9; ADR-0026
+
+**Revisada:** 2026-07-16 para reflejar los perfiles declarativos `generic` y
+`legal`, su uso real en planificación y el rechazo de ids desconocidos.
 
 ## Contexto
 
@@ -31,32 +34,31 @@ esa parte determinista sin adelantar la extracción de entidades.
    (40), `recuperado`/`recovered` (35) y `temp`/`temporal`/`copia`/`nueva
    carpeta` y patrones de copia (`* - copia`, `copia de *`) (30). La
    penalización es el peso con que §18.3 degrada una carpeta como ubicación
-   canónica; se guarda por carpeta para que una fase posterior de política de
-   duplicados la use al puntuar representantes (§15.5).
+   canónica; se guarda por carpeta y el análisis la usa al puntuar
+   representantes (§15.5) y clasificar conjuntos para la política del plan.
 
-3. **Perfil `generic` conservador, sin marcadores protegidos (§25.4).** El
-   perfil genérico no intenta inferir sectores, así que no declara
-   marcadores protegidos: `is_protected_boundary` es siempre falso bajo él.
-   La estructura de datos y el tipo `ContextKind::Protected` existen ya para
-   que un perfil jurídico (expediente, pericial, cliente, asunto) pueda
-   declarar fronteras protegidas sin cambiar el esquema; ese perfil se añade
-   en una rebanada posterior. Un perfil desconocido cae a `generic`.
+3. **Dos perfiles embebidos y fallo cerrado.** `generic` no declara fronteras
+   protegidas (§25.4). `legal` hereda sus marcadores genéricos y añade
+   fronteras por nombre para expedientes, procedimientos, asuntos, clientes,
+   personas y correspondencia (ADR-0026). Un id desconocido se rechaza al
+   crear, abrir y analizar el proyecto: nunca cae silenciosamente a
+   `generic`, porque un typo eliminaría las protecciones solicitadas.
 
-4. **Solo evidencia, no acción.** La clasificación baja el ranking de una
-   carpeta como ubicación representativa, pero no marca ningún archivo para
-   eliminación ni genera operaciones de plan. La consolidación de duplicados
-   consciente del contexto —usar estas penalizaciones para elegir qué copia
-   preservar— es una rebanada futura que además depende de la política de
-   duplicados (§15.4).
+4. **La clasificación es evidencia y la política la consume explícitamente.**
+   Clasificar una carpeta no borra ni omite nada por sí solo. Sus
+   penalizaciones alimentan el representante lógico (ADR-0025), y sus
+   fronteras condicionan las políticas de duplicado del plan. La política por
+   defecto `REPORT_ONLY` copia todas las apariciones; las políticas de
+   consolidación son opt-in y nunca atraviesan una frontera protegida.
 
 5. **Dónde se ejecuta y persistencia.** El cómputo corre dentro del paso
    `analyze` (transición `HASHED → ANALYZING → ANALYZED`), tras las firmas de
    carpeta (ADR-0023). Se persiste en la tabla `folder_contexts` de la
-   migración `0005_contexts.sql` (una fila por carpeta: `kind`,
+   migración `0007_contexts.sql` (una fila por carpeta: `kind`,
    `is_protected_boundary`, `penalty`, `marker`). El recómputo es idempotente.
-   Se emite el evento de auditoría `CONTEXTS_CLASSIFIED`. Un nuevo informe de
-   CLI, `dataforge report contexts`, lista las carpetas genéricas por
-   penalización descendente.
+   Se emite el evento de auditoría `CONTEXTS_CLASSIFIED`. El informe
+   `dataforge report contexts` lista carpetas genéricas por penalización y
+   fronteras protegidas con el marcador que las justificó.
 
 ## Alternativas consideradas
 
@@ -79,17 +81,15 @@ esa parte determinista sin adelantar la extracción de entidades.
 
 ## Consecuencias
 
-- DataForge distingue ya carpetas de bajo valor de materias reales, cimiento
-  para "diferenciar repetición legítima" y para las políticas de duplicado
-  conscientes del contexto de Milestone 0.2, manteniendo la garantía de "solo
-  evidencia".
+- DataForge distingue contenedores de bajo valor y fronteras explícitas por
+  perfil. Esa evidencia ya guía el representante y las políticas de duplicado
+  sin conceder a la clasificación capacidad destructiva.
 - El coste es proporcional al número de carpetas del snapshot (una
   comparación de nombre por carpeta), no a los bytes.
-- Deuda aceptada, a registrar en el backlog de Milestone 0.2: el perfil
-  jurídico con marcadores protegidos; la extracción de entidades y el grafo
-  contextual completo (§18.2–§18.4); y el uso de las penalizaciones en la
-  puntuación del representante lógico (§15.5) dentro de la política de
-  duplicados. Nada de esto existe todavía ni se insinúa en el plan.
-- Condición de revisión: cuando llegue el perfil jurídico y el grafo de
-  entidades, revisar si `folder_contexts` se fusiona con las tablas
-  `contexts`/`context_memberships` o coexiste con ellas.
+- Deuda aceptada: la clasificación sigue basada en nombres exactos o prefijos
+  acotados. No interpreta contenido ni demuestra por sí sola que dos carpetas
+  pertenezcan al mismo asunto real.
+- Condición de revisión: si se incorpora contexto derivado de contenido,
+  decidir si `folder_contexts` coexiste con nuevas relaciones o se convierte
+  en una proyección de ellas. Hasta entonces no debe presentarse como grafo
+  semántico.

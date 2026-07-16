@@ -1,6 +1,6 @@
 {
   "schema": "dataforge.profile",
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "id": "generic",
   "name": "Genérico",
   "description": "Perfil conservador por defecto. Reconoce contenedores de bajo valor comunes (descargas, escritorio, copias de seguridad, temporales) para puntuar el representante lógico de un conjunto de duplicados, pero NO declara ninguna frontera protegida: sin conocimiento del dominio no hay forma de saber qué carpeta es un límite que no debe disolverse. Un perfil sin marcadores protegidos es el más seguro posible frente a la deduplicación (RFC-0001 §25.4).",
@@ -31,5 +31,55 @@
     { "name": "nueva carpeta", "penalty": 30 },
     { "name": "new folder", "penalty": 30 }
   ],
-  "protected_markers": []
+  "protected_markers": [],
+  "rules": [
+    {
+      "id": "temporary.office-lock",
+      "version": 1,
+      "match": { "file_name_glob": "~$*" },
+      "classification": { "category": "temporary", "confidence": 1.0 },
+      "action": "COPY_TEMPORARY",
+      "risk": "LOW"
+    },
+    {
+      "id": "temporary.tmp-extension",
+      "version": 1,
+      "match": { "file_name_glob": "*.tmp" },
+      "classification": { "category": "temporary", "confidence": 0.98 },
+      "action": "COPY_TEMPORARY",
+      "risk": "LOW"
+    },
+    {
+      "id": "temporary.partial-download",
+      "version": 1,
+      "match": { "file_name_glob": "*.part" },
+      "classification": { "category": "temporary", "confidence": 0.9 },
+      "action": "COPY_TEMPORARY",
+      "risk": "LOW"
+    },
+    {
+      "id": "review.backup-extension",
+      "version": 1,
+      "match": { "file_name_glob": "*.bak" },
+      "classification": { "category": "backup", "confidence": 0.8 },
+      "action": "COPY_REVIEW",
+      "risk": "MEDIUM"
+    },
+    {
+      "id": "separate.windows-thumbnail-cache",
+      "version": 1,
+      "match": { "file_name_glob": "thumbs.db" },
+      "classification": { "category": "system_metadata", "confidence": 1.0 },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.macos-metadata",
+      "version": 1,
+      "match": { "file_name_glob": ".ds_store" },
+      "classification": { "category": "system_metadata", "confidence": 1.0 },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    }
+  ]
 }

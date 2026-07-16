@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
-use df_domain::{Actor, ProfileRef, Project, SourceRoot, TreeCloneSet};
+use df_domain::{Actor, ProfileRef, Project, ProjectState, SnapshotId, SourceRoot, TreeCloneSet};
 
 /// Re-exported so clients can name a policy without depending on `df-domain`
 /// (RFC-0001 rules 16/17: clients only ever talk to the facade).
@@ -18,6 +18,8 @@ pub use df_domain::DuplicatePolicy;
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
+pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
+pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOutcome;
 pub use df_hash::HashOutcome;
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
@@ -94,6 +96,10 @@ pub struct ProjectStatus {
     pub latest_snapshot_id: Option<String>,
     /// Inventory counters of that snapshot (files, folders, hash progress).
     pub inventory: Option<InventorySummary>,
+    /// Structural M0.2 diagnostic for the latest snapshot. Present after a
+    /// scan even when analysis has not completed, so clients can distinguish
+    /// “not analysed” from a genuine zero count.
+    pub structural_diagnostics: Option<StructuralDiagnostics>,
     /// Present when an integrity pass was executed (project_status).
     pub integrity: Option<IntegrityReport>,
 }
@@ -155,6 +161,10 @@ fn ensure_disjoint(a: &Path, a_label: &str, b: &Path, b_label: &str) -> DfResult
             b.display()
         )));
     }
+    // Lexical separation is not enough on Windows: a junction, 8.3 alias or
+    // alternate spelling can name the same physical tree. Resolve only the
+    // existing prefixes (without creating either root) and fail closed.
+    df_fs_safety::ensure_physical_roots_disjoint(a, b)?;
     Ok(())
 }
 
@@ -193,6 +203,9 @@ fn validate_request(request: &CreateProjectRequest) -> DfResult<(PathBuf, Profil
     ensure_disjoint(project_dir, "project directory", output_root, "output root")?;
 
     for source in &request.source_roots {
+        // `read_dir(source)` would follow a junction before the scanner can
+        // inspect any child, contradicting the no-follow source policy.
+        df_fs_safety::ensure_root_is_not_reparse(source)?;
         if !source.is_dir() {
             return Err(DfError::Validation(format!(
                 "source root `{}` does not exist or is not a directory",
@@ -205,11 +218,17 @@ fn validate_request(request: &CreateProjectRequest) -> DfResult<(PathBuf, Profil
         ensure_disjoint(source, "source root", output_root, "output root")?;
         ensure_disjoint(source, "source root", &audit_root, "audit root")?;
     }
+    for (index, source) in request.source_roots.iter().enumerate() {
+        for other in request.source_roots.iter().skip(index + 1) {
+            ensure_disjoint(source, "source root", other, "source root")?;
+        }
+    }
 
     let profile = match request.profile.as_deref() {
         None | Some("") => ProfileRef::default(),
         Some(name) => ProfileRef::new(name),
     };
+    df_domain::Profile::load(profile.as_str())?;
 
     Ok((audit_root, profile))
 }
@@ -226,6 +245,10 @@ fn status_from_db(
     let inventory = snapshot
         .as_ref()
         .map(|s| df_db::inventory::inventory_summary(db, s.id))
+        .transpose()?;
+    let structural_diagnostics = snapshot
+        .as_ref()
+        .map(|snapshot| df_db::analysis::diagnostics(db, snapshot.id))
         .transpose()?;
 
     Ok(ProjectStatus {
@@ -257,6 +280,7 @@ fn status_from_db(
         }),
         latest_snapshot_id: snapshot.map(|s| s.id.to_string()),
         inventory,
+        structural_diagnostics,
         integrity,
     })
 }
@@ -366,6 +390,9 @@ fn open_db(project_dir: &Path, marker: &ProjectMarker) -> DfResult<Db> {
             marker.project_id, project.id
         )));
     }
+    // The profile is persisted user-controlled state. Refuse unknown ids at
+    // the project boundary so every caller gets the same fail-closed result.
+    df_domain::Profile::load(project.profile.as_str())?;
     Ok(db)
 }
 
@@ -633,6 +660,48 @@ pub struct DuplicateReport {
     pub sets: Vec<DuplicateSet>,
 }
 
+/// Reports require two independent pieces of evidence for the latest snapshot:
+///
+/// - a stable lifecycle state at or beyond ANALYZED; and
+/// - the append-only completion marker written by the final analysis stage.
+///
+/// The state keeps half-built results hidden after a crash in ANALYZING. The
+/// marker keeps a manually advanced or otherwise inconsistent state from
+/// exposing empty tables as a genuine report.
+fn ensure_snapshot_analysis_complete(
+    db: &Db,
+    project: &Project,
+    snapshot_id: SnapshotId,
+) -> DfResult<()> {
+    let stable_after_analysis = matches!(
+        project.state,
+        ProjectState::Analyzed
+            | ProjectState::Planning
+            | ProjectState::PlanReady
+            | ProjectState::PlanReview
+            | ProjectState::PlanApproved
+            | ProjectState::Executing
+            | ProjectState::ExecutionPaused
+            | ProjectState::Executed
+            | ProjectState::Verifying
+            | ProjectState::Completed
+            | ProjectState::CompletedWithWarnings
+            | ProjectState::Failed
+            | ProjectState::Archived
+    );
+    if !stable_after_analysis {
+        return Err(DfError::Validation(format!(
+            "analysis for snapshot `{snapshot_id}` has not completed; run analyze before requesting reports"
+        )));
+    }
+    df_db::analysis::require_current_analysis_completion(
+        db,
+        project.id,
+        snapshot_id,
+        project.profile.as_str(),
+    )
+}
+
 /// Compute the exact-duplicate report of the latest complete snapshot.
 pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     let project_dir = absolutize(project_dir)?;
@@ -641,6 +710,7 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     let project = repository::load_project(&db)?;
     let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     let sets = df_db::inventory::exact_duplicates(&db, snapshot.id)?;
     let redundant_files = sets.iter().map(|s| s.occurrences.len() as u64 - 1).sum();
     let redundant_bytes = sets
@@ -665,9 +735,86 @@ pub struct TreeCloneReport {
     pub snapshot_id: String,
     /// Folders that belong to some exact tree-clone set.
     pub cloned_folders: u64,
-    /// Bytes the redundant copies of those subtrees occupy.
+    /// Conservative, non-overlapping estimate of bytes occupied by redundant
+    /// copies. Nested clone sets contribute at most once.
     pub redundant_bytes: u64,
     pub sets: Vec<TreeCloneSet>,
+}
+
+struct RedundantSubtree<'a> {
+    components: Vec<String>,
+    path: &'a str,
+    signature: &'a str,
+    bytes: u64,
+}
+
+fn clone_path_components(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn clone_paths_overlap(left: &[String], right: &[String]) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+/// Estimate redundant clone bytes without counting a nested subtree twice.
+///
+/// Each set keeps its lexicographically first folder as the canonical copy.
+/// The remaining copies are considered from the shallowest path outwards, so
+/// a selected subtree excludes both its ancestors and descendants. The result
+/// is deterministic and may deliberately undercount ambiguous overlaps.
+fn non_overlapping_redundant_bytes(sets: &[TreeCloneSet]) -> u64 {
+    let mut candidates = Vec::new();
+
+    for set in sets {
+        let mut folders: Vec<_> = set
+            .folders
+            .iter()
+            .map(|path| (clone_path_components(path), path.as_str()))
+            .collect();
+        folders.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+        folders.dedup_by(|left, right| left.0 == right.0);
+
+        candidates.extend(
+            folders
+                .into_iter()
+                .skip(1)
+                .map(|(components, path)| RedundantSubtree {
+                    components,
+                    path,
+                    signature: &set.signature,
+                    bytes: set.subtree_bytes,
+                }),
+        );
+    }
+
+    candidates.sort_by(|left, right| {
+        left.components
+            .len()
+            .cmp(&right.components.len())
+            .then_with(|| right.bytes.cmp(&left.bytes))
+            .then_with(|| left.components.cmp(&right.components))
+            .then_with(|| left.path.cmp(right.path))
+            .then_with(|| left.signature.cmp(right.signature))
+    });
+
+    let mut selected = Vec::<Vec<String>>::new();
+    let mut redundant_bytes = 0_u64;
+    for candidate in candidates {
+        if selected
+            .iter()
+            .any(|path| clone_paths_overlap(path, &candidate.components))
+        {
+            continue;
+        }
+
+        redundant_bytes = redundant_bytes.saturating_add(candidate.bytes);
+        selected.push(candidate.components);
+    }
+
+    redundant_bytes
 }
 
 /// Compute the exact tree-clone report of the latest complete snapshot.
@@ -678,9 +825,10 @@ pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     let project = repository::load_project(&db)?;
     let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     let sets = df_db::structure::tree_clone_sets(&db, snapshot.id)?;
     let cloned_folders = sets.iter().map(|s| s.folders.len() as u64).sum();
-    let redundant_bytes = sets.iter().map(|s| s.redundant_bytes()).sum();
+    let redundant_bytes = non_overlapping_redundant_bytes(&sets);
     Ok(TreeCloneReport {
         snapshot_id: snapshot.id.to_string(),
         cloned_folders,
@@ -712,6 +860,7 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
     let project = repository::load_project(&db)?;
     let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     let relations = df_db::structure::tree_relation_views(&db, snapshot.id)?;
     let partial_clones = relations
         .iter()
@@ -737,6 +886,7 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
 pub struct ContextReport {
     pub snapshot_id: String,
     pub generic_folders: Vec<df_db::context::GenericFolder>,
+    pub protected_folders: Vec<df_db::context::ProtectedFolder>,
 }
 
 /// Report the generic folders of the latest complete snapshot.
@@ -747,11 +897,64 @@ pub fn context_report(project_dir: &Path) -> DfResult<ContextReport> {
     let project = repository::load_project(&db)?;
     let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     let generic_folders = df_db::context::generic_folders(&db, snapshot.id)?;
+    let protected_folders = df_db::context::protected_folders(&db, snapshot.id)?;
     Ok(ContextReport {
         snapshot_id: snapshot.id.to_string(),
         generic_folders,
+        protected_folders,
     })
+}
+
+/// Structural anomalies of the completed latest analysis.
+pub fn structural_anomaly_report(project_dir: &Path) -> DfResult<AnomalyReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::anomaly_report(&db, snapshot.id)
+}
+
+/// Human review queue for structural findings and review-class rules.
+pub fn structural_review_queue(project_dir: &Path) -> DfResult<ReviewQueue> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::review_queue(&db, snapshot.id)
+}
+
+/// Append a review decision before planning. Decisions after a plan exists
+/// would not change that immutable plan, so they are rejected explicitly.
+pub fn decide_structural_review(
+    project_dir: &Path,
+    item_id: &str,
+    decision: RuleAction,
+    rationale: &str,
+    actor: Actor,
+) -> DfResult<ReviewQueue> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    if project.state != ProjectState::Analyzed {
+        return Err(DfError::Validation(format!(
+            "review decisions require ANALYZED state before planning (current {})",
+            project.state
+        )));
+    }
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::decide_review_item(&mut db, project.id, item_id, decision, rationale, actor)?;
+    df_db::analysis::review_queue(&db, snapshot.id)
 }
 
 /// Result of `dataforge audit verify`: a cryptographic pass over the ledger.
@@ -786,6 +989,71 @@ pub fn verify_audit(project_dir: &Path) -> DfResult<AuditReport> {
 mod tests {
     use super::*;
 
+    fn clone_set(tag: char, folders: &[&str], subtree_bytes: u64) -> TreeCloneSet {
+        TreeCloneSet {
+            id: df_domain::TreeCloneSetId::new(),
+            snapshot_id: SnapshotId::new(),
+            signature: tag.to_string().repeat(64),
+            relationship: df_domain::TreeRelationship::ExactClone,
+            folders: folders.iter().map(|path| (*path).to_owned()).collect(),
+            subtree_files: 1,
+            subtree_bytes,
+        }
+    }
+
+    #[test]
+    fn redundant_tree_bytes_count_nested_clone_sets_once() {
+        let sets = vec![
+            clone_set('a', &["/archive/A", "/archive/B"], 100),
+            clone_set('b', &["/archive/A/documents", "/archive/B/documents"], 40),
+        ];
+
+        assert_eq!(
+            sets.iter().map(TreeCloneSet::redundant_bytes).sum::<u64>(),
+            140
+        );
+        assert_eq!(non_overlapping_redundant_bytes(&sets), 100);
+
+        let mut reordered = sets.clone();
+        reordered.reverse();
+        for set in &mut reordered {
+            set.folders.reverse();
+        }
+        assert_eq!(non_overlapping_redundant_bytes(&reordered), 100);
+    }
+
+    #[test]
+    fn redundant_tree_bytes_sum_disjoint_clone_sets() {
+        let sets = vec![
+            clone_set('a', &["/archive/A", "/archive/B"], 100),
+            clone_set('b', &["/archive/C", "/archive/D"], 50),
+        ];
+
+        assert_eq!(non_overlapping_redundant_bytes(&sets), 150);
+    }
+
+    #[test]
+    fn redundant_tree_bytes_keep_only_uncovered_copies_in_larger_sets() {
+        let sets = vec![
+            clone_set('a', &["/archive/A", "/archive/B"], 100),
+            clone_set(
+                'b',
+                &[
+                    "/archive/A/documents",
+                    "/archive/B/documents",
+                    "/archive/C/documents",
+                ],
+                40,
+            ),
+        ];
+
+        assert_eq!(
+            sets.iter().map(TreeCloneSet::redundant_bytes).sum::<u64>(),
+            180
+        );
+        assert_eq!(non_overlapping_redundant_bytes(&sets), 140);
+    }
+
     fn request(base: &Path) -> CreateProjectRequest {
         CreateProjectRequest {
             name: "Expedientes 2020".to_string(),
@@ -794,6 +1062,33 @@ mod tests {
             audit_root: None,
             source_roots: vec![],
             profile: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success()) && link.exists()
+    }
+
+    fn assert_analysis_reports_unavailable(project_dir: &Path) {
+        let reports: [DfResult<()>; 4] = [
+            duplicate_report(project_dir).map(|_| ()),
+            tree_clone_report(project_dir).map(|_| ()),
+            tree_relation_report(project_dir).map(|_| ()),
+            context_report(project_dir).map(|_| ()),
+        ];
+        for report in reports {
+            assert!(
+                matches!(&report, Err(DfError::Validation(message)) if message.contains("has not completed")),
+                "analysis report should be unavailable, got {report:?}"
+            );
         }
     }
 
@@ -835,6 +1130,42 @@ mod tests {
         assert_eq!(std::fs::read_dir(&origin).unwrap().count(), 0);
     }
 
+    /// Original P0 reproducer: the source spelling is separate lexically but
+    /// resolves to the output directory. Project creation must reject it before
+    /// staging a database or writing anything into the physical source.
+    #[cfg(windows)]
+    #[test]
+    fn create_rejects_a_source_junction_to_the_output_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("datos");
+        let source_alias = tmp.path().join("alias");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("origen.txt"), b"source bytes").unwrap();
+        if !make_junction(&source_alias, &output) {
+            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            return;
+        }
+
+        let mut req = request(tmp.path());
+        req.output_root = output.clone();
+        req.source_roots = vec![source_alias];
+        let error = create_project(&req, Actor::Test).unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(message) if message.contains("reparse point") || message.contains("overlap physically")),
+            "unexpected error: {error:?}"
+        );
+        assert!(!req.project_dir.exists(), "no project may be staged");
+        assert_eq!(
+            std::fs::read_dir(&output).unwrap().count(),
+            1,
+            "project creation wrote into the physical source"
+        );
+        assert_eq!(
+            std::fs::read(output.join("origen.txt")).unwrap(),
+            b"source bytes"
+        );
+    }
+
     #[test]
     fn empty_name_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -844,6 +1175,20 @@ mod tests {
             create_project(&req, Actor::Test),
             Err(DfError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn a_profile_typo_is_rejected_before_creating_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = request(tmp.path());
+        req.profile = Some("legla".to_string());
+
+        let error = create_project(&req, Actor::Test).unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(message) if message.contains("legla")),
+            "unexpected error: {error:?}"
+        );
+        assert!(!req.project_dir.exists());
     }
 
     #[test]
@@ -910,7 +1255,26 @@ mod tests {
     }
 
     #[test]
-    fn scan_hash_and_duplicate_report_through_the_facade() {
+    fn opening_rejects_an_unknown_persisted_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let db = Db::open(&req.project_dir.join(PROJECT_DB_RELATIVE)).unwrap();
+        db.conn_for_tests()
+            .execute("UPDATE projects SET profile = 'legla'", [])
+            .unwrap();
+        drop(db);
+
+        let error = open_project(&req.project_dir).unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(message) if message.contains("legla")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn scan_hash_analyze_and_reports_through_the_facade() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
         std::fs::create_dir_all(&origin).unwrap();
@@ -930,13 +1294,21 @@ mod tests {
         assert_eq!(hash.hashed, 3);
         assert_eq!(hash.state, "HASHED");
 
+        assert_analysis_reports_unavailable(&req.project_dir);
+
+        let analysis = analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        assert_eq!(analysis.state, "ANALYZED");
+
         let report = duplicate_report(&req.project_dir).expect("duplicates");
         assert_eq!(report.sets.len(), 1);
         assert_eq!(report.redundant_files, 1);
         assert_eq!(report.redundant_bytes, 9);
+        tree_clone_report(&req.project_dir).expect("tree clones");
+        tree_relation_report(&req.project_dir).expect("tree relations");
+        context_report(&req.project_dir).expect("context");
 
         let status = project_status(&req.project_dir).expect("status");
-        assert_eq!(status.state, "HASHED");
+        assert_eq!(status.state, "ANALYZED");
         let inventory = status.inventory.expect("inventory populated after scan");
         assert_eq!(inventory.files, 3);
         assert_eq!(inventory.hash_done, 3);
@@ -950,6 +1322,90 @@ mod tests {
 
         // Nothing was written inside the origin during the whole pipeline.
         assert_eq!(std::fs::read_dir(&origin).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn completed_analysis_reports_remain_available_after_terminal_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("evidencia.txt"), b"contenido").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).unwrap();
+        hash_project(&req.project_dir, Actor::Test).unwrap();
+        analyze_project(&req.project_dir, Actor::Test).unwrap();
+
+        let mut db = Db::open(&req.project_dir.join(PROJECT_DB_RELATIVE)).unwrap();
+        repository::update_project_state(&mut db, ProjectState::Planning, Actor::Test).unwrap();
+        repository::update_project_state(&mut db, ProjectState::Failed, Actor::Test).unwrap();
+        drop(db);
+
+        duplicate_report(&req.project_dir).expect("duplicate report after failure");
+        tree_clone_report(&req.project_dir).expect("tree report after failure");
+        structural_anomaly_report(&req.project_dir).expect("anomaly report after failure");
+        structural_review_queue(&req.project_dir).expect("review queue after failure");
+        assert_eq!(project_status(&req.project_dir).unwrap().state, "FAILED");
+    }
+
+    #[test]
+    fn reports_stay_hidden_during_a_crashed_analysis_and_work_after_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido").unwrap();
+        std::fs::write(origin.join("dos.txt"), b"contenido").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).unwrap();
+        hash_project(&req.project_dir, Actor::Test).unwrap();
+
+        // Simulate a process dying after ANALYZING and the first analysis
+        // repository committed. No table or state is changed with raw SQL.
+        let mut db = Db::open(&req.project_dir.join(PROJECT_DB_RELATIVE)).unwrap();
+        let project = repository::load_project(&db).unwrap();
+        let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+            .unwrap()
+            .unwrap();
+        repository::update_project_state(&mut db, ProjectState::Analyzing, Actor::Test).unwrap();
+        df_db::plans::materialize_duplicate_sets(&mut db, project.id, snapshot.id, Actor::Test)
+            .unwrap();
+        drop(db);
+
+        assert_analysis_reports_unavailable(&req.project_dir);
+
+        let resumed = analyze_project(&req.project_dir, Actor::Test).unwrap();
+        assert_eq!(resumed.state, "ANALYZED");
+        duplicate_report(&req.project_dir).expect("duplicates after resume");
+        tree_clone_report(&req.project_dir).expect("tree clones after resume");
+        tree_relation_report(&req.project_dir).expect("tree relations after resume");
+        context_report(&req.project_dir).expect("context after resume");
+    }
+
+    #[test]
+    fn reports_require_final_stage_evidence_even_if_state_says_analyzed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).unwrap();
+        hash_project(&req.project_dir, Actor::Test).unwrap();
+
+        // Public state transitions alone cannot manufacture analysis evidence.
+        let mut db = Db::open(&req.project_dir.join(PROJECT_DB_RELATIVE)).unwrap();
+        repository::update_project_state(&mut db, ProjectState::Analyzing, Actor::Test).unwrap();
+        repository::update_project_state(&mut db, ProjectState::Analyzed, Actor::Test).unwrap();
+        drop(db);
+
+        assert_analysis_reports_unavailable(&req.project_dir);
     }
 
     #[test]

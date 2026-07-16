@@ -43,6 +43,21 @@ export interface InventorySummary {
   hash_source_changed: number;
 }
 
+/** Compact M0.2 evidence summary for the latest complete snapshot. */
+export interface StructuralDiagnostics {
+  analysis_complete: boolean;
+  folder_signatures: number;
+  exact_tree_clone_sets: number;
+  partial_tree_clones: number;
+  embedded_trees: number;
+  generic_folders: number;
+  protected_boundaries: number;
+  rule_matches: number;
+  anomalies: number;
+  high_anomalies: number;
+  pending_review: number;
+}
+
 export interface ProjectStatus {
   project_id: string;
   name: string;
@@ -59,6 +74,7 @@ export interface ProjectStatus {
   last_event: EventView | null;
   latest_snapshot_id: string | null;
   inventory: InventorySummary | null;
+  structural_diagnostics: StructuralDiagnostics | null;
   integrity: IntegrityReport | null;
 }
 

@@ -16,10 +16,13 @@
 //! clone set, so a partially-scanned branch is never claimed identical to
 //! another (safety, §19.4).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
-use df_domain::{Actor, ProjectId, SnapshotId, TreeCloneSet, TreeCloneSetId, TreeRelationship};
+use df_domain::{
+    Actor, ProjectId, RawPath, ScanEntryStatus, SnapshotId, TreeCloneSet, TreeCloneSetId,
+    TreeRelationship,
+};
 use df_error::DfResult;
 use rusqlite::params;
 
@@ -54,6 +57,49 @@ fn folder_signature(mut entries: Vec<String>) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Stable Merkle name for the final component of an exact raw relative path.
+///
+/// The `raw:` namespace cannot collide with the `display:` compatibility
+/// namespace below. Encoding the UTF-16LE bytes preserves unpaired surrogate
+/// values on every platform, including when tests run somewhere other than
+/// Windows. Only the basename participates: otherwise identical subtrees at
+/// different parents would receive different signatures.
+fn raw_basename_key(raw: &RawPath) -> String {
+    let blob = raw.to_blob();
+    let mut start = 0usize;
+    for (index, unit) in blob.chunks_exact(2).enumerate() {
+        let value = u16::from_le_bytes([unit[0], unit[1]]);
+        if value == b'/' as u16 || value == b'\\' as u16 {
+            start = (index + 1) * 2;
+        }
+    }
+    let mut key = String::with_capacity(4 + (blob.len() - start) * 2);
+    key.push_str("raw:");
+    for byte in &blob[start..] {
+        use std::fmt::Write as _;
+        write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    key
+}
+
+/// Select the authoritative child name used by a Merkle entry.
+///
+/// Legacy snapshots can lack a raw path, in which case a non-lossy display
+/// name remains usable under its own namespace. A known lossy name without
+/// raw evidence is not safe to identify structurally and makes the subtree
+/// incomplete instead.
+fn merkle_child_name(
+    raw_relative_path: Option<&RawPath>,
+    normalized_name: &str,
+    name_is_lossy: bool,
+) -> Option<String> {
+    match raw_relative_path {
+        Some(raw) => Some(raw_basename_key(raw)),
+        None if name_is_lossy || normalized_name.contains('\u{fffd}') => None,
+        None => Some(format!("display:{normalized_name}")),
+    }
+}
+
 /// Bottom-up state of one folder while computing signatures.
 struct Computed {
     signature: Option<String>,
@@ -67,6 +113,8 @@ struct FolderRow {
     source_root_id: String,
     relative_path: String,
     normalized_name: String,
+    raw_relative_path: Option<RawPath>,
+    status: ScanEntryStatus,
     depth: i64,
 }
 
@@ -74,8 +122,10 @@ struct FileRow {
     source_root_id: String,
     parent_relative_path: String,
     normalized_name: String,
+    raw_relative_path: Option<RawPath>,
+    name_is_lossy: bool,
     size_bytes: i64,
-    scan_status: String,
+    scan_status: ScanEntryStatus,
     sha256: Option<String>,
 }
 
@@ -95,24 +145,41 @@ pub fn compute_folder_signatures(
         let mut stmt = db
             .conn()
             .prepare(
-                "SELECT id, source_root_id, relative_path, normalized_name, depth
+                "SELECT id, source_root_id, relative_path, normalized_name, depth,
+                        status, raw_relative_path
                  FROM folders WHERE snapshot_id = ?1",
             )
             .map_err(db_err)?;
         let rows = stmt
             .query_map([&snapshot], |row| {
-                Ok(FolderRow {
-                    id: row.get(0)?,
-                    source_root_id: row.get(1)?,
-                    relative_path: row.get(2)?,
-                    normalized_name: row.get(3)?,
-                    depth: row.get(4)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                ))
             })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
-        rows
+        rows.into_iter()
+            .map(
+                |(id, source_root_id, relative_path, normalized_name, depth, status, raw)| {
+                    Ok(FolderRow {
+                        id,
+                        source_root_id,
+                        relative_path,
+                        normalized_name,
+                        raw_relative_path: raw.as_deref().map(RawPath::from_blob).transpose()?,
+                        status: ScanEntryStatus::parse(&status)?,
+                        depth,
+                    })
+                },
+            )
+            .collect::<DfResult<Vec<_>>>()?
     };
 
     let files: Vec<FileRow> = {
@@ -120,7 +187,8 @@ pub fn compute_folder_signatures(
             .conn()
             .prepare(
                 "SELECT o.source_root_id, o.parent_relative_path, o.normalized_name,
-                        o.size_bytes, o.scan_status, c.sha256
+                        o.size_bytes, o.scan_status, c.sha256, o.raw_relative_path,
+                        o.name_is_lossy
                  FROM path_occurrences o
                  LEFT JOIN occurrence_content oc ON oc.occurrence_id = o.id
                  LEFT JOIN content_objects c ON c.id = oc.content_id
@@ -129,19 +197,45 @@ pub fn compute_folder_signatures(
             .map_err(db_err)?;
         let rows = stmt
             .query_map([&snapshot], |row| {
-                Ok(FileRow {
-                    source_root_id: row.get(0)?,
-                    parent_relative_path: row.get(1)?,
-                    normalized_name: row.get(2)?,
-                    size_bytes: row.get(3)?,
-                    scan_status: row.get(4)?,
-                    sha256: row.get(5)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
             })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
-        rows
+        rows.into_iter()
+            .map(
+                |(
+                    source_root_id,
+                    parent_relative_path,
+                    normalized_name,
+                    size_bytes,
+                    scan_status,
+                    sha256,
+                    raw,
+                    name_is_lossy,
+                )| {
+                    Ok(FileRow {
+                        source_root_id,
+                        parent_relative_path,
+                        normalized_name,
+                        raw_relative_path: raw.as_deref().map(RawPath::from_blob).transpose()?,
+                        name_is_lossy: name_is_lossy != 0,
+                        size_bytes,
+                        scan_status: ScanEntryStatus::parse(&scan_status)?,
+                        sha256,
+                    })
+                },
+            )
+            .collect::<DfResult<Vec<_>>>()?
     };
 
     // --- index children by (source_root_id, parent_relative_path) ----------
@@ -185,7 +279,7 @@ pub fn compute_folder_signatures(
     for &index in &order {
         let folder = &folders[index];
         let mut entries: Vec<String> = Vec::new();
-        let mut complete = true;
+        let mut complete = folder.status == ScanEntryStatus::Ok;
         let mut subtree_files: u64 = 0;
         let mut subtree_bytes: u64 = 0;
 
@@ -195,9 +289,14 @@ pub fn compute_folder_signatures(
             for file in children {
                 subtree_files += 1;
                 subtree_bytes += file.size_bytes.max(0) as u64;
-                match (&file.sha256, file.scan_status.as_str()) {
-                    (Some(sha), "OK") => {
-                        entries.push(format!("F\0{}\0{}", file.normalized_name, sha));
+                let name = merkle_child_name(
+                    file.raw_relative_path.as_ref(),
+                    &file.normalized_name,
+                    file.name_is_lossy,
+                );
+                match (&file.sha256, file.scan_status, name) {
+                    (Some(sha), ScanEntryStatus::Ok, Some(name)) => {
+                        entries.push(format!("F\0{name}\0{sha}"));
                     }
                     _ => complete = false,
                 }
@@ -214,9 +313,14 @@ pub fn compute_folder_signatures(
                     .expect("children are computed before their parent");
                 subtree_files += child_computed.subtree_files;
                 subtree_bytes += child_computed.subtree_bytes;
-                match (&child_computed.signature, child_computed.is_complete) {
-                    (Some(sig), true) => {
-                        entries.push(format!("D\0{}\0{}", child.normalized_name, sig));
+                let name = merkle_child_name(
+                    child.raw_relative_path.as_ref(),
+                    &child.normalized_name,
+                    false,
+                );
+                match (&child_computed.signature, child_computed.is_complete, name) {
+                    (Some(sig), true, Some(name)) => {
+                        entries.push(format!("D\0{name}\0{sig}"));
                     }
                     _ => complete = false,
                 }
@@ -438,6 +542,98 @@ mod tests {
         assert_eq!(folder_signature(vec![]), folder_signature(vec![]));
     }
 
+    fn raw_from_units(units: &[u16]) -> RawPath {
+        let blob: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        RawPath::from_blob(&blob).unwrap()
+    }
+
+    #[test]
+    fn raw_merkle_names_use_only_the_basename_and_preserve_invalid_utf16() {
+        let first = raw_from_units(&[b'A' as u16, b'\\' as u16, 0xd800]);
+        let same_name_elsewhere = raw_from_units(&[b'B' as u16, b'/' as u16, 0xd800]);
+        let different_raw_name = raw_from_units(&[b'B' as u16, b'/' as u16, 0xd801]);
+
+        assert_eq!(
+            raw_basename_key(&first),
+            raw_basename_key(&same_name_elsewhere),
+            "the parent path must not affect a child Merkle name"
+        );
+        assert_ne!(
+            raw_basename_key(&first),
+            raw_basename_key(&different_raw_name),
+            "distinct raw UTF-16 names must never collapse through U+FFFD"
+        );
+    }
+
+    #[test]
+    fn bounded_candidate_pairs_are_deterministic_and_count_unique_omissions() {
+        let key = |path: &str| StableFolderKey::new("root", path);
+        let mut first = HashMap::new();
+        first.insert("shared-1".to_string(), vec![key("c"), key("a"), key("b")]);
+        // a/b share two contents: this must still be one candidate pair.
+        first.insert("shared-2".to_string(), vec![key("b"), key("a")]);
+
+        let mut reversed = HashMap::new();
+        reversed.insert("shared-2".to_string(), vec![key("a"), key("b")]);
+        reversed.insert("shared-1".to_string(), vec![key("b"), key("c"), key("a")]);
+
+        let expected = limited_candidate_pairs(&first, 32, 2);
+        let reordered = limited_candidate_pairs(&reversed, 32, 2);
+        assert_eq!(expected, reordered);
+        assert_eq!(expected.0.len(), 2);
+        assert_eq!(expected.1, 1, "only the distinct third pair was omitted");
+        assert_eq!(expected.0, vec![(key("a"), key("b")), (key("a"), key("c"))]);
+    }
+
+    #[test]
+    fn candidate_cap_is_stable_across_rescans_with_new_folder_ids() {
+        fn folder(folder_id: &str, relative_path: &str) -> (StableFolderKey, SubtreeContents) {
+            (
+                StableFolderKey::new("source-root", relative_path),
+                SubtreeContents {
+                    folder_id: folder_id.to_string(),
+                    contents: ["shared-content".to_string()].into_iter().collect(),
+                    bytes_by_content: HashMap::new(),
+                },
+            )
+        }
+
+        // The per-snapshot UUID ordering is deliberately reversed. An id-based
+        // cap would select different logical pairs in these two scans.
+        let first_scan = HashMap::from([
+            folder("folder-z", "a"),
+            folder("folder-y", "b"),
+            folder("folder-x", "c"),
+        ]);
+        let rescanned = HashMap::from([
+            folder("folder-x", "a"),
+            folder("folder-y2", "b"),
+            folder("folder-z", "c"),
+        ]);
+
+        for key in first_scan.keys() {
+            assert_ne!(first_scan[key].folder_id, rescanned[key].folder_id);
+        }
+
+        let expected = limited_candidate_pairs_for_folders(&first_scan, 32, 2);
+        let actual = limited_candidate_pairs_for_folders(&rescanned, 32, 2);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.1, 1, "the cap must omit the same logical pair");
+        assert_eq!(
+            actual.0,
+            vec![
+                (
+                    StableFolderKey::new("source-root", "a"),
+                    StableFolderKey::new("source-root", "b"),
+                ),
+                (
+                    StableFolderKey::new("source-root", "a"),
+                    StableFolderKey::new("source-root", "c"),
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn parent_path_groups_root_children_under_empty() {
         assert_eq!(parent_path(""), "");
@@ -481,13 +677,24 @@ mod tests {
     }
 
     fn add_folder(db: &Db, s: &Seed, rel: &str, parent: Option<&str>, name: &str) {
+        add_folder_with_status(db, s, rel, parent, name, "OK");
+    }
+
+    fn add_folder_with_status(
+        db: &Db,
+        s: &Seed,
+        rel: &str,
+        parent: Option<&str>,
+        name: &str,
+        status: &str,
+    ) {
         db.conn()
             .execute(
                 "INSERT INTO folders
                     (id, snapshot_id, source_root_id, relative_path,
                      parent_relative_path, name, normalized_name, depth, status,
                      created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'OK','t')",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'t')",
                 params![
                     uuid::Uuid::new_v4().to_string(),
                     s.snapshot.to_string(),
@@ -497,6 +704,7 @@ mod tests {
                     name,
                     name.to_lowercase(),
                     rel.matches(['/', '\\']).count() as i64 + if rel.is_empty() { 0 } else { 1 },
+                    status,
                 ],
             )
             .unwrap();
@@ -635,6 +843,111 @@ mod tests {
         assert_eq!(summary.tree_clone_sets, 0);
         assert!(tree_clone_sets(&db, s.snapshot).unwrap().is_empty());
     }
+
+    #[test]
+    fn an_error_or_unfollowed_reparse_folder_makes_every_ancestor_incomplete() {
+        for blocked_status in ["ERROR", "REPARSE_NOT_FOLLOWED"] {
+            let sha = "e".repeat(64);
+            let mut db = Db::open_in_memory().unwrap();
+            let (project_id, s) = seed(&mut db);
+            add_folder(&db, &s, "", None, "in");
+            add_folder(&db, &s, "A", Some(""), "A");
+            add_folder(&db, &s, "B", Some(""), "B");
+            add_folder_with_status(&db, &s, "B/hidden", Some("B"), "hidden", blocked_status);
+            add_file(&db, &s, "A", "same.txt", Some(&sha));
+            add_file(&db, &s, "B", "same.txt", Some(&sha));
+
+            let summary =
+                compute_folder_signatures(&mut db, project_id, s.snapshot, Actor::Test).unwrap();
+            assert_eq!(summary.complete_folders, 1, "status {blocked_status}");
+            assert_eq!(summary.tree_clone_sets, 0, "status {blocked_status}");
+
+            let b_complete: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT fs.is_complete
+                     FROM folder_signatures fs
+                     JOIN folders f ON f.id = fs.folder_id
+                     WHERE f.snapshot_id = ?1 AND f.relative_path = 'B'",
+                    [s.snapshot.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(b_complete, 0, "status {blocked_status} must propagate");
+        }
+    }
+
+    #[test]
+    fn a_lossy_file_without_raw_identity_makes_the_branch_incomplete() {
+        let sha = "f".repeat(64);
+        let mut db = Db::open_in_memory().unwrap();
+        let (project_id, s) = seed(&mut db);
+        add_folder(&db, &s, "", None, "in");
+        add_folder(&db, &s, "A", Some(""), "A");
+        add_file(&db, &s, "A", "damaged\u{fffd}.txt", Some(&sha));
+        db.conn()
+            .execute(
+                "UPDATE path_occurrences
+                 SET name_is_lossy = 1, raw_relative_path = NULL
+                 WHERE snapshot_id = ?1 AND relative_path = 'A/damaged�.txt'",
+                [s.snapshot.to_string()],
+            )
+            .unwrap();
+
+        let summary =
+            compute_folder_signatures(&mut db, project_id, s.snapshot, Actor::Test).unwrap();
+        assert_eq!(summary.complete_folders, 0);
+        assert_eq!(summary.tree_clone_sets, 0);
+    }
+
+    #[test]
+    fn different_raw_file_names_do_not_form_a_false_exact_clone() {
+        let sha = "1".repeat(64);
+        let mut db = Db::open_in_memory().unwrap();
+        let (project_id, s) = seed(&mut db);
+        add_folder(&db, &s, "", None, "in");
+        add_folder(&db, &s, "A", Some(""), "A");
+        add_folder(&db, &s, "B", Some(""), "B");
+        let display = "damaged\u{fffd}.txt";
+        add_file(&db, &s, "A", display, Some(&sha));
+        add_file(&db, &s, "B", display, Some(&sha));
+
+        let raw_a = raw_from_units(&[
+            b'A' as u16,
+            b'/' as u16,
+            b'd' as u16,
+            0xd800,
+            b'.' as u16,
+            b't' as u16,
+            b'x' as u16,
+            b't' as u16,
+        ]);
+        let raw_b = raw_from_units(&[
+            b'B' as u16,
+            b'/' as u16,
+            b'd' as u16,
+            0xd801,
+            b'.' as u16,
+            b't' as u16,
+            b'x' as u16,
+            b't' as u16,
+        ]);
+        for (relative, raw) in [("A/damaged�.txt", raw_a), ("B/damaged�.txt", raw_b)] {
+            db.conn()
+                .execute(
+                    "UPDATE path_occurrences
+                     SET name_is_lossy = 1, raw_relative_path = ?1
+                     WHERE snapshot_id = ?2 AND relative_path = ?3",
+                    params![raw.to_blob(), s.snapshot.to_string(), relative],
+                )
+                .unwrap();
+        }
+
+        let summary =
+            compute_folder_signatures(&mut db, project_id, s.snapshot, Actor::Test).unwrap();
+        assert_eq!(summary.complete_folders, 3);
+        assert_eq!(summary.tree_clone_sets, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -655,8 +968,8 @@ pub struct TreeRelationOptions {
     /// overlap is indistinguishable from coincidence
     /// (`REPEATED_COMPONENT_ONLY`).
     pub min_similarity: f64,
-    /// Hard ceiling on candidate pairs, so a pathological snapshot degrades
-    /// into "fewer relations reported" instead of hanging.
+    /// Hard ceiling on candidate pairs examined and persisted. Distinct
+    /// candidates beyond it are counted in `pairs_skipped`.
     pub max_pairs: usize,
 }
 
@@ -711,13 +1024,76 @@ fn is_ancestor_of(ancestor: &str, descendant: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(['/', '\\']))
 }
 
+/// Snapshot-independent identity used to order folders and apply candidate
+/// limits reproducibly across rescans of the same project.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct StableFolderKey {
+    source_root_id: String,
+    relative_path: String,
+}
+
+impl StableFolderKey {
+    fn new(source_root_id: impl Into<String>, relative_path: impl Into<String>) -> Self {
+        Self {
+            source_root_id: source_root_id.into(),
+            relative_path: relative_path.into(),
+        }
+    }
+}
+
 /// A folder's subtree, as the set of distinct contents it holds.
 struct SubtreeContents {
     folder_id: String,
-    source_root_id: String,
-    relative_path: String,
     contents: std::collections::HashSet<String>,
     bytes_by_content: HashMap<String, u64>,
+}
+
+/// Build the bounded candidate set in a stable order and report the number of
+/// distinct candidates omitted by the bound.
+///
+/// A pair can share several contents, so counting each rejected insertion
+/// overstates truncation. Materialising the distinct set first both removes
+/// that ambiguity and makes selection independent of `HashMap` randomisation.
+fn limited_candidate_pairs(
+    by_content: &HashMap<String, Vec<StableFolderKey>>,
+    max_folders_per_content: usize,
+    max_pairs: usize,
+) -> (Vec<(StableFolderKey, StableFolderKey)>, u64) {
+    let mut distinct: BTreeSet<(StableFolderKey, StableFolderKey)> = BTreeSet::new();
+    for holders in by_content.values() {
+        if holders.len() > max_folders_per_content {
+            continue;
+        }
+        let mut holders = holders.clone();
+        holders.sort_unstable();
+        holders.dedup();
+        for (index, a) in holders.iter().enumerate() {
+            for b in holders.iter().skip(index + 1) {
+                distinct.insert((a.clone(), b.clone()));
+            }
+        }
+    }
+
+    let pairs_skipped = distinct.len().saturating_sub(max_pairs) as u64;
+    let selected = distinct.into_iter().take(max_pairs).collect();
+    (selected, pairs_skipped)
+}
+
+fn limited_candidate_pairs_for_folders(
+    folders: &HashMap<StableFolderKey, SubtreeContents>,
+    max_folders_per_content: usize,
+    max_pairs: usize,
+) -> (Vec<(StableFolderKey, StableFolderKey)>, u64) {
+    let mut by_content: HashMap<String, Vec<StableFolderKey>> = HashMap::new();
+    for (key, folder) in folders {
+        for content in &folder.contents {
+            by_content
+                .entry(content.clone())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    limited_candidate_pairs(&by_content, max_folders_per_content, max_pairs)
 }
 
 /// Compute pairwise `PARTIAL_TREE_CLONE` / `TREE_EMBEDDED` relations between
@@ -761,18 +1137,15 @@ pub fn compute_tree_relations(
         rows
     };
 
-    // (root, relative_path) -> folder id, to attach an occurrence to each of
-    // its ancestor folders without a LIKE over path separators.
-    let mut folder_at: HashMap<(String, String), String> = HashMap::new();
-    let mut folders: HashMap<String, SubtreeContents> = HashMap::new();
+    // A source-root/path pair is stable across snapshots of the same project;
+    // folder ids are newly generated per scan and must not drive bounded
+    // candidate selection.
+    let mut folders: HashMap<StableFolderKey, SubtreeContents> = HashMap::new();
     for (folder_id, root_id, relative) in folder_rows {
-        folder_at.insert((root_id.clone(), relative.clone()), folder_id.clone());
         folders.insert(
-            folder_id.clone(),
+            StableFolderKey::new(root_id, relative),
             SubtreeContents {
                 folder_id,
-                source_root_id: root_id,
-                relative_path: relative,
                 contents: std::collections::HashSet::new(),
                 bytes_by_content: HashMap::new(),
             },
@@ -810,11 +1183,10 @@ pub fn compute_tree_relations(
     // O(occurrences x depth) instead of a quadratic path match.
     for (root_id, parent, content_id, size) in occurrences {
         for ancestor in ancestors_of(&parent) {
-            if let Some(folder_id) = folder_at.get(&(root_id.clone(), ancestor)) {
-                if let Some(folder) = folders.get_mut(folder_id) {
-                    folder.bytes_by_content.insert(content_id.clone(), size);
-                    folder.contents.insert(content_id.clone());
-                }
+            let key = StableFolderKey::new(root_id.clone(), ancestor);
+            if let Some(folder) = folders.get_mut(&key) {
+                folder.bytes_by_content.insert(content_id.clone(), size);
+                folder.contents.insert(content_id.clone());
             }
         }
     }
@@ -822,44 +1194,19 @@ pub fn compute_tree_relations(
 
     // Inverted index content -> folders, so only folders that actually share
     // something get paired.
-    let mut by_content: HashMap<&str, Vec<&str>> = HashMap::new();
-    for folder in folders.values() {
-        for content in &folder.contents {
-            by_content
-                .entry(content.as_str())
-                .or_default()
-                .push(folder.folder_id.as_str());
-        }
-    }
-
-    let mut candidates: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
-    let mut pairs_skipped = 0u64;
-    for holders in by_content.values() {
-        if holders.len() > options.max_folders_per_content {
-            continue; // a shared component, not a sign of kinship
-        }
-        for (i, a) in holders.iter().enumerate() {
-            for b in holders.iter().skip(i + 1) {
-                let pair = if a < b { (*a, *b) } else { (*b, *a) };
-                if candidates.contains(&pair) {
-                    continue;
-                }
-                if candidates.len() >= options.max_pairs {
-                    pairs_skipped += 1;
-                    continue;
-                }
-                candidates.insert(pair);
-            }
-        }
-    }
+    let (candidates, pairs_skipped) = limited_candidate_pairs_for_folders(
+        &folders,
+        options.max_folders_per_content,
+        options.max_pairs,
+    );
 
     let mut relations: Vec<(df_domain::TreeRelation, Option<&'static str>)> = Vec::new();
-    for (a_id, b_id) in &candidates {
-        let (a, b) = (&folders[*a_id], &folders[*b_id]);
+    for (a_key, b_key) in &candidates {
+        let (a, b) = (&folders[a_key], &folders[b_key]);
         // Same root and one inside the other: trivially "shared", not a clone.
-        if a.source_root_id == b.source_root_id
-            && (is_ancestor_of(&a.relative_path, &b.relative_path)
-                || is_ancestor_of(&b.relative_path, &a.relative_path))
+        if a_key.source_root_id == b_key.source_root_id
+            && (is_ancestor_of(&a_key.relative_path, &b_key.relative_path)
+                || is_ancestor_of(&b_key.relative_path, &a_key.relative_path))
         {
             continue;
         }
@@ -886,13 +1233,10 @@ pub fn compute_tree_relations(
             .filter_map(|c| a.bytes_by_content.get(c.as_str()))
             .sum();
 
-        // Stable order, so the pair is stored once regardless of hash order.
-        let (fa, fb, ua, ub) =
-            if (&a.relative_path, &a.folder_id) <= (&b.relative_path, &b.folder_id) {
-                (a, b, unique_a, unique_b)
-            } else {
-                (b, a, unique_b, unique_a)
-            };
+        // Candidate endpoints are already ordered by the stable source/path
+        // key, so A/B is independent of the per-snapshot folder UUIDs.
+        debug_assert!(a_key < b_key);
+        let (fa, fb, ua, ub) = (a, b, unique_a, unique_b);
         let (relationship, contained) = match (ua, ub) {
             (0, _) => (TreeRelationship::Embedded, Some("A")),
             (_, 0) => (TreeRelationship::Embedded, Some("B")),

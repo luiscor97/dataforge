@@ -1,5 +1,9 @@
 # Modelo de amenazas — Filesystem Safety Hardening (v0.1.1-dev)
 
+Estado: sigue siendo la base de seguridad del objetivo `0.2.0`; Milestone 0.2
+añade análisis estructural y recuperación, pero no amplía las plataformas ni
+relaja estas garantías. Véase también [`initial.md`](initial.md).
+
 Ámbito: el pipeline `scan → hash → analyze → plan → approve → execute →
 verify` frente a un sistema de archivos **hostil o simplemente tramposo**.
 Complementa [`initial.md`](initial.md), que cubre la fundación.
@@ -191,13 +195,19 @@ y el test que lo demuestra.
   carpeta.
 - **Impacto**: la salida cae dentro del origen (o al revés) sin detectarse:
   el pipeline se autoalimenta o escribe en el origen.
-- **Mitigación**: servicio `PathRelation` que resuelve por identidad física
-  cuando puede y devuelve `Unresolved` (conservador) cuando no.
-- **Riesgo residual**: NAS/UNC **no** se anuncia como plenamente soportado
-  hasta tener pruebas.
-- **Test**: `two_representations_of_same_folder_are_detected`.
+- **Mitigación vigente**: la fachada rechaza contención y equivalencia léxicas;
+  además, el escáner no sigue reparse points y la escritura valida la identidad
+  física del `output_root` congelada en el manifiesto y rechaza componentes
+  redirigidos durante la resolución segura.
+- **Riesgo residual aceptado**: la comprobación inicial entre **dos raíces** no
+  compara todavía su identidad física. Un alias preexistente que no aparezca
+  como componente reparse de la ruta suministrada (por ejemplo, otra
+  representación UNC o 8.3) puede eludir la prueba léxica. En `0.2.0` deben
+  usarse raíces canónicas, locales y manifiestamente separadas; NAS/UNC sigue
+  siendo experimental. Falta un servicio de relación física entre raíces y su
+  regresión específica.
 
-## Qué NO se promete en v0.1.1-dev
+## Qué sigue sin prometerse en 0.2.0
 
 - Seguridad equivalente en Linux/macOS: **no implementada**; la ejecución se
   bloquea en plataformas sin primitivas seguras.

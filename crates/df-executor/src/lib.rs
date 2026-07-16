@@ -99,11 +99,21 @@ pub fn execute_plan(
         )));
     }
 
+    // Validate both the currently registered roots and the paths frozen in the
+    // immutable manifest. The latter are what copy operations will actually
+    // open, while the former also cover empty roots represented only by
+    // CREATE_DIRECTORY operations.
+    let source_roots = execution_source_roots(db, project.id, plan.id)?;
+    validate_source_output_boundary(&source_roots, &project.output_root)?;
+
     // The output root is validated and physically identified before a single
     // byte is written; on a platform without a safe implementation this errors
     // out instead of executing unprotected (ADR-0017).
     let output_root = project.output_root.clone();
     let safe_root = SafeOutputRoot::validate(&output_root)?;
+    // Creating a previously absent output root changes the filesystem view;
+    // repeat the proof before entering EXECUTING or running an operation.
+    validate_source_output_boundary(&source_roots, safe_root.path())?;
 
     repository::update_project_state(db, ProjectState::Executing, actor)?;
 
@@ -163,6 +173,31 @@ pub fn execute_plan(
         cancelled,
         state: project.state.as_str().to_string(),
     })
+}
+
+fn execution_source_roots(
+    db: &Db,
+    project_id: df_domain::ProjectId,
+    plan_id: df_domain::PlanId,
+) -> DfResult<Vec<PathBuf>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for root in repository::load_source_roots(db, project_id)? {
+        paths.insert(root.absolute_path);
+    }
+    for entry in plans::manifest(db, plan_id)? {
+        if let Some(path) = entry.source_root_path_snapshot {
+            paths.insert(PathBuf::from(path));
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn validate_source_output_boundary(source_roots: &[PathBuf], output_root: &Path) -> DfResult<()> {
+    for source_root in source_roots {
+        df_fs_safety::ensure_root_is_not_reparse(source_root)?;
+        df_fs_safety::ensure_physical_roots_disjoint(source_root, output_root)?;
+    }
+    Ok(())
 }
 
 /// Execute one operation against the filesystem. Never returns `Err`: every
@@ -252,7 +287,8 @@ impl OperationFailure {
         match error {
             FsSafetyError::ReparsePoint { .. }
             | FsSafetyError::OutsideOutputRoot { .. }
-            | FsSafetyError::OutputRootIdentityChanged { .. } => Self {
+            | FsSafetyError::OutputRootIdentityChanged { .. }
+            | FsSafetyError::PhysicalRootOverlap { .. } => Self {
                 code: OperationErrorCode::InvalidPath,
                 state: ExecutionState::FailedFinal,
                 detail: error.to_string(),
@@ -263,6 +299,7 @@ impl OperationFailure {
                 detail: error.to_string(),
             },
             FsSafetyError::InvalidRelativePath { .. }
+            | FsSafetyError::InvalidRootPath { .. }
             | FsSafetyError::UnsupportedPlatform { .. } => Self {
                 code: OperationErrorCode::InvalidPath,
                 state: ExecutionState::FailedFinal,
@@ -306,6 +343,7 @@ fn copy_file(
     operation: &ExecutableOperation,
     options: &ExecuteOptions,
 ) -> Result<OperationOutcome, OperationFailure> {
+    validate_source_root(safe_root, operation)?;
     // Resolving proves the planned destination is reachable without crossing a
     // single link, and re-checks the output root's physical identity.
     let planned_destination = safe_root
@@ -432,6 +470,10 @@ fn copy_file(
             ));
         }
     }
+    // Re-prove the root boundary after reading and before committing the
+    // destination. This catches a junction/root swap during a long copy; the
+    // file fingerprint above independently catches a source-object swap.
+    validate_source_root(safe_root, operation)?;
 
     // 8. Finalize. The no-overwrite guarantee comes from the platform, not
     // from a prior exists() check, which would be a race (ADR-0021): if the
@@ -454,6 +496,33 @@ fn copy_file(
         blake3: Some(copy.blake3),
         started_at: chrono::Utc::now(),
     })
+}
+
+fn validate_source_root(
+    safe_root: &SafeOutputRoot,
+    operation: &ExecutableOperation,
+) -> Result<(), OperationFailure> {
+    let root = operation.source_root_path.as_deref().ok_or_else(|| {
+        OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "copy operation without a source root",
+        )
+    })?;
+    df_fs_safety::ensure_root_is_not_reparse(root).map_err(OperationFailure::from_fs_safety)?;
+    df_fs_safety::ensure_physical_roots_disjoint(root, safe_root.path())
+        .map_err(OperationFailure::from_fs_safety)?;
+    if let Some(expected) = operation.source_root_identity.as_deref() {
+        let current = df_fs_safety::identity_of(root)
+            .map_err(OperationFailure::from_fs_safety)?
+            .map(|identity| format!("{}:{}", identity.volume_serial, identity.file_index));
+        if current.as_deref() != Some(expected) {
+            return Err(OperationFailure::fatal(
+                OperationErrorCode::SourceChanged,
+                "source root identity changed after plan approval",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn source_path(operation: &ExecutableOperation) -> Result<PathBuf, OperationFailure> {
@@ -756,6 +825,44 @@ mod tests {
         // The run ends FAILED, not silently "done": the refusal is journaled
         // (its typed code is covered by `fs_safety_refusals_map_to_typed_final_failures`).
         assert!(!fx.output.join("origen").join("a.txt").exists());
+    }
+
+    /// Original source/output-alias boundary: after approval, replace the
+    /// frozen source root with a junction to the output. Execution must fail in
+    /// preflight, before creating a directory or moving the lifecycle state.
+    #[cfg(windows)]
+    #[test]
+    fn a_source_root_repointed_to_output_is_rejected_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let saved_origin = tmp.path().join("origen-original");
+        std::fs::rename(&fx.origin, &saved_origin).unwrap();
+        std::fs::create_dir_all(&fx.output).unwrap();
+        if !make_junction(&fx.origin, &fx.output) {
+            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            return;
+        }
+
+        let error =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(message) if message.contains("reparse point") || message.contains("overlap physically")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            repository::load_project(&fx.db).unwrap().state,
+            ProjectState::PlanApproved,
+            "preflight refusal must not enter EXECUTING"
+        );
+        assert_eq!(
+            std::fs::read_dir(&fx.output).unwrap().count(),
+            0,
+            "execution wrote inside the physical source"
+        );
+        assert_eq!(
+            std::fs::read(saved_origin.join("a.txt")).unwrap(),
+            b"same bytes"
+        );
     }
 
     /// Threat T5 / P0-3: after approval, the live inventory is evidence, not

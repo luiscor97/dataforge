@@ -29,6 +29,7 @@
 //! [`SafeOutputRoot::validate`], which blocks execution rather than pretending
 //! (RFC-0001 rule 19: no claiming a guarantee without evidence).
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -47,6 +48,15 @@ pub enum FsSafetyError {
     /// The output root is no longer the directory we validated.
     #[error("the output root `{root}` is no longer the same physical directory")]
     OutputRootIdentityChanged { root: PathBuf },
+
+    /// Two roots that look separate as strings resolve to the same physical
+    /// tree (or one resolves below the other).
+    #[error("filesystem roots `{left}` and `{right}` overlap physically")]
+    PhysicalRootOverlap { left: PathBuf, right: PathBuf },
+
+    /// A root cannot be resolved safely without creating anything.
+    #[error("invalid filesystem root `{path}`: {reason}")]
+    InvalidRootPath { path: PathBuf, reason: String },
 
     /// The destination already exists; we never replace.
     #[error("destination `{path}` already exists; DataForge never overwrites")]
@@ -145,6 +155,49 @@ impl SafeRelativePath {
                         return Err(invalid(
                             "component ends with a space or dot, which Windows strips",
                         ));
+                    }
+                    if text.encode_utf16().count() > 255 {
+                        return Err(invalid(
+                            "component exceeds the portable Windows limit of 255 UTF-16 units",
+                        ));
+                    }
+                    if text.chars().any(|character| {
+                        character < '\u{20}'
+                            || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\')
+                    }) {
+                        return Err(invalid(
+                            "component contains a character Windows cannot create safely",
+                        ));
+                    }
+                    let device_stem = text
+                        .split('.')
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_uppercase();
+                    let reserved_device = matches!(
+                        device_stem.as_str(),
+                        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+                    ) || device_stem
+                        .strip_prefix("COM")
+                        .or_else(|| device_stem.strip_prefix("LPT"))
+                        .is_some_and(|number| {
+                            matches!(
+                                number,
+                                "1" | "2"
+                                    | "3"
+                                    | "4"
+                                    | "5"
+                                    | "6"
+                                    | "7"
+                                    | "8"
+                                    | "9"
+                                    | "¹"
+                                    | "²"
+                                    | "³"
+                            )
+                        });
+                    if reserved_device {
+                        return Err(invalid("component is a reserved Windows device name"));
                     }
                     components.push(text.into_owned());
                 }
@@ -484,6 +537,104 @@ pub fn is_reparse_point(path: &Path) -> FsResult<bool> {
     }
 }
 
+/// Reject a source root that is itself a symlink, junction or mount point.
+///
+/// Directory walkers inspect every child with `symlink_metadata`, but the
+/// starting root is supplied by configuration. Without this explicit check,
+/// `read_dir(root)` follows a junction before the walker gets a chance to
+/// apply its no-follow policy.
+pub fn ensure_root_is_not_reparse(path: &Path) -> FsResult<()> {
+    if is_reparse_point(path)? {
+        return Err(FsSafetyError::ReparsePoint {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Prove that two absolute roots are physically disjoint without creating
+/// either path.
+///
+/// Existing prefixes are canonicalized, which resolves aliases such as
+/// junctions, 8.3 names and alternate spellings. Any not-yet-existing suffix
+/// is then appended to that physical prefix before the containment check. This
+/// lets callers reject `source -> output` aliases *before* creating an output
+/// directory inside the source tree.
+pub fn ensure_physical_roots_disjoint(left: &Path, right: &Path) -> FsResult<()> {
+    let resolved_left = resolve_physical_path_without_creating(left)?;
+    let resolved_right = resolve_physical_path_without_creating(right)?;
+    if physical_paths_overlap(&resolved_left, &resolved_right) {
+        return Err(FsSafetyError::PhysicalRootOverlap {
+            left: left.to_path_buf(),
+            right: right.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve the deepest existing ancestor and preserve the missing suffix.
+/// This function is deliberately read-only: security validation must happen
+/// before `SafeOutputRoot::validate` is allowed to create the output root.
+fn resolve_physical_path_without_creating(path: &Path) -> FsResult<PathBuf> {
+    let invalid = |reason: &str| FsSafetyError::InvalidRootPath {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    };
+    if !path.is_absolute() {
+        return Err(invalid("must be absolute"));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(invalid("must not contain `..`"));
+    }
+
+    let mut existing = path.to_path_buf();
+    let mut missing: Vec<OsString> = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(&existing)
+                    .map_err(|error| FsSafetyError::io(&existing, error))?;
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = existing
+                    .file_name()
+                    .ok_or_else(|| invalid("has no reachable existing ancestor"))?
+                    .to_os_string();
+                missing.push(component);
+                if !existing.pop() {
+                    return Err(invalid("has no reachable existing ancestor"));
+                }
+            }
+            Err(error) => return Err(FsSafetyError::io(&existing, error)),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn physical_paths_overlap(left: &Path, right: &Path) -> bool {
+    let components = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let left = components(left);
+    let right = components(right);
+    let shorter = left.len().min(right.len());
+    left[..shorter] == right[..shorter]
+}
+
+#[cfg(not(windows))]
+fn physical_paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 /// Physical identity of a path, or `None` when the filesystem cannot give one.
 pub fn identity_of(path: &Path) -> FsResult<Option<FileIdentity>> {
     platform::identity_of(path)
@@ -710,6 +861,46 @@ mod tests {
     }
 
     #[test]
+    fn windows_device_names_and_illegal_characters_are_rejected_everywhere() {
+        for component in [
+            "CON",
+            "con.txt",
+            "PRN",
+            "AUX.log",
+            "NUL",
+            "COM1",
+            "com9.bin",
+            "LPT1",
+            "lpt9.txt",
+            "name:stream",
+            "bad?.txt",
+            "bad*.txt",
+            "bad|name",
+            "bad<name>",
+            "CONIN$",
+            "conout$.txt",
+            "CLOCK$",
+            "COM¹.txt",
+            "LPT³",
+        ] {
+            assert!(
+                SafeRelativePath::parse(Path::new(component)).is_err(),
+                "`{component}` must be rejected on every build platform"
+            );
+        }
+        for component in ["CONTRATO.txt", "COM10", "LPT0", "auxiliar", "normal.txt"] {
+            assert!(
+                SafeRelativePath::parse(Path::new(component)).is_ok(),
+                "`{component}` is not a reserved device"
+            );
+        }
+        #[cfg(not(windows))]
+        assert!(SafeRelativePath::parse(Path::new("back\\slash.txt")).is_err());
+        let too_long = format!("{}.txt", "a".repeat(252));
+        assert!(SafeRelativePath::parse(Path::new(&too_long)).is_err());
+    }
+
+    #[test]
     fn parent_and_with_file_name_stay_inside() {
         let rel = SafeRelativePath::parse(Path::new("a/b/c.txt")).unwrap();
         assert_eq!(rel.file_name(), "c.txt");
@@ -733,6 +924,14 @@ mod tests {
     fn current_dir_components_are_ignored() {
         let parsed = SafeRelativePath::parse(Path::new("./a/./b.txt")).unwrap();
         assert_eq!(parsed.components(), &["a".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn normal_sibling_roots_are_physically_disjoint_even_before_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = tmp.path().join("left").join("future");
+        let right = tmp.path().join("right").join("future");
+        ensure_physical_roots_disjoint(&left, &right).unwrap();
     }
 
     #[cfg(not(windows))]
@@ -839,6 +1038,33 @@ mod tests {
             let ia = identity_of(&a).unwrap().unwrap();
             let ib = identity_of(&b).unwrap().unwrap();
             assert_ne!(ia, ib);
+        }
+
+        #[test]
+        fn a_source_junction_is_rejected_and_cannot_hide_physical_overlap() {
+            let tmp = tempfile::tempdir().unwrap();
+            let real = tmp.path().join("real");
+            let link = tmp.path().join("link");
+            std::fs::create_dir(&real).unwrap();
+            if !make_junction(&link, &real) {
+                eprintln!("SKIP: could not create a junction on this system");
+                return;
+            }
+
+            assert!(matches!(
+                ensure_root_is_not_reparse(&link).unwrap_err(),
+                FsSafetyError::ReparsePoint { .. }
+            ));
+            assert!(matches!(
+                ensure_physical_roots_disjoint(&link, &real).unwrap_err(),
+                FsSafetyError::PhysicalRootOverlap { .. }
+            ));
+            // The output may not exist yet: resolving the deepest existing
+            // ancestor must still expose that it would be created in `real`.
+            assert!(matches!(
+                ensure_physical_roots_disjoint(&link.join("future"), &real).unwrap_err(),
+                FsSafetyError::PhysicalRootOverlap { .. }
+            ));
         }
 
         #[test]

@@ -9,15 +9,16 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
-**Estado actual: Milestone 0.2 — Structural Intelligence (en curso), sobre la
-base endurecida por `v0.1.1-dev` — Filesystem Safety Hardening.**
-Milestone 0.1 (Safe Inventory Core) está completo: el pipeline llega de la
-carpeta caótica a la copia verificada con informe.
+**Estado actual: Milestone 0.2 — Structural Intelligence (cierre, objetivo
+`0.2.0`), sobre la base endurecida por Filesystem Safety Hardening.** El
+pipeline completo llega de la carpeta caótica a una copia verificada, y M0.2
+añade diagnóstico estructural, perfiles, reglas seguras y revisión auditable.
 
 DataForge **no está listo para producción general**. Lo que hay hoy es una
-**réplica segura y verificable**: inventaría un origen sin tocarlo, produce una
-copia verificada criptográficamente y la audita. La reconstrucción documental
-—contextos, perfiles, relaciones, búsqueda— **todavía no existe**.
+**copia segura, explicable y verificable**: inventaría un origen sin tocarlo,
+detecta relaciones estructurales acotadas, propone un plan conservador y audita
+cada decisión. Todavía no interpreta el significado de los documentos ni
+reconstruye automáticamente expedientes a partir de su contenido.
 
 Qué debes saber antes de apuntarlo a datos reales:
 
@@ -46,29 +47,43 @@ Qué existe hoy (real, con pruebas):
 - Dominio: IDs tipados, `Project`, `SourceRoot`, `Snapshot`, `AuditEvent`,
   inventario (`PathOccurrence`, `ContentObject`, fingerprints) y la máquina
   de estados completa de RFC-0001 §11.
-- SQLite como única fuente de verdad: migraciones `0001_foundation` y
-  `0002_inventory` con checksum, repositorios transaccionales y comprobación
-  de integridad (`integrity_check`, FK, migraciones, ledger).
+- SQLite como única fuente de verdad: migraciones `0001`–`0010` con checksum,
+  repositorios transaccionales y comprobación de integridad
+  (`integrity_check`, FK, migraciones, ledger).
 - Escaneo seguro (`df-scan`): valida orígenes, inventaría archivos y
   carpetas en snapshots inmutables, registra reparse points sin seguirlos,
   soporta rutas largas de Windows y persiste errores parciales.
 - Hashing (`df-hash`): BLAKE3 + SHA-256 en una pasada, fingerprint físico
   con invalidación pre/post (`SOURCE_CHANGED`) y cola reanudable — matar el
   proceso no pierde trabajo.
-- Duplicados exactos (mismo tamaño + SHA-256) como informe de evidencia y
-  conjuntos materializados en el análisis, cada uno con su **representante
-  lógico** (§15.5): la mejor ubicación canónica, elegida por penalización de
-  ubicación, limpieza del nombre y profundidad, con la razón explicada — sin
-  que ello implique borrar las demás copias.
-- **Inteligencia estructural (M0.2)**: firmas Merkle de carpeta (BLAKE3,
-  §19.2) y detección de **clones exactos de árbol** (carpetas injertadas con
-  subárboles byte a byte idénticos); y **clasificación de contexto** que marca
-  contenedores genéricos de bajo valor (Descargas, Escritorio, Backup,
-  Recuperado, Copia, Temporales) con la penalización del §18.3. Todo es
-  evidencia: nada se propone borrar.
-- Planificación (`df-planner`): plan con cobertura completa de cada
-  aparición, razones por operación, validación (destinos, colisiones,
-  cobertura) y aprobación que congela el plan bajo un SHA-256 canónico.
+- Duplicados exactos (mismo tamaño + SHA-256) materializados como evidencia,
+  cada conjunto con un **representante lógico** explicado. `REPORT_ONLY` es la
+  política por defecto; tres políticas opt-in pueden representar copias
+  demostradas, pero conservan siempre contextos desconocidos y fronteras
+  protegidas. El origen nunca se borra.
+- **Inteligencia estructural M0.2**: firmas Merkle de carpeta y clones exactos;
+  relaciones `PARTIAL_TREE_CLONE` y `TREE_EMBEDDED` acotadas por cardinalidad,
+  con recuentos del contenido exclusivo de ambos lados. Las relaciones son
+  evidencia para conservación/revisión y nunca autorizan omitir una rama.
+- **Perfiles declarativos embebidos**: `generic` clasifica contenedores de bajo
+  valor y `legal` añade fronteras protegidas por nombre para expedientes,
+  procedimientos, asuntos, clientes y personas. Los ids desconocidos se
+  rechazan; no hay fallback silencioso que retire protección.
+- **Reglas, anomalías y revisión**: reglas versionadas de nombre de archivo
+  solo pueden elegir operaciones de copia seguras; se persisten anomalías de
+  nombres/contenidos, rutas, lectura y estructura; la cola de revisión y sus
+  decisiones con justificación son append-only. Una revisión pendiente se
+  copia como `COPY_REVIEW`, no se descarta.
+- **Frontera de completitud del análisis**: un marcador append-only por
+  snapshot distingue un informe vacío válido de una caída entre etapas. Los
+  informes fallan cerrados hasta que el marcador y un estado estable confirman
+  el final del análisis.
+- Planificación (`df-planner`): plan con cobertura completa de cada aparición,
+  política explícita de duplicados, guía de reglas/revisión, razones por
+  operación, validación y aprobación que congela un manifiesto bajo SHA-256.
+- Recuperación de fases: `ANALYZING`, `PLANNING` y `PLAN_REVIEW` se pueden
+  reanudar sin repetir la transición inicial, crear otra versión del mismo
+  plan ni duplicar el manifiesto/evento de aprobación ya persistido.
 - Ejecución segura (`df-executor`): copia por archivo con fingerprint
   pre/post, archivo parcial, doble hash en streaming, comparación, rename
   atómico; sin sobrescritura, con colisiones resueltas de forma
@@ -80,19 +95,19 @@ Qué existe hoy (real, con pruebas):
 - Ledger de auditoría append-only con encadenamiento SHA-256, verificación
   y eventos de todo el pipeline.
 - CLI `dataforge`: `project create/status`, `scan`, `hash`, `analyze`,
-  `plan create/validate/approve`, `execute`, `verify`,
-  `report duplicates/tree-clones/contexts`, `audit verify` (con `--json` y
-  códigos de salida documentados).
-- App de escritorio (Tauri 2 + React + TypeScript strict): crear proyecto,
-  abrir proyecto y ver estado, inventario e integridad, usando los mismos
-  comandos de `df-facade` que la CLI.
+  `plan create/validate/approve`, `review list/decide`, `execute`, `verify`,
+  `report duplicates/tree-clones/tree-relations/contexts/anomalies` y
+  `audit verify` (con `--json` y códigos de salida documentados).
+- App de escritorio (Tauri 2 + React + TypeScript strict): crear/abrir proyecto
+  y ver estado, inventario, integridad y diagnóstico estructural M0.2, usando
+  la misma `df-facade` que la CLI.
 
-Qué **no** existe todavía (y no está simulado): clones parciales/embebidos de
-árbol, perfiles con fronteras protegidas, reglas declarativas, grafo de
-entidades, anomalías, consolidación de duplicados, similitud, búsqueda,
-informes exportables, plugins, IA. La reconstrucción documental como tal
-—relacionar y reorganizar por contexto— sigue sin existir: hoy el pipeline
-produce una **réplica segura y verificable**, no una reconstrucción.
+Qué **no** existe todavía (y no está simulado): extracción de contenido,
+relaciones documentales por significado, reconstrucción automática de
+expedientes, búsqueda, informes exportables, perfiles de usuario en runtime,
+plugins o IA. Las relaciones M0.2 comparan identidades exactas de contenido y
+nombres declarados; no son una comprensión semántica. Tampoco se consolidan
+automáticamente árboles completos o parciales.
 Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro).
 
 ## Inicio rápido (Windows)
@@ -110,14 +125,20 @@ cargo run -p dataforge-cli -- project create `
   --name "Mi proyecto" `
   --path  D:\proyectos\demo `
   --output-root D:\salidas\demo `
+  --profile legal `
   --source D:\datos\origen
 cargo run -p dataforge-cli -- scan --path D:\proyectos\demo
 cargo run -p dataforge-cli -- hash --path D:\proyectos\demo
 cargo run -p dataforge-cli -- analyze --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report duplicates --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report tree-clones --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report tree-relations --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report contexts --path D:\proyectos\demo
-cargo run -p dataforge-cli -- plan create --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report anomalies --path D:\proyectos\demo
+cargo run -p dataforge-cli -- review list --path D:\proyectos\demo
+# Opcional: review decide --item <id> --decision COPY_ACTIVE --reason "..."
+cargo run -p dataforge-cli -- plan create --path D:\proyectos\demo `
+  --duplicate-policy REPORT_ONLY
 cargo run -p dataforge-cli -- plan approve --path D:\proyectos\demo
 cargo run -p dataforge-cli -- execute --path D:\proyectos\demo
 cargo run -p dataforge-cli -- verify --path D:\proyectos\demo
@@ -154,6 +175,11 @@ scripts/         bootstrap reproducible del entorno (PowerShell)
 3. Todo cambio de estado pasa por la máquina de estados y queda registrado
    en un ledger hash-chained verificable.
 4. La interfaz no contiene lógica crítica: CLI y escritorio usan `df-facade`.
+5. Un hallazgo automático es evidencia; solo una política explícita o una
+   decisión humana puede cambiar la operación propuesta, y ambas permanecen
+   dentro del conjunto de copias seguras.
+6. Ningún informe estructural se publica antes del marcador final de su
+   snapshot.
 
 ## Contribuir
 

@@ -67,6 +67,8 @@ pub struct FolderContext {
     pub penalty: u32,
     /// The marker that triggered a non-neutral classification, if any.
     pub marker: Option<String>,
+    /// Profile-authored explanation for a protected boundary.
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]

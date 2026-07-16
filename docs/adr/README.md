@@ -21,11 +21,14 @@
 | [ADR-0024](ADR-0024-folder-context-classification.md) | Clasificación de contexto de carpetas por marcadores de perfil (M0.2) | Aceptada |
 | [ADR-0025](ADR-0025-duplicate-logical-representative.md) | Representante lógico de un conjunto de duplicados (M0.2) | Aceptada |
 | [ADR-0026](ADR-0026-declarative-profiles.md) | Perfiles declarativos y fronteras protegidas (M0.2) | Aceptada |
+| [ADR-0027](ADR-0027-bounded-tree-relations.md) | Relaciones estructurales acotadas entre árboles (M0.2) | Aceptada |
+| [ADR-0028](ADR-0028-declarative-rules-anomalies-review.md) | Reglas declarativas, anomalías y revisión humana (M0.2) | Aceptada |
+| [ADR-0029](ADR-0029-analysis-completion-and-phase-recovery.md) | Marcador de análisis completo y recuperación de fases (M0.2) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).
 Nuevas ADR se crean a partir de [TEMPLATE.md](TEMPLATE.md).
 
 Los números son únicos e irrepetibles: 0017–0022 pertenecen al endurecimiento
-`v0.1.1-dev` y 0023–0025 al Milestone 0.2. Cuando dos ramas de trabajo
+`v0.1.1-dev` y 0023–0029 al Milestone 0.2 (objetivo `0.2.0`). Cuando dos ramas de trabajo
 proponen el mismo número, cede la que aún no está publicada (el tag manda).
