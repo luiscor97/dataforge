@@ -991,6 +991,10 @@ pub struct TreeRelationSummary {
     pub embedded: u64,
     /// Candidate pairs left unexamined because `max_pairs` was reached.
     pub pairs_skipped: u64,
+    /// Pass-through containers suppressed: ancestors whose subtree content is
+    /// identical to a descendant folder's. Their relations would duplicate
+    /// the descendant's, so only the deepest, most specific folder reports.
+    pub pass_through_suppressed: u64,
 }
 
 /// Every ancestor folder path of a file, from its parent up to the root.
@@ -1192,6 +1196,32 @@ pub fn compute_tree_relations(
     }
     folders.retain(|_, f| f.contents.len() >= options.min_subtree_contents);
 
+    // A pass-through container — an ancestor whose subtree content set is
+    // identical to a descendant folder's (e.g. `Backup/` holding only
+    // `Backup/Expediente 77/`) — relates to exactly the same third folders
+    // as that descendant, duplicating every one of its relations. Report the
+    // deepest, most specific folder only. Within one root an ancestor's set
+    // always contains the descendant's, so equal cardinality means equal
+    // sets. Deterministic: driven by stable keys, not map order.
+    let pass_through: std::collections::HashSet<StableFolderKey> = folders
+        .keys()
+        .flat_map(|key| {
+            let descendant_len = folders[key].contents.len();
+            ancestors_of(&key.relative_path)
+                .into_iter()
+                .skip(1) // the chain starts at the folder itself
+                .map(|ancestor| StableFolderKey::new(key.source_root_id.clone(), ancestor))
+                .filter(|ancestor_key| {
+                    folders
+                        .get(ancestor_key)
+                        .is_some_and(|ancestor| ancestor.contents.len() == descendant_len)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let pass_through_suppressed = pass_through.len() as u64;
+    folders.retain(|key, _| !pass_through.contains(key));
+
     // Inverted index content -> folders, so only folders that actually share
     // something get paired.
     let (candidates, pairs_skipped) = limited_candidate_pairs_for_folders(
@@ -1260,6 +1290,7 @@ pub fn compute_tree_relations(
 
     let mut summary = TreeRelationSummary {
         pairs_skipped,
+        pass_through_suppressed,
         ..Default::default()
     };
     let now = to_stored_timestamp(chrono::Utc::now());
@@ -1303,6 +1334,7 @@ pub fn compute_tree_relations(
         "partial_clones": summary.partial_clones,
         "embedded": summary.embedded,
         "pairs_skipped": summary.pairs_skipped,
+        "pass_through_suppressed": summary.pass_through_suppressed,
     });
     append_event(&tx, project_id, EVENT_STRUCTURE_ANALYZED, &payload, actor)?;
     tx.commit().map_err(db_err)?;

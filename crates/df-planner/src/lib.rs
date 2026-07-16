@@ -2000,4 +2000,64 @@ mod tests {
         assert_eq!(outcome.embedded_trees, 0);
         assert_eq!(outcome.partial_tree_clones, 0);
     }
+
+    /// A pass-through container (an ancestor holding nothing beyond one
+    /// descendant folder) must not duplicate that descendant's relations.
+    /// Before this filter, `Backup/` holding only `Backup/casos/` produced a
+    /// second, redundant PARTIAL_TREE_CLONE against the original `casos/`.
+    #[test]
+    fn a_pass_through_container_does_not_duplicate_its_childs_relations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("casos")).unwrap();
+        std::fs::create_dir_all(origin.join("Backup").join("casos")).unwrap();
+
+        for (name, body) in [("a.txt", b"aaa".as_slice()), ("b.txt", b"bbb".as_slice())] {
+            std::fs::write(origin.join("casos").join(name), body).unwrap();
+            std::fs::write(origin.join("Backup").join("casos").join(name), body).unwrap();
+        }
+        std::fs::write(origin.join("casos").join("solo-original.txt"), b"only here").unwrap();
+        std::fs::write(
+            origin.join("Backup").join("casos").join("solo-backup.txt"),
+            b"only there",
+        )
+        .unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Pasa-through",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "generic",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+
+        // One relation, not two: Backup/ is a pass-through of Backup/casos.
+        assert_eq!(
+            outcome.partial_tree_clones, 1,
+            "the pass-through container must not add a duplicate relation"
+        );
+        assert_eq!(outcome.embedded_trees, 0);
+
+        // And the surviving relation is between the two deepest folders.
+        let snapshot: df_domain::SnapshotId = outcome.snapshot_id.parse().unwrap();
+        let views = df_db::structure::tree_relation_views(&db, snapshot).unwrap();
+        assert_eq!(views.len(), 1);
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(
+            views[0].path_a.ends_with(&format!("Backup{sep}casos"))
+                || views[0].path_b.ends_with(&format!("Backup{sep}casos")),
+            "the deepest folder reports the relation: {views:?}"
+        );
+        assert!(
+            !views[0].path_a.ends_with("Backup") && !views[0].path_b.ends_with("Backup"),
+            "the pass-through ancestor must not appear: {views:?}"
+        );
+    }
 }

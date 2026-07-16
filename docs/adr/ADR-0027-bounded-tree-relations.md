@@ -39,7 +39,18 @@ reproducible.
    predeterminado exige que los contenidos compartidos representen al menos la
    mitad de la unión de ambos conjuntos.
 
-4. **La selección es determinista entre rescaneos.** Cada carpeta se ordena por
+4. **Los contenedores pasa-through no duplican relaciones.** Un ancestro cuyo
+   conjunto de contenidos es idéntico al de una carpeta descendiente (por
+   ejemplo, `Backup/` que solo contiene `Backup/Expediente 77/`) se relaciona
+   exactamente con las mismas carpetas que esa descendiente, y duplicaría cada
+   una de sus relaciones. Antes de generar candidatos se suprimen esos
+   ancestros y reporta únicamente la carpeta más profunda —la ubicación más
+   específica—. Dentro de una raíz el conjunto del ancestro siempre contiene
+   al del descendiente, de modo que la igualdad de cardinalidad implica
+   igualdad de conjuntos. El número de contenedores suprimidos se registra en
+   el evento de análisis (`pass_through_suppressed`).
+
+5. **La selección es determinista entre rescaneos.** Cada carpeta se ordena por
    la clave estable `(source_root_id, relative_path)`, independiente del UUID
    `folder_id` generado en cada snapshot. Los pares se deduplican en un
    `BTreeSet`, el límite se aplica después de ordenarlos y la misma clave fija
@@ -47,7 +58,7 @@ reproducible.
    límites no dependen del orden de lectura, de la semilla aleatoria de una
    tabla hash ni de los nuevos ids de carpeta de un rescaneo.
 
-5. **Se emiten dos relaciones.** Tras excluir los clones exactos ya cubiertos
+6. **Se emiten dos relaciones.** Tras excluir los clones exactos ya cubiertos
    por ADR-0023:
 
    - `PARTIAL_TREE_CLONE`: ambos lados conservan al menos un contenido que el
@@ -60,13 +71,13 @@ reproducible.
    no persiste la lista de rutas exclusivas; los recuentos son la evidencia
    mínima que impide presentar la relación como clon exacto.
 
-6. **Son evidencia para conservación y revisión, no autorización de
+7. **Son evidencia para conservación y revisión, no autorización de
    consolidación.** Una relación parcial crea una anomalía porque eliminar
    cualquiera de las ramas perdería contenido. Una relación embebida también
    se somete a revisión. Ninguna de las dos genera por sí sola una operación
    que omita una rama.
 
-7. **Persistencia y superficie.** Las relaciones viven en `tree_relations`
+8. **Persistencia y superficie.** Las relaciones viven en `tree_relations`
    (migración `0009_tree_relations.sql`), se recomputan de forma idempotente por
    snapshot y se exponen en `dataforge report tree-relations`. El evento
    `STRUCTURE_ANALYZED` incluye los recuentos de relaciones y pares omitidos.
