@@ -21,6 +21,10 @@ df-executor = { workspace = true }
 df-verifier = { workspace = true }
 df-media = { workspace = true }
 df-plugin = { workspace = true }
+df-ai = { workspace = true }
+df-process-safety = { workspace = true }
+keyring = { workspace = true }
+ureq = { workspace = true }
 df-similarity = { workspace = true }
 df-extract = { workspace = true }
 df-search = { workspace = true }

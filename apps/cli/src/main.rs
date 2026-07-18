@@ -9,16 +9,17 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use df_domain::Actor;
-use df_error::DfResult;
+use df_error::{DfError, DfResult};
 use df_facade::{
-    AnalyzeOutcome, AnomalyReport, ApproveOutcome, AuditReport, ContentArtifactBuildOutcome,
-    ContentExtractionOptions, ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome,
-    ContextReport, CreateProjectRequest, DuplicateReport, ExecuteOutcome, ExtractionLimits,
-    HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, PlanOutcome,
-    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
-    QueryOptions, RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions,
-    SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions,
-    TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
+    AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
+    ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
+    DuplicateReport, ExecuteOutcome, ExtractionLimits, HashOutcome, MediaOutcome,
+    MediaProjectOptions, MediaReport, MediaSidecars, PlanOutcome, PlanValidationReport,
+    PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus, QueryOptions,
+    RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest,
+    SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, TreeCloneReport,
+    TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -106,6 +107,11 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Assisted intelligence: explanations and labels, never actions (M0.7).
+    Ai {
+        #[command(subcommand)]
+        command: AiCommand,
     },
     /// Manage reconstruction plans.
     Plan {
@@ -427,6 +433,65 @@ enum PluginCommand {
 }
 
 #[derive(Subcommand)]
+enum AiCommand {
+    /// Manage BYOK API keys in the OS credential vault.
+    Key {
+        #[command(subcommand)]
+        command: AiKeyCommand,
+    },
+    /// Explain one pending review item. Without --accept-disclosure this
+    /// only previews the exact disclosure and sends nothing anywhere.
+    Explain {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// Review item id (see `review list`).
+        #[arg(long)]
+        item: String,
+        /// Cloud provider (`anthropic` or `openai`); mutually exclusive with
+        /// --local-exe.
+        #[arg(long, conflicts_with = "local_exe")]
+        provider: Option<String>,
+        /// Model identifier for the chosen provider.
+        #[arg(long)]
+        model: String,
+        /// Absolute path to an air-gapped local model executable.
+        #[arg(long)]
+        local_exe: Option<PathBuf>,
+        /// The disclosure digest previously shown; consent for exactly that
+        /// disclosure.
+        #[arg(long)]
+        accept_disclosure: Option<String>,
+    },
+    /// Immutable audit trail of assistance invocations.
+    Audits {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum AiKeyCommand {
+    /// Read the key from stdin (never from arguments) and store it.
+    Set {
+        /// `anthropic` or `openai`.
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove the stored key.
+    Remove {
+        /// `anthropic` or `openai`.
+        #[arg(long)]
+        provider: String,
+    },
+    /// Show which providers have a stored key (values are never shown).
+    List,
+}
+
+#[derive(Subcommand)]
 enum ReviewCommand {
     /// List pending and decided structural review items.
     List {
@@ -492,6 +557,10 @@ enum Output {
     PluginList(Vec<PluginRegistrationView>),
     PluginRuns(PluginsOutcome),
     PluginFindings(PluginReport),
+    AiKeys(Vec<(String, bool)>),
+    AiKeyChanged(String),
+    AiAssist(Box<AiAssistOutcome>),
+    AiAudits(Vec<AssistanceAuditView>),
     Review(ReviewQueue),
     Audit(AuditReport),
 }
@@ -597,6 +666,80 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 }
                 df_facade::run_plugins_with_options(path, Actor::Cli, &options)
                     .map(Output::PluginRuns)
+            }
+        },
+        Command::Ai { command } => match command {
+            AiCommand::Key { command } => match command {
+                AiKeyCommand::Set { provider } => {
+                    let provider = df_facade::AiKeyProvider::parse(provider)?;
+                    eprintln!("Pega la API key y pulsa Enter (nunca va en argumentos):");
+                    let mut key = String::new();
+                    std::io::stdin()
+                        .read_line(&mut key)
+                        .map_err(|error| DfError::Validation(error.to_string()))?;
+                    df_facade::set_ai_key(provider, &key)?;
+                    Ok(Output::AiKeyChanged(format!(
+                        "stored key for {}",
+                        provider.as_str()
+                    )))
+                }
+                AiKeyCommand::Remove { provider } => {
+                    let provider = df_facade::AiKeyProvider::parse(provider)?;
+                    df_facade::remove_ai_key(provider)?;
+                    Ok(Output::AiKeyChanged(format!(
+                        "removed key for {}",
+                        provider.as_str()
+                    )))
+                }
+                AiKeyCommand::List => {
+                    let mut rows = Vec::new();
+                    for provider in [
+                        df_facade::AiKeyProvider::Anthropic,
+                        df_facade::AiKeyProvider::OpenAi,
+                    ] {
+                        rows.push((
+                            provider.as_str().to_string(),
+                            df_facade::ai_key_present(provider)?,
+                        ));
+                    }
+                    Ok(Output::AiKeys(rows))
+                }
+            },
+            AiCommand::Explain {
+                path,
+                item,
+                provider,
+                model,
+                local_exe,
+                accept_disclosure,
+            } => {
+                let choice = match (provider, local_exe) {
+                    (Some(provider), None) => df_facade::AiProviderChoice::Cloud {
+                        provider: df_facade::AiKeyProvider::parse(provider)?,
+                        model: model.clone(),
+                    },
+                    (None, Some(executable)) => df_facade::AiProviderChoice::LocalProcess {
+                        executable: executable.clone(),
+                        model: model.clone(),
+                    },
+                    _ => {
+                        return Err(DfError::Validation(
+                            "choose exactly one of --provider or --local-exe".to_string(),
+                        ))
+                    }
+                };
+                df_facade::ai_explain_review(
+                    path,
+                    item,
+                    &choice,
+                    accept_disclosure.as_deref(),
+                    Actor::Cli,
+                )
+                .map(Box::new)
+                .map(Output::AiAssist)
+            }
+            AiCommand::Audits { path, limit } => {
+                df_facade::ai_audit_report(path, *limit).map(Output::AiAudits)
             }
         },
         Command::Content { command } => match command {
@@ -1250,6 +1393,76 @@ fn print_anomalies(report: &AnomalyReport) {
     }
 }
 
+fn print_ai_assist(outcome: &AiAssistOutcome) {
+    let disclosure = &outcome.disclosure;
+    println!("Purpose        : {}", disclosure.purpose);
+    println!(
+        "Provider       : {} / {} ({})",
+        disclosure.provider, disclosure.model, disclosure.endpoint
+    );
+    println!(
+        "Disclosure     : {} byte(s) visible, {} byte(s) on the wire",
+        disclosure.visible_content_bytes, disclosure.transport_bytes
+    );
+    for field in &disclosure.fields {
+        println!();
+        println!(
+            "  [{}] {} — {} byte(s), {} redaction(s)",
+            field.evidence_id, field.field_name, field.visible_bytes, field.redactions
+        );
+        println!("    {}", field.visible_text);
+    }
+    println!();
+    println!("Disclosure SHA-256: {}", disclosure.disclosure_sha256);
+    if !outcome.executed {
+        println!();
+        println!(
+            "Preview only — nothing was sent. To consent to exactly this \
+             disclosure, repeat with --accept-disclosure {}",
+            disclosure.disclosure_sha256
+        );
+        return;
+    }
+    println!(
+        "Status         : {}",
+        outcome.status.as_deref().unwrap_or("-")
+    );
+    if let Some(explanation) = &outcome.explanation {
+        println!();
+        println!("Explanation    : {explanation}");
+    }
+    for suggestion in &outcome.suggestions {
+        println!();
+        println!("  [{}] {}", suggestion.id, suggestion.label);
+        println!("    {}", suggestion.explanation);
+    }
+    println!();
+    println!("Evidence only: assisted intelligence cannot execute anything.");
+}
+
+fn print_ai_audits(audits: &[AssistanceAuditView]) {
+    if audits.is_empty() {
+        println!("No assistance invocations have been recorded.");
+        return;
+    }
+    for audit in audits {
+        println!(
+            "{} — {} {} / {} — {}{}",
+            audit.created_at,
+            audit.purpose,
+            audit.provider,
+            audit.model,
+            audit.status,
+            audit
+                .failure
+                .as_deref()
+                .map(|failure| format!(" ({failure})"))
+                .unwrap_or_default()
+        );
+        println!("  disclosure {}", audit.disclosure_sha256);
+    }
+}
+
 fn print_plugin_registered(metadata: &RegisteredPluginMetadata) {
     println!("Plugin           : {}", metadata.key);
     println!("Publisher        : {}", metadata.manifest.publisher);
@@ -1501,6 +1714,17 @@ fn print_human(output: &Output) {
         Output::PluginList(plugins) => print_plugin_list(plugins),
         Output::PluginRuns(outcome) => print_plugin_runs(outcome),
         Output::PluginFindings(report) => print_plugin_findings(report),
+        Output::AiKeys(rows) => {
+            for (provider, present) in rows {
+                println!(
+                    "{provider}: {}",
+                    if *present { "key stored" } else { "no key" }
+                );
+            }
+        }
+        Output::AiKeyChanged(message) => println!("{message}"),
+        Output::AiAssist(outcome) => print_ai_assist(outcome),
+        Output::AiAudits(audits) => print_ai_audits(audits),
         Output::Review(queue) => print_review(queue),
         Output::Audit(report) => print_audit(report),
     }
@@ -1571,6 +1795,14 @@ fn verdict_exit_code(output: &Output) -> i32 {
             }
         }
         Output::PluginRegistered(_) | Output::PluginList(_) | Output::PluginFindings(_) => 0,
+        Output::AiAssist(outcome) => {
+            if !outcome.executed || outcome.status.as_deref() == Some("ACCEPTED") {
+                0
+            } else {
+                3
+            }
+        }
+        Output::AiKeys(_) | Output::AiKeyChanged(_) | Output::AiAudits(_) => 0,
         Output::ContentExtraction(outcome) => {
             if outcome.status == "COMPLETED"
                 && outcome.counters.limited == 0

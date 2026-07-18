@@ -34,6 +34,10 @@ pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, Structural
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOutcome;
 pub use df_hash::HashOutcome;
+mod ai_transport;
+mod secrets;
+
+pub use df_db::assistance::AssistanceAuditView;
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
 pub use df_plugin::{
@@ -42,6 +46,7 @@ pub use df_plugin::{
 pub use df_scan::ScanOutcome;
 pub use df_similarity::{SimilarityOptions, SimilarityOutcome};
 pub use df_verifier::VerifyOutcome;
+pub use secrets::{ai_key_present, remove_ai_key, set_ai_key, AiKeyProvider};
 
 pub use df_extract::ExtractionLimits;
 pub use df_query::{QueryColumn, QueryOptions, QueryResult, SnapshotBuildOptions};
@@ -1012,6 +1017,313 @@ pub fn default_media_worker() -> Option<PathBuf> {
     });
     let metadata = std::fs::symlink_metadata(&candidate).ok()?;
     metadata.is_file().then_some(candidate)
+}
+
+/// Provider selection for one assistance invocation (M0.7).
+#[derive(Debug, Clone)]
+pub enum AiProviderChoice {
+    /// A cloud provider authenticated with the key stored in the OS
+    /// credential vault (BYOK). Requires explicit disclosure consent.
+    Cloud {
+        provider: AiKeyProvider,
+        model: String,
+    },
+    /// Air-gapped: an explicit absolute executable run under
+    /// `df-process-safety` that reads the envelope on stdin and writes the
+    /// model JSON on stdout.
+    LocalProcess { executable: PathBuf, model: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiDisclosedFieldView {
+    pub evidence_id: String,
+    pub field_name: String,
+    pub visible_bytes: usize,
+    pub redactions: usize,
+    pub visible_text: String,
+}
+
+/// Everything the user must see before consenting to one cloud disclosure.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiDisclosureView {
+    pub request_id: String,
+    pub purpose: String,
+    pub provider: String,
+    pub model: String,
+    pub endpoint: String,
+    pub visible_content_bytes: usize,
+    pub transport_bytes: usize,
+    pub fields: Vec<AiDisclosedFieldView>,
+    /// Digest to pass back verbatim as consent for exactly this disclosure.
+    pub disclosure_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiAssistOutcome {
+    /// False when only the disclosure preview was produced.
+    pub executed: bool,
+    pub disclosure: AiDisclosureView,
+    pub status: Option<String>,
+    pub explanation: Option<String>,
+    pub suggestions: Vec<df_ai::ValidatedSuggestion>,
+    /// Always true: assistance explains and suggests, it never executes.
+    pub evidence_only: bool,
+}
+
+fn enum_str<T: Serialize>(value: &T) -> DfResult<String> {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .ok_or_else(|| DfError::Validation("non-string enum serialization".to_string()))
+}
+
+fn review_item_request(item: &ReviewItemView) -> df_ai::AssistanceRequest {
+    let risk = match item.risk.as_str() {
+        "LOW" => df_ai::LocalRisk::Low,
+        "MEDIUM" => df_ai::LocalRisk::Medium,
+        "HIGH" => df_ai::LocalRisk::High,
+        "CRITICAL" => df_ai::LocalRisk::Critical,
+        _ => df_ai::LocalRisk::Medium,
+    };
+    // Evidence ids are stable field names: the request carries exactly one
+    // review item, uniqueness holds, and deterministic ids keep static or
+    // air-gapped providers reproducible.
+    let mut evidence = vec![
+        df_ai::EvidenceInput {
+            id: "kind".to_string(),
+            field_name: "kind".to_string(),
+            text: item.kind.clone(),
+            local_risk: risk,
+            reliability_basis_points: 9_000,
+        },
+        df_ai::EvidenceInput {
+            id: "reason".to_string(),
+            field_name: "reason".to_string(),
+            text: item.reason.clone(),
+            local_risk: risk,
+            reliability_basis_points: 9_000,
+        },
+        df_ai::EvidenceInput {
+            id: "recommended".to_string(),
+            field_name: "recommended_action".to_string(),
+            text: item.recommended_action.clone(),
+            local_risk: risk,
+            reliability_basis_points: 9_000,
+        },
+    ];
+    if item.folder_a.is_some() || item.folder_b.is_some() {
+        evidence.push(df_ai::EvidenceInput {
+            id: "folders".to_string(),
+            field_name: "folders".to_string(),
+            text: format!(
+                "{} | {}",
+                item.folder_a.as_deref().unwrap_or("-"),
+                item.folder_b.as_deref().unwrap_or("-")
+            ),
+            local_risk: risk,
+            reliability_basis_points: 9_000,
+        });
+    }
+    df_ai::AssistanceRequest {
+        request_id: format!("review:{}", item.id),
+        purpose: df_ai::AssistancePurpose::Explain,
+        evidence,
+        // Defaults redact paths, e-mails and phone numbers; the disclosure
+        // preview shows exactly what survives.
+        redaction: df_ai::RedactionConfig::default(),
+    }
+}
+
+fn disclosure_view(manifest: &df_ai::DisclosureManifest) -> DfResult<AiDisclosureView> {
+    Ok(AiDisclosureView {
+        request_id: manifest.request_id.clone(),
+        purpose: enum_str(&manifest.purpose)?,
+        provider: manifest.provider.provider.clone(),
+        model: manifest.provider.model.clone(),
+        endpoint: manifest.provider.endpoint.clone(),
+        visible_content_bytes: manifest.visible_content_bytes,
+        transport_bytes: manifest.transport_bytes,
+        fields: manifest
+            .fields
+            .iter()
+            .map(|field| AiDisclosedFieldView {
+                evidence_id: field.evidence_id.clone(),
+                field_name: field.field_name.clone(),
+                visible_bytes: field.visible_bytes,
+                redactions: field.redactions.len(),
+                visible_text: field.visible_text.clone(),
+            })
+            .collect(),
+        disclosure_sha256: manifest.digest(),
+    })
+}
+
+const LOCAL_AI_LIMITS: df_process_safety::ProcessLimits = df_process_safety::ProcessLimits {
+    timeout: std::time::Duration::from_secs(120),
+    memory_bytes: 2 * 1024 * 1024 * 1024,
+    max_stdin_bytes: 1024 * 1024,
+    max_stdout_bytes: 1024 * 1024,
+};
+
+/// Explain one pending review item with assisted intelligence.
+///
+/// Without `accept_disclosure` this is a pure preview: it returns the exact
+/// disclosure manifest and sends nothing anywhere. Passing back the
+/// manifest's digest is the one-invocation consent; the audit row persists
+/// either way once execution happens.
+pub fn ai_explain_review(
+    project_dir: &Path,
+    item_id: &str,
+    choice: &AiProviderChoice,
+    accept_disclosure: Option<&str>,
+    actor: Actor,
+) -> DfResult<AiAssistOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    let queue = df_db::analysis::review_queue(&db, snapshot.id)?;
+    let item = queue
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .ok_or_else(|| {
+            DfError::Validation(format!("review item `{item_id}` is not in the queue"))
+        })?;
+
+    let request = review_item_request(item);
+    let (descriptor, local_provider) = match choice {
+        AiProviderChoice::Cloud { provider, model } => (
+            df_ai::ProviderDescriptor {
+                kind: df_ai::ProviderKind::Cloud,
+                provider: provider.as_str().to_string(),
+                model: model.clone(),
+                endpoint: match provider {
+                    AiKeyProvider::Anthropic => ai_transport::ANTHROPIC_ENDPOINT.to_string(),
+                    AiKeyProvider::OpenAi => ai_transport::OPENAI_ENDPOINT.to_string(),
+                },
+            },
+            None,
+        ),
+        AiProviderChoice::LocalProcess { executable, model } => {
+            let provider = df_ai::LocalProcessProvider::new(
+                "local-process",
+                model.clone(),
+                executable,
+                Vec::new(),
+                LOCAL_AI_LIMITS,
+            );
+            let descriptor = df_ai::Provider::descriptor(&provider).clone();
+            (descriptor, Some(provider))
+        }
+    };
+
+    let engine = df_ai::AssistanceEngine::new(df_ai::AiMode::Enabled);
+    let prepared = engine
+        .prepare(&request, &descriptor)
+        .map_err(|error| DfError::Validation(error.to_string()))?;
+    let disclosure = disclosure_view(prepared.disclosure())?;
+
+    let Some(accepted) = accept_disclosure else {
+        return Ok(AiAssistOutcome {
+            executed: false,
+            disclosure,
+            status: None,
+            explanation: None,
+            suggestions: Vec::new(),
+            evidence_only: true,
+        });
+    };
+    if accepted != disclosure.disclosure_sha256 {
+        return Err(DfError::Validation(
+            "the accepted digest does not match this disclosure; review it again".to_string(),
+        ));
+    }
+
+    let outcome = match (choice, local_provider) {
+        (AiProviderChoice::Cloud { provider, model }, _) => {
+            let api_key = secrets::ai_key(*provider)?;
+            let consent = df_ai::CloudConsentToken::grant_for(prepared.disclosure());
+            match provider {
+                AiKeyProvider::Anthropic => {
+                    let cloud = df_ai::CloudProvider::new(
+                        provider.as_str(),
+                        model.clone(),
+                        ai_transport::ANTHROPIC_ENDPOINT,
+                        ai_transport::AnthropicTransport {
+                            api_key,
+                            model: model.clone(),
+                        },
+                    );
+                    engine.execute(&prepared, &cloud, Some(&consent))
+                }
+                AiKeyProvider::OpenAi => {
+                    let cloud = df_ai::CloudProvider::new(
+                        provider.as_str(),
+                        model.clone(),
+                        ai_transport::OPENAI_ENDPOINT,
+                        ai_transport::OpenAiTransport {
+                            api_key,
+                            model: model.clone(),
+                        },
+                    );
+                    engine.execute(&prepared, &cloud, Some(&consent))
+                }
+            }
+        }
+        (AiProviderChoice::LocalProcess { .. }, Some(provider)) => {
+            engine.execute(&prepared, &provider, None)
+        }
+        (AiProviderChoice::LocalProcess { .. }, None) => unreachable!("local provider built above"),
+    };
+
+    let audit = &outcome.audit;
+    df_db::assistance::insert_audit(
+        &mut db,
+        project.id,
+        &df_db::assistance::AssistanceAuditInput {
+            request_id_sha256: audit.request_id_sha256.clone(),
+            purpose: enum_str(&audit.purpose)?,
+            provider_kind: enum_str(&audit.provider_kind)?,
+            provider: audit.provider.clone(),
+            model: audit.model.clone(),
+            endpoint: descriptor.endpoint.clone(),
+            status: enum_str(&audit.status)?,
+            failure: audit.failure.as_ref().map(enum_str).transpose()?,
+            disclosure_sha256: audit.disclosure_sha256.clone(),
+            prompt_sha256: audit.prompt_sha256.clone(),
+            audit_json: serde_json::to_string(audit)
+                .map_err(|error| DfError::Validation(format!("audit serialization: {error}")))?,
+        },
+        actor,
+    )?;
+
+    Ok(AiAssistOutcome {
+        executed: true,
+        disclosure,
+        status: Some(enum_str(&audit.status)?),
+        explanation: outcome.result.as_ref().map(|r| r.explanation.clone()),
+        suggestions: outcome
+            .result
+            .map(|result| result.suggestions)
+            .unwrap_or_default(),
+        evidence_only: true,
+    })
+}
+
+/// Latest assistance audit rows, newest first.
+pub fn ai_audit_report(
+    project_dir: &Path,
+    limit: u32,
+) -> DfResult<Vec<df_db::assistance::AssistanceAuditView>> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    df_db::assistance::list_audits(&db, project.id, limit)
 }
 
 /// Transport file of one signed plugin package: everything except the

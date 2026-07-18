@@ -46,6 +46,11 @@ ignore = [
     # bounded. Remove when lopdf changes font parser or the PDF backend moves.
     # Review by: 2026-10-18.
     "RUSTSEC-2026-0192",
+    # `rustls-pemfile` is archived (thin wrapper over the same PEM code now
+    # living in rustls-pki-types); pulled by ureq 3.1 for the M0.7 cloud
+    # transports. Not vulnerable. Remove when ureq depends on the pki-types
+    # PEM API directly. Review by: 2026-10-18.
+    "RUSTSEC-2025-0134",
 ]
 
 [licenses]

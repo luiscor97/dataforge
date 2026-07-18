@@ -119,6 +119,12 @@ arrow-array = "=58.3.0"
 arrow-schema = "=58.3.0"
 parquet = { version = "=58.3.0", default-features = false, features = ["arrow", "zstd"] }
 tokio = { version = "1", features = ["rt", "time"] }
+# M0.7 BYOK: API keys live in the OS credential store (Windows Credential
+# Manager), never in SQLite, config files or the ledger.
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+# Minimal blocking HTTPS client for the cloud transports at the facade edge;
+# df-ai itself never links any network code.
+ureq = { version = "=3.1.2", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

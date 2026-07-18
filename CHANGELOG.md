@@ -5,6 +5,39 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.7 — Assisted Intelligence (implementación local)
+
+#### Añadido
+
+- BYOK: las API keys de Anthropic y OpenAI viven en el almacén de
+  credenciales del sistema operativo (Windows Credential Manager vía
+  `keyring`), nunca en SQLite, archivos, ledger ni logs; la CLI las lee por
+  stdin (`ai key set|remove|list`). OAuth no existe para terceros en estos
+  proveedores y las suscripciones de chat no dan acceso a API (ADR-0034).
+- Transportes cloud en el borde: `df-ai` sigue sin enlazar red ni ver
+  credenciales; la fachada implementa su `CloudTransport` con `ureq`
+  (rustls) para la Messages API de Anthropic y Chat Completions de OpenAI,
+  extrayendo solo el texto del modelo y sin reflejar cuerpos de error.
+- Consentimiento por digest: `ai explain --item <id>` sin
+  `--accept-disclosure` es una previsualización pura del manifiesto de
+  divulgación (campo a campo, con redacciones aplicadas) que no envía nada;
+  ejecutar exige devolver el SHA-256 exacto de ese manifiesto. Ruta
+  air-gapped con `--local-exe` bajo `df-process-safety`.
+- Migración append-only `0018_assistance_audit.sql`: una fila inmutable por
+  invocación con el contrato de auditoría completo y su evento en el ledger
+  en la misma transacción; `ai audits` la expone.
+- E2E con modelo local determinista: preview sin clave, digest incorrecto
+  rechazado, ejecución aislada, sugerencia validada con riesgo y confianza
+  recalculados, auditoría y ledger verificados; cloud sin clave falla
+  cerrado tras el consentimiento.
+
+#### Límites
+
+- La IA explica y sugiere etiquetas sobre items de revisión; no puede
+  ejecutar, planificar ni aprobar nada, y ninguna sugerencia lleva acción.
+- Deuda declarada: validación de clave en primer uso real, un caso de uso
+  inicial y pantalla de escritorio pendiente (ADR-0034).
+
 ### Milestone 0.6 — Plugin Ecosystem (implementación local)
 
 #### Añadido

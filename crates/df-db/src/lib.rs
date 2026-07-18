@@ -5,6 +5,7 @@
 //! the integrity checks. No other crate issues SQL.
 
 pub mod analysis;
+pub mod assistance;
 pub mod context;
 pub mod dedup;
 pub mod extraction;
