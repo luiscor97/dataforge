@@ -133,6 +133,56 @@ export interface SimilarityOutcome {
   cancelled: boolean;
 }
 
+export interface MediaCounters {
+  contents_total: number;
+  contents_analyzed: number;
+  contents_limited: number;
+  contents_failed: number;
+  pairs_compared: number;
+  relations_total: number;
+}
+
+export interface MediaRelationView {
+  relation:
+    | "IMAGE_PERCEPTUAL_MATCH"
+    | "AUDIO_ACOUSTIC_MATCH"
+    | "VIDEO_PERCEPTUAL_MATCH";
+  score_millionths: number;
+  content_a: string;
+  content_b: string;
+  path_a: string | null;
+  path_b: string | null;
+  evidence: unknown;
+}
+
+export interface MediaStatusReport {
+  run_id: string;
+  snapshot_id: string;
+  contract_version: string;
+  config_digest: string;
+  config: unknown;
+  counters: MediaCounters;
+  pair_cap_reached: boolean;
+  relations: MediaRelationView[];
+  relations_truncated: boolean;
+}
+
+export interface MediaOutcome {
+  run_id: string;
+  snapshot_id: string;
+  status: string;
+  config_digest: string;
+  contents_total: number;
+  contents_analyzed: number;
+  contents_limited: number;
+  contents_failed: number;
+  pairs_compared: number;
+  pair_cap_reached: boolean;
+  relations: number;
+  cancelled: boolean;
+  evidence_only: boolean;
+}
+
 export interface ContentExtractionCounters {
   contents_total: number;
   extracted: number;
@@ -250,6 +300,7 @@ export interface ProjectStatus {
   inventory: InventorySummary | null;
   structural_diagnostics: StructuralDiagnostics | null;
   similarity: SimilarityStatus | null;
+  media: MediaStatusReport | null;
   integrity: IntegrityReport | null;
 }
 

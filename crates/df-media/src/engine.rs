@@ -567,7 +567,11 @@ fn ffmpeg_backend_version(
     Ok(first_line.to_string())
 }
 
-fn descriptor_for(kind: MediaKind, limits: MediaLimits, backend: &str) -> AlgorithmDescriptor {
+pub(crate) fn descriptor_for(
+    kind: MediaKind,
+    limits: MediaLimits,
+    backend: &str,
+) -> AlgorithmDescriptor {
     let (name, version, canonical) = match kind {
         MediaKind::Image => (
             "DataForge DCT perceptual image hash",

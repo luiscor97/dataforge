@@ -43,6 +43,7 @@ const baseStatus = {
   inventory: null,
   structural_diagnostics: null,
   similarity: null,
+  media: null,
   integrity: null,
 };
 
@@ -209,4 +210,61 @@ test("renders sealed M0.3 version evidence without implying an automatic action"
   assert.match(markup, /<dt>Máximo de candidatos<\/dt><dd>200\.000<\/dd>/);
   assert.match(markup, /la similitud no equivale a identidad/);
   assert.match(markup, /nunca autoriza por sí sola/);
+});
+
+test("renders sealed M0.5 media evidence without implying an automatic action", () => {
+  const markup = renderStatus({
+    ...baseStatus,
+    latest_snapshot_id: "snapshot-1",
+    media: {
+      run_id: "media-run-1",
+      snapshot_id: "snapshot-1",
+      contract_version: "dataforge.media-analysis.v1",
+      config_digest: "b".repeat(64),
+      config: {},
+      counters: {
+        contents_total: 3,
+        contents_analyzed: 3,
+        contents_limited: 0,
+        contents_failed: 0,
+        pairs_compared: 3,
+        relations_total: 1,
+      },
+      pair_cap_reached: false,
+      relations_truncated: false,
+      relations: [
+        {
+          relation: "IMAGE_PERCEPTUAL_MATCH",
+          score_millionths: 968750,
+          content_a: "a",
+          content_b: "b",
+          path_a: "fotos\\viaje.jpg",
+          path_b: "fotos\\viaje-comprimida.jpg",
+          evidence: { kind: "IMAGE", hamming_distance: 2 },
+        },
+      ],
+    },
+  });
+
+  assert.match(markup, /Inteligencia multimedia M0\.5/);
+  assert.match(markup, /role="status">Evidencia sellada/);
+  assert.match(markup, /IMAGE_PERCEPTUAL_MATCH/);
+  assert.match(markup, /96\.9%/);
+  assert.match(markup, /viaje-comprimida\.jpg/);
+  assert.match(markup, /<dt>Pares comparados<\/dt><dd>3<\/dd>/);
+  assert.match(markup, /una coincidencia perceptual/);
+  assert.match(markup, /nunca autoriza por sí sola/);
+});
+
+test("keeps the media diagnosis pending until structural analysis completes", () => {
+  const markup = renderStatus({
+    ...baseStatus,
+    latest_snapshot_id: "snapshot-1",
+  });
+
+  assert.match(markup, /Inteligencia multimedia M0\.5/);
+  assert.match(
+    markup,
+    /Pendiente: primero debe terminar el análisis estructural M0\.2/,
+  );
 });

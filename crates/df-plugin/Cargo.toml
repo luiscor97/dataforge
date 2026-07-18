@@ -16,7 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-wasmtime = { version = "=36.0.6", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"] }
+# 36.0.12 clears the 2026-07 RUSTSEC batch (0085-0095: component-model
+# transcoding OOB, Winch sandbox escapes, table allocation panics) while
+# staying on the 36 LTS line. Do not downgrade below 36.0.8.
+wasmtime = { version = "=36.0.12", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"] }
 
 [dev-dependencies]
 rand_core = { version = "=0.6.4", features = ["getrandom"] }

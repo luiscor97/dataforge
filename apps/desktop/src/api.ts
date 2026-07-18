@@ -8,6 +8,7 @@ import {
   type ContentSearchRequest,
   type CreateProjectRequest,
   type ErrorDto,
+  type MediaOutcome,
   type ProjectStatus,
   type SimilarityOutcome,
   isErrorDto,
@@ -50,6 +51,10 @@ export function analyzeSimilarity(
   projectDir: string,
 ): Promise<SimilarityOutcome> {
   return call<SimilarityOutcome>("analyze_similarity", { projectDir });
+}
+
+export function analyzeMedia(projectDir: string): Promise<MediaOutcome> {
+  return call<MediaOutcome>("analyze_media", { projectDir });
 }
 
 export function extractContent(

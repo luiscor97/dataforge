@@ -5,6 +5,41 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.5 — Media Intelligence (implementación local)
+
+#### Añadido
+
+- Migración append-only `0016_media_intelligence.sql`: runs de medios
+  direccionados por el SHA-256 de su configuración serializada, evidencia
+  por contenido (`media_evidence`) y relaciones de revisión
+  (`media_relations`) selladas al completar. Los triggers exigen evidencia
+  `EXTRACTED` en ambos lados de una relación, par ordenado y run `RUNNING`;
+  el sellado valida contadores contra filas reales.
+- Orquestación de proyecto en `df-media`: selección paginada de contenidos
+  multimedia por extensión normalizada, verificación de fingerprint y
+  SHA-256 antes y después de leer (fuente cambiada = conflicto duro),
+  análisis reanudable por contenido y comparación por pares acotada con
+  sondeo de un par extra (`pair_cap_reached` = cola real omitida).
+- Relaciones `IMAGE_PERCEPTUAL_MATCH`, `AUDIO_ACOUSTIC_MATCH` y
+  `VIDEO_PERCEPTUAL_MATCH` con score en millonésimas y evidencia literal de
+  comparación. `automatic_action: true` es irrepresentable en el contrato.
+- Fachada (`analyze_media`, `media_report`, resumen en `project_status`),
+  CLI (`media --ffmpeg --image-worker --max-pairs`, `report media`) y
+  sección M0.5 del escritorio con estados pendiente/sellado accesibles.
+  El worker de imagen embebido se resuelve solo junto al ejecutable; FFmpeg
+  solo por ruta absoluta explícita (ADR-0032).
+- Prueba E2E con el worker aislado real: dos rediciones JPEG del mismo
+  material se relacionan, la imagen ajena no, el run se sella y se
+  reutiliza por digest, y sin workers el fallo es evidencia explícita
+  `WORKER_UNAVAILABLE` con el run sellado igualmente.
+
+#### Límites
+
+- La selección es por extensión, no por sniffing de contenido, y las
+  comparaciones son por pares dentro de cada tipo con techo explícito.
+- Una coincidencia perceptual señala posibles rediciones para revisión
+  humana; nunca autoriza eliminación, consolidación ni operación de plan.
+
 ### Rendimiento y robustez del motor (transversal)
 
 #### Cambiado

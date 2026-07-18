@@ -13,6 +13,7 @@ pub mod fingerprint;
 pub mod ids;
 pub mod inventory;
 pub mod manifest;
+pub mod media;
 pub mod plan;
 pub mod profile;
 pub mod project;
@@ -42,16 +43,19 @@ pub use fingerprint::{
 };
 pub use ids::{
     AnalyticalSnapshotId, ArchiveEntryId, ChunkId, ContentId, DuplicateSetId, EventId,
-    ExtractionRunId, FindingId, FolderId, HashJobId, MailAttachmentId, MailThreadId, OccurrenceId,
-    OperationId, PlanId, ProjectId, RepresentationId, ScanRunId, SearchIndexId,
-    SimilarityRelationId, SimilarityRunId, SnapshotId, SourceRootId, TextSubjectId, TreeCloneSetId,
-    VerificationRunId,
+    ExtractionRunId, FindingId, FolderId, HashJobId, MailAttachmentId, MailThreadId,
+    MediaEvidenceId, MediaRelationId, MediaRunId, OccurrenceId, OperationId, PlanId, ProjectId,
+    RepresentationId, ScanRunId, SearchIndexId, SimilarityRelationId, SimilarityRunId, SnapshotId,
+    SourceRootId, TextSubjectId, TreeCloneSetId, VerificationRunId,
 };
 pub use inventory::{
     ContentObject, FolderRecord, HashState, PathOccurrence, ScanCounters, ScanEntryStatus, ScanRun,
     ScanRunStatus,
 };
 pub use manifest::ManifestEntry;
+pub use media::{
+    MediaRelationKind, MediaRelationRecord, MediaRun, MediaRunCounters, MediaRunStatus,
+};
 pub use plan::{
     ApprovalState, Confidence, ExecutionState, OperationErrorCode, OperationType, Plan,
     PlanOperation, PlanStatus, RiskLevel,

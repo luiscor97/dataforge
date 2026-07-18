@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  analyzeMedia,
   analyzeSimilarity,
   createProject,
   engineVersion,
@@ -113,6 +114,22 @@ export default function App(): React.JSX.Element {
     setError(null);
     try {
       await analyzeSimilarity(status.project_dir);
+      setStatus(await projectStatus(status.project_dir));
+    } catch (failure) {
+      handleFailure(failure);
+    } finally {
+      setBusy(false);
+    }
+  }, [status, handleFailure]);
+
+  const runMedia = useCallback(async () => {
+    if (status === null) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await analyzeMedia(status.project_dir);
       setStatus(await projectStatus(status.project_dir));
     } catch (failure) {
       handleFailure(failure);
@@ -280,6 +297,7 @@ export default function App(): React.JSX.Element {
           busy={busy}
           onRefresh={() => void refreshStatus()}
           onAnalyzeSimilarity={() => void runSimilarity()}
+          onAnalyzeMedia={() => void runMedia()}
           onBack={goHome}
         />
       )}

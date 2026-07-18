@@ -14,9 +14,10 @@ use df_facade::{
     AnalyzeOutcome, AnomalyReport, ApproveOutcome, AuditReport, ContentArtifactBuildOutcome,
     ContentExtractionOptions, ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome,
     ContextReport, CreateProjectRequest, DuplicateReport, ExecuteOutcome, ExtractionLimits,
-    HashOutcome, PlanOutcome, PlanValidationReport, ProjectStatus, QueryOptions, ReviewQueue,
-    ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome,
-    SimilarityReport, SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, PlanOutcome,
+    PlanValidationReport, ProjectStatus, QueryOptions, ReviewQueue, ScanOutcome,
+    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
+    SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -77,6 +78,23 @@ enum Command {
         /// Deterministic maximum number of candidate pairs to evaluate.
         #[arg(long, default_value_t = 200_000)]
         max_candidates: u64,
+    },
+    /// Perceptual image/audio/video evidence for human review (M0.5).
+    Media {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// Absolute path to an FFmpeg executable (audio/video). Without it,
+        /// audio and video produce explicit failure evidence.
+        #[arg(long)]
+        ffmpeg: Option<PathBuf>,
+        /// Absolute path to the isolated image worker. Defaults to the
+        /// `df-media-worker` next to this executable, if present.
+        #[arg(long)]
+        image_worker: Option<PathBuf>,
+        /// Deterministic maximum number of pairwise comparisons.
+        #[arg(long, default_value_t = 100_000)]
+        max_pairs: u64,
     },
     /// Extract, index, search and query document content (M0.4).
     Content {
@@ -352,6 +370,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Perceptual media review relations of the latest sealed run.
+    Media {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -399,6 +423,7 @@ enum Output {
     Hash(HashOutcome),
     Analyze(AnalyzeOutcome),
     Similarity(SimilarityOutcome),
+    Media(MediaOutcome),
     ContentExtraction(ContentExtractionOutcome),
     ContentArtifacts(ContentArtifactBuildOutcome),
     ContentSearch(ContentSearchOutcome),
@@ -414,6 +439,7 @@ enum Output {
     Contexts(ContextReport),
     Anomalies(AnomalyReport),
     Similarities(SimilarityReport),
+    MediaRelations(MediaReport),
     Review(ReviewQueue),
     Audit(AuditReport),
 }
@@ -468,6 +494,33 @@ fn run(cli: &Cli) -> DfResult<Output> {
             },
         )
         .map(Output::Similarity),
+        Command::Media {
+            path,
+            ffmpeg,
+            image_worker,
+            max_pairs,
+        } => {
+            let mut sidecars = MediaSidecars::none();
+            if let Some(worker) = image_worker
+                .clone()
+                .or_else(df_facade::default_media_worker)
+            {
+                sidecars = sidecars.with_image_worker(worker);
+            }
+            if let Some(ffmpeg) = ffmpeg {
+                sidecars = sidecars.with_ffmpeg(ffmpeg);
+            }
+            df_facade::analyze_media_with_options(
+                path,
+                Actor::Cli,
+                &MediaProjectOptions {
+                    max_pairs: *max_pairs,
+                    sidecars,
+                    ..MediaProjectOptions::default()
+                },
+            )
+            .map(Output::Media)
+        }
         Command::Content { command } => match command {
             ContentCommand::Extract {
                 path,
@@ -615,6 +668,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::Similarities { path } => {
                 df_facade::similarity_report(path).map(Output::Similarities)
+            }
+            ReportCommand::Media { path } => {
+                df_facade::media_report(path).map(Output::MediaRelations)
             }
         },
         Command::Review { command } => match command {
@@ -1113,6 +1169,70 @@ fn print_anomalies(report: &AnomalyReport) {
     }
 }
 
+fn print_media(outcome: &MediaOutcome) {
+    println!("Media run        : {}", outcome.run_id);
+    println!("Snapshot         : {}", outcome.snapshot_id);
+    println!("Status           : {}", outcome.status);
+    println!("Config SHA-256   : {}", outcome.config_digest);
+    println!("Contents         : {}", outcome.contents_total);
+    println!("Analyzed         : {}", outcome.contents_analyzed);
+    println!("Limited          : {}", outcome.contents_limited);
+    println!("Failed           : {}", outcome.contents_failed);
+    println!("Pairs compared   : {}", outcome.pairs_compared);
+    println!("Relations        : {}", outcome.relations);
+    println!(
+        "Pair cap         : {}",
+        if outcome.pair_cap_reached {
+            "REACHED — results are conservative but not exhaustive"
+        } else {
+            "not reached"
+        }
+    );
+    println!("Evidence only    : media relations never authorise an operation");
+}
+
+fn print_media_relations(report: &MediaReport) {
+    let status = &report.status;
+    println!("Media run      : {}", status.run_id);
+    println!("Snapshot       : {}", status.snapshot_id);
+    println!("Relations      : {}", status.counters.relations_total);
+    println!("Pairs compared : {}", status.counters.pairs_compared);
+    if status.pair_cap_reached {
+        println!("Pair cap       : REACHED — the report is not exhaustive");
+    }
+    for relation in &status.relations {
+        println!();
+        println!(
+            "  {} — score {:.1}%",
+            relation.relation,
+            f64::from(relation.score_millionths) / 10_000.0
+        );
+        println!(
+            "    A: {}",
+            relation
+                .path_a
+                .as_deref()
+                .unwrap_or(relation.content_a.as_str())
+        );
+        println!(
+            "    B: {}",
+            relation
+                .path_b
+                .as_deref()
+                .unwrap_or(relation.content_b.as_str())
+        );
+    }
+    if status.relations.is_empty() {
+        println!("No perceptual media relations met the engine thresholds.");
+    }
+    if status.relations_truncated {
+        println!();
+        println!("(list truncated; use --json for the full sealed evidence)");
+    }
+    println!();
+    println!("Evidence only: media relations never authorise an operation.");
+}
+
 fn print_similarities(report: &SimilarityReport) {
     let status = &report.status;
     println!("Similarity run : {}", status.run_id);
@@ -1225,6 +1345,8 @@ fn print_human(output: &Output) {
         Output::Contexts(report) => print_contexts(report),
         Output::Anomalies(report) => print_anomalies(report),
         Output::Similarities(report) => print_similarities(report),
+        Output::Media(outcome) => print_media(outcome),
+        Output::MediaRelations(report) => print_media_relations(report),
         Output::Review(queue) => print_review(queue),
         Output::Audit(report) => print_audit(report),
     }
@@ -1274,6 +1396,14 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 0
             }
         }
+        Output::Media(outcome) => {
+            if outcome.cancelled || outcome.status != "COMPLETED" || outcome.contents_failed > 0 {
+                3
+            } else {
+                0
+            }
+        }
+        Output::MediaRelations(_) => 0,
         Output::ContentExtraction(outcome) => {
             if outcome.status == "COMPLETED"
                 && outcome.counters.limited == 0

@@ -34,6 +34,7 @@ pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, Structural
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOutcome;
 pub use df_hash::HashOutcome;
+pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
 pub use df_scan::ScanOutcome;
 pub use df_similarity::{SimilarityOptions, SimilarityOutcome};
@@ -121,6 +122,8 @@ pub struct ProjectStatus {
     pub structural_diagnostics: Option<StructuralDiagnostics>,
     /// Latest sealed M0.3 content-similarity evidence for this snapshot.
     pub similarity: Option<SimilarityStatus>,
+    /// Latest sealed M0.5 perceptual media evidence for this snapshot.
+    pub media: Option<MediaStatusReport>,
     /// Present when an integrity pass was executed (project_status).
     pub integrity: Option<IntegrityReport>,
 }
@@ -162,6 +165,26 @@ pub struct SimilarityStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct SimilarityReport {
     pub status: SimilarityStatus,
+    pub evidence_only: bool,
+}
+
+/// Sealed media evidence of the latest run (M0.5).
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaStatusReport {
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub contract_version: String,
+    pub config_digest: String,
+    pub config: serde_json::Value,
+    pub counters: df_domain::MediaRunCounters,
+    pub pair_cap_reached: bool,
+    pub relations: Vec<df_db::media::MediaRelationView>,
+    pub relations_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaReport {
+    pub status: MediaStatusReport,
     pub evidence_only: bool,
 }
 
@@ -522,6 +545,27 @@ fn status_from_db(
         }
         _ => None,
     };
+    let media = match (
+        snapshot.as_ref(),
+        df_db::media::latest_completed_run(db, project.id)?,
+    ) {
+        (Some(snapshot), Some(run)) if run.snapshot_id == snapshot.id => {
+            let relations = df_db::media::list_media_relations(db, run.id, 20)?;
+            let relations_truncated = run.counters.relations_total > relations.len() as u64;
+            Some(MediaStatusReport {
+                run_id: run.id.to_string(),
+                snapshot_id: run.snapshot_id.to_string(),
+                contract_version: run.contract_version.clone(),
+                config_digest: run.config_digest.clone(),
+                config: run.config.clone(),
+                counters: run.counters,
+                pair_cap_reached: run.pair_cap_reached,
+                relations,
+                relations_truncated,
+            })
+        }
+        _ => None,
+    };
 
     Ok(ProjectStatus {
         project_id: project.id.to_string(),
@@ -554,6 +598,7 @@ fn status_from_db(
         inventory,
         structural_diagnostics,
         similarity,
+        media,
         integrity,
     })
 }
@@ -927,6 +972,78 @@ pub fn analyze_similarity_with_options(
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
     df_similarity::analyze_project(&mut db, actor, options, None)
+}
+
+/// Perceptual media evidence over the latest snapshot (M0.5). Sidecars are
+/// explicit absolute paths; audio and video without FFmpeg produce explicit
+/// failure evidence instead of silently vanishing.
+pub fn analyze_media(project_dir: &Path, actor: Actor) -> DfResult<MediaOutcome> {
+    let mut options = MediaProjectOptions::default();
+    if let Some(worker) = default_media_worker() {
+        options.sidecars = options.sidecars.with_image_worker(worker);
+    }
+    analyze_media_with_options(project_dir, actor, &options)
+}
+
+/// Configurable entry point; the serialized limits and pair cap are part of
+/// the immutable run identity, sidecar paths are not.
+pub fn analyze_media_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &MediaProjectOptions,
+) -> DfResult<MediaOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    df_media::analyze_media_project(&mut db, actor, options, None)
+}
+
+/// The bundled image worker next to the running executable, if present.
+/// Deterministic deployment wiring — never a `PATH` or environment lookup.
+pub fn default_media_worker() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join(if cfg!(windows) {
+        "df-media-worker.exe"
+    } else {
+        "df-media-worker"
+    });
+    let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+    metadata.is_file().then_some(candidate)
+}
+
+/// Latest sealed media evidence. Relations are explicitly informational and
+/// cannot be translated to plan operations by this API.
+pub fn media_report(project_dir: &Path) -> DfResult<MediaReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let run = df_db::media::latest_completed_run(&db, project.id)?
+        .filter(|run| run.snapshot_id == snapshot.id)
+        .ok_or_else(|| {
+            DfError::Validation(
+                "the latest snapshot has no completed media run; run media analysis first"
+                    .to_string(),
+            )
+        })?;
+    let relations = df_db::media::list_media_relations(&db, run.id, 1_000)?;
+    let relations_truncated = run.counters.relations_total > relations.len() as u64;
+    Ok(MediaReport {
+        status: MediaStatusReport {
+            run_id: run.id.to_string(),
+            snapshot_id: run.snapshot_id.to_string(),
+            contract_version: run.contract_version.clone(),
+            config_digest: run.config_digest.clone(),
+            config: run.config.clone(),
+            counters: run.counters,
+            pair_cap_reached: run.pair_cap_reached,
+            relations,
+            relations_truncated,
+        },
+        evidence_only: true,
+    })
 }
 
 /// Latest sealed similarity evidence. Relations are explicitly informational

@@ -13,4 +13,6 @@ df-media.workspace = true
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
+df-domain.workspace = true
+df-facade.workspace = true
 tempfile.workspace = true

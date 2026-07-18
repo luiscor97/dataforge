@@ -7,8 +7,8 @@ use df_domain::Actor;
 use df_error::DfError;
 use df_facade::{
     ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
-    ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest, ProjectStatus, QueryOptions,
-    SearchRequest, SimilarityOutcome, SnapshotBuildOptions,
+    ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest, MediaOutcome, ProjectStatus,
+    QueryOptions, SearchRequest, SimilarityOutcome, SnapshotBuildOptions,
 };
 use serde::Serialize;
 
@@ -71,6 +71,14 @@ fn project_status(project_dir: String) -> Result<ProjectStatus, ErrorDto> {
 fn analyze_similarity(project_dir: String) -> Result<SimilarityOutcome, ErrorDto> {
     df_facade::analyze_similarity(std::path::Path::new(&project_dir), Actor::Desktop)
         .map_err(ErrorDto::from)
+}
+
+#[tauri::command]
+async fn analyze_media(project_dir: String) -> Result<MediaOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::analyze_media(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -165,6 +173,7 @@ pub fn run() {
             open_project,
             project_status,
             analyze_similarity,
+            analyze_media,
             extract_content,
             fail_content_extraction,
             build_content_artifacts,

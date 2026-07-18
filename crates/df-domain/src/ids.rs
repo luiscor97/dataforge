@@ -150,6 +150,18 @@ typed_id!(
     /// Identifier of an analytical Parquet artifact.
     AnalyticalSnapshotId
 );
+typed_id!(
+    /// Identifier of one configuration-addressed media run (M0.5).
+    MediaRunId
+);
+typed_id!(
+    /// Identifier of one per-content media analysis evidence row.
+    MediaEvidenceId
+);
+typed_id!(
+    /// Identifier of a non-destructive media review relation.
+    MediaRelationId
+);
 
 #[cfg(test)]
 mod tests {

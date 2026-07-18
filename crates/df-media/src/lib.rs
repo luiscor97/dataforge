@@ -11,11 +11,16 @@
 mod compare;
 mod engine;
 mod fingerprint;
+mod project;
 mod types;
 pub mod worker_protocol;
 
 pub use compare::compare_media;
 pub use engine::analyze_media;
+pub use project::{
+    analyze_media_project, MediaOutcome, MediaProjectOptions, AUDIO_EXTENSIONS, IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+};
 pub use types::{
     AlgorithmDescriptor, AudioFingerprint, AudioMetadata, ComparisonEvidence, FailureCode,
     ImageFingerprint, ImageMetadata, MediaAnalysis, MediaCompareError, MediaError,

@@ -12,6 +12,7 @@ interface StatusViewProps {
   busy: boolean;
   onRefresh: () => void;
   onAnalyzeSimilarity?: () => void;
+  onAnalyzeMedia?: () => void;
   onBack: () => void;
 }
 
@@ -20,10 +21,12 @@ export function StatusView({
   busy,
   onRefresh,
   onAnalyzeSimilarity,
+  onAnalyzeMedia,
   onBack,
 }: StatusViewProps): React.JSX.Element {
   const diagnostics = status.structural_diagnostics ?? null;
   const similarity = status.similarity ?? null;
+  const media = status.media ?? null;
 
   return (
     <section className="panel">
@@ -382,6 +385,121 @@ export function StatusView({
               Evidencia de revisión: la similitud no equivale a identidad y
               nunca autoriza por sí sola una eliminación, consolidación ni
               operación del plan.
+            </p>
+          </>
+        )}
+      </section>
+      <section className="diagnostics" aria-labelledby="media-heading">
+        <div className="section-heading">
+          <div>
+            <h3 id="media-heading">Inteligencia multimedia M0.5</h3>
+            <p>
+              Huellas perceptuales de imagen, audio y vídeo para detectar
+              rediciones del mismo material.
+            </p>
+          </div>
+          {media !== null && (
+            <span
+              className="diagnostic-badge diagnostic-complete"
+              role="status"
+            >
+              Evidencia sellada
+            </span>
+          )}
+        </div>
+
+        {media === null ? (
+          <div className="diagnostic-status diagnostic-pending" role="status">
+            <p>
+              {diagnostics?.analysis_complete === true
+                ? "Pendiente: ejecuta el análisis multimedia sobre el snapshot ya analizado."
+                : "Pendiente: primero debe terminar el análisis estructural M0.2."}
+            </p>
+            {diagnostics?.analysis_complete === true && (
+              <button
+                type="button"
+                onClick={onAnalyzeMedia}
+                disabled={busy || onAnalyzeMedia === undefined}
+              >
+                {busy ? "Analizando medios…" : "Analizar imagen, audio y vídeo"}
+              </button>
+            )}
+          </div>
+        ) : (
+          <>
+            <div className="diagnostics-grid">
+              <section
+                className="diagnostic-group"
+                aria-labelledby="media-summary-heading"
+              >
+                <h4 id="media-summary-heading">Resumen del corpus</h4>
+                <dl className="metric-list">
+                  <dt>Contenidos multimedia</dt>
+                  <dd>{formatCount(media.counters.contents_total)}</dd>
+                  <dt>Analizados</dt>
+                  <dd>{formatCount(media.counters.contents_analyzed)}</dd>
+                  <dt>Limitados</dt>
+                  <dd>{formatCount(media.counters.contents_limited)}</dd>
+                  <dt>Fallidos</dt>
+                  <dd
+                    className={
+                      media.counters.contents_failed > 0
+                        ? "metric-warning"
+                        : undefined
+                    }
+                  >
+                    {formatCount(media.counters.contents_failed)}
+                  </dd>
+                  <dt>Pares comparados</dt>
+                  <dd>{formatCount(media.counters.pairs_compared)}</dd>
+                  <dt>Relaciones</dt>
+                  <dd>{formatCount(media.counters.relations_total)}</dd>
+                  <dt>Límite de pares</dt>
+                  <dd
+                    className={
+                      media.pair_cap_reached ? "metric-warning" : undefined
+                    }
+                  >
+                    {media.pair_cap_reached
+                      ? "Alcanzado — resultados no exhaustivos"
+                      : "No alcanzado"}
+                  </dd>
+                </dl>
+              </section>
+              <section
+                className="diagnostic-group similarity-relations"
+                aria-labelledby="media-relations-heading"
+              >
+                <h4 id="media-relations-heading">Relaciones de revisión</h4>
+                {media.relations.length === 0 ? (
+                  <p>Ningún par superó los umbrales perceptuales del motor.</p>
+                ) : (
+                  <ol>
+                    {media.relations.map((relation) => (
+                      <li key={`${relation.content_a}-${relation.content_b}`}>
+                        <strong>{relation.relation}</strong> —{" "}
+                        {(relation.score_millionths / 10_000).toFixed(1)}%
+                        <br />
+                        <code>{relation.path_a ?? relation.content_a}</code>
+                        <br />
+                        <span aria-hidden="true">↔</span>{" "}
+                        <code>{relation.path_b ?? relation.content_b}</code>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+                {media.relations_truncated && (
+                  <p className="metric-warning">
+                    La vista muestra solo las primeras{" "}
+                    {formatCount(media.relations.length)} relaciones.
+                  </p>
+                )}
+              </section>
+            </div>
+            <p className="diagnostic-note">
+              Evidencia de revisión: una coincidencia perceptual señala posibles
+              rediciones del mismo material y nunca autoriza por sí sola una
+              eliminación, consolidación ni operación del plan.
             </p>
           </>
         )}

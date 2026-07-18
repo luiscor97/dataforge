@@ -19,6 +19,7 @@ df-hash = { workspace = true }
 df-planner = { workspace = true }
 df-executor = { workspace = true }
 df-verifier = { workspace = true }
+df-media = { workspace = true }
 df-similarity = { workspace = true }
 df-extract = { workspace = true }
 df-search = { workspace = true }

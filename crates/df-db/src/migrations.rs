@@ -95,6 +95,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "hash_queue_index",
         sql: include_str!("../migrations/0015_hash_queue_index.sql"),
     },
+    Migration {
+        version: 16,
+        name: "media_intelligence",
+        sql: include_str!("../migrations/0016_media_intelligence.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {
