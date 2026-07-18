@@ -15,9 +15,10 @@ use df_facade::{
     ContentExtractionOptions, ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome,
     ContextReport, CreateProjectRequest, DuplicateReport, ExecuteOutcome, ExtractionLimits,
     HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, PlanOutcome,
-    PlanValidationReport, ProjectStatus, QueryOptions, ReviewQueue, ScanOutcome,
-    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
-    SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
+    QueryOptions, RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions,
+    SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions,
+    TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -100,6 +101,11 @@ enum Command {
     Content {
         #[command(subcommand)]
         command: ContentCommand,
+    },
+    /// Signed, sandboxed suggestion plugins (M0.6).
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
     },
     /// Manage reconstruction plans.
     Plan {
@@ -376,6 +382,48 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Findings and suggestions of the latest sealed plugin runs.
+    Plugins {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Verify a signed package (signature, hash, ABI, compile) and store it.
+    Register {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// JSON package file: manifest, component SHA-256, publisher key and
+        /// Ed25519 signature.
+        #[arg(long)]
+        package: PathBuf,
+        /// The WebAssembly component file the package signs.
+        #[arg(long)]
+        component: PathBuf,
+    },
+    /// Stored registrations of this project.
+    List {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Execute every registered plugin over the analysed snapshot. Subject
+    /// metadata is granted by default; text requires --grant-text.
+    Run {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// Deterministic maximum number of subjects offered to each plugin.
+        #[arg(long, default_value_t = 10_000)]
+        max_subjects: u64,
+        /// Additionally grant plugins access to normalized subject text.
+        #[arg(long)]
+        grant_text: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -440,6 +488,10 @@ enum Output {
     Anomalies(AnomalyReport),
     Similarities(SimilarityReport),
     MediaRelations(MediaReport),
+    PluginRegistered(Box<RegisteredPluginMetadata>),
+    PluginList(Vec<PluginRegistrationView>),
+    PluginRuns(PluginsOutcome),
+    PluginFindings(PluginReport),
     Review(ReviewQueue),
     Audit(AuditReport),
 }
@@ -521,6 +573,32 @@ fn run(cli: &Cli) -> DfResult<Output> {
             )
             .map(Output::Media)
         }
+        Command::Plugin { command } => match command {
+            PluginCommand::Register {
+                path,
+                package,
+                component,
+            } => df_facade::register_plugin(path, package, component, Actor::Cli)
+                .map(Box::new)
+                .map(Output::PluginRegistered),
+            PluginCommand::List { path } => df_facade::list_plugins(path).map(Output::PluginList),
+            PluginCommand::Run {
+                path,
+                max_subjects,
+                grant_text,
+            } => {
+                let mut options = df_facade::default_plugin_options();
+                options.max_subjects = *max_subjects;
+                if *grant_text {
+                    options
+                        .policy
+                        .granted_capabilities
+                        .insert(df_facade::PluginCapability::SubjectText);
+                }
+                df_facade::run_plugins_with_options(path, Actor::Cli, &options)
+                    .map(Output::PluginRuns)
+            }
+        },
         Command::Content { command } => match command {
             ContentCommand::Extract {
                 path,
@@ -671,6 +749,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::Media { path } => {
                 df_facade::media_report(path).map(Output::MediaRelations)
+            }
+            ReportCommand::Plugins { path } => {
+                df_facade::plugin_report(path).map(Output::PluginFindings)
             }
         },
         Command::Review { command } => match command {
@@ -1169,6 +1250,75 @@ fn print_anomalies(report: &AnomalyReport) {
     }
 }
 
+fn print_plugin_registered(metadata: &RegisteredPluginMetadata) {
+    println!("Plugin           : {}", metadata.key);
+    println!("Publisher        : {}", metadata.manifest.publisher);
+    println!("Component SHA-256: {}", metadata.component_sha256);
+    println!("Publisher key    : {}", metadata.publisher_public_key_hex);
+    println!("Capabilities     : {:?}", metadata.manifest.capabilities);
+    println!("Verified: signature, hash, manifest, ABI and full compile.");
+}
+
+fn print_plugin_list(plugins: &[PluginRegistrationView]) {
+    if plugins.is_empty() {
+        println!("No plugins are registered in this project.");
+        return;
+    }
+    for plugin in plugins {
+        println!("{}", plugin.plugin);
+        println!("  component : {}", plugin.component_sha256);
+        println!("  publisher : {}", plugin.publisher_public_key_hex);
+    }
+}
+
+fn print_plugin_runs(outcome: &PluginsOutcome) {
+    println!("Snapshot         : {}", outcome.snapshot_id);
+    for run in &outcome.runs {
+        println!();
+        println!("  {} — {}", run.plugin, run.status);
+        println!("    run       : {}", run.run_id);
+        println!(
+            "    subjects  : {} total, {} analysed, {} failed{}",
+            run.subjects_total,
+            run.subjects_analyzed,
+            run.subjects_failed,
+            if run.subject_cap_reached {
+                " (cap REACHED — not exhaustive)"
+            } else {
+                ""
+            }
+        );
+        println!("    findings  : {}", run.findings);
+    }
+    println!();
+    println!("Evidence only    : findings suggest, they never execute.");
+}
+
+fn print_plugin_findings(report: &PluginReport) {
+    println!("Snapshot : {}", report.snapshot_id);
+    for run in &report.runs {
+        println!(
+            "  {} — {} finding(s) over {} subject(s)",
+            run.plugin, run.findings_total, run.subjects_total
+        );
+    }
+    for finding in &report.findings {
+        println!();
+        println!(
+            "  [{}] {} — {}",
+            finding.severity, finding.code, finding.plugin
+        );
+        println!("    subject : {}", finding.subject_id);
+        println!("    {}", finding.message);
+    }
+    if report.findings.is_empty() {
+        println!();
+        println!("No findings were reported.");
+    }
+    println!();
+    println!("Evidence only: plugin findings never authorise an operation.");
+}
+
 fn print_media(outcome: &MediaOutcome) {
     println!("Media run        : {}", outcome.run_id);
     println!("Snapshot         : {}", outcome.snapshot_id);
@@ -1347,6 +1497,10 @@ fn print_human(output: &Output) {
         Output::Similarities(report) => print_similarities(report),
         Output::Media(outcome) => print_media(outcome),
         Output::MediaRelations(report) => print_media_relations(report),
+        Output::PluginRegistered(metadata) => print_plugin_registered(metadata),
+        Output::PluginList(plugins) => print_plugin_list(plugins),
+        Output::PluginRuns(outcome) => print_plugin_runs(outcome),
+        Output::PluginFindings(report) => print_plugin_findings(report),
         Output::Review(queue) => print_review(queue),
         Output::Audit(report) => print_audit(report),
     }
@@ -1404,6 +1558,19 @@ fn verdict_exit_code(output: &Output) -> i32 {
             }
         }
         Output::MediaRelations(_) => 0,
+        Output::PluginRuns(outcome) => {
+            if outcome.cancelled
+                || outcome
+                    .runs
+                    .iter()
+                    .any(|run| run.status != "COMPLETED" || run.subjects_failed > 0)
+            {
+                3
+            } else {
+                0
+            }
+        }
+        Output::PluginRegistered(_) | Output::PluginList(_) | Output::PluginFindings(_) => 0,
         Output::ContentExtraction(outcome) => {
             if outcome.status == "COMPLETED"
                 && outcome.counters.limited == 0

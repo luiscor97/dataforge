@@ -36,6 +36,9 @@ pub use df_executor::ExecuteOutcome;
 pub use df_hash::HashOutcome;
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
+pub use df_plugin::{
+    Capability as PluginCapability, PluginProjectOptions, PluginsOutcome, RegisteredPluginMetadata,
+};
 pub use df_scan::ScanOutcome;
 pub use df_similarity::{SimilarityOptions, SimilarityOutcome};
 pub use df_verifier::VerifyOutcome;
@@ -1009,6 +1012,133 @@ pub fn default_media_worker() -> Option<PathBuf> {
     });
     let metadata = std::fs::symlink_metadata(&candidate).ok()?;
     metadata.is_file().then_some(candidate)
+}
+
+/// Transport file of one signed plugin package: everything except the
+/// component bytes, which live in their own file next to it.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPackageFile {
+    pub manifest: df_plugin::PluginManifest,
+    pub component_sha256: String,
+    pub publisher_public_key_hex: String,
+    pub signature_hex: String,
+}
+
+/// Verify (signature, hash, manifest, ABI, compile) and persist one plugin.
+pub fn register_plugin(
+    project_dir: &Path,
+    package_path: &Path,
+    component_path: &Path,
+    actor: Actor,
+) -> DfResult<RegisteredPluginMetadata> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let package_text =
+        std::fs::read_to_string(package_path).map_err(|error| DfError::io(package_path, error))?;
+    let package: PluginPackageFile = serde_json::from_str(&package_text)
+        .map_err(|error| DfError::Validation(format!("plugin package file: {error}")))?;
+    let component_bytes =
+        std::fs::read(component_path).map_err(|error| DfError::io(component_path, error))?;
+    df_plugin::register_project_plugin(
+        &mut db,
+        actor,
+        df_plugin::SignedPluginPackage {
+            manifest: package.manifest,
+            component_sha256: package.component_sha256,
+            component_bytes,
+            publisher_public_key_hex: package.publisher_public_key_hex,
+            signature_hex: package.signature_hex,
+        },
+        &PluginProjectOptions::default(),
+    )
+}
+
+/// Stored registrations of the project (identity view; runs re-verify).
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginRegistrationView {
+    pub plugin: String,
+    pub component_sha256: String,
+    pub publisher_public_key_hex: String,
+}
+
+pub fn list_plugins(project_dir: &Path) -> DfResult<Vec<PluginRegistrationView>> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    Ok(df_db::plugins::list_registrations(&db, project.id)?
+        .into_iter()
+        .map(|registration| PluginRegistrationView {
+            plugin: format!("{}@{}", registration.plugin_id, registration.plugin_version),
+            component_sha256: registration.component_sha256,
+            publisher_public_key_hex: registration.publisher_public_key_hex,
+        })
+        .collect())
+}
+
+/// Default execution policy: bounded subject *metadata* (paths and sizes the
+/// operator already sees in every report) is granted; normalized *text*
+/// stays an explicit opt-in per invocation. The host itself grants nothing.
+pub fn default_plugin_options() -> PluginProjectOptions {
+    let mut options = PluginProjectOptions::default();
+    options
+        .policy
+        .granted_capabilities
+        .insert(df_plugin::Capability::SubjectMetadata);
+    options
+}
+
+/// Execute every registered plugin over the latest analysed snapshot.
+pub fn run_plugins(project_dir: &Path, actor: Actor) -> DfResult<PluginsOutcome> {
+    run_plugins_with_options(project_dir, actor, &default_plugin_options())
+}
+
+pub fn run_plugins_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &PluginProjectOptions,
+) -> DfResult<PluginsOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    df_plugin::run_project_plugins(&mut db, actor, options, None)
+}
+
+/// Sealed plugin findings of the latest snapshot's completed runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginReport {
+    pub snapshot_id: String,
+    pub runs: Vec<df_db::plugins::PluginRunView>,
+    pub findings: Vec<df_db::plugins::PluginFindingView>,
+    pub evidence_only: bool,
+}
+
+pub fn plugin_report(project_dir: &Path) -> DfResult<PluginReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let runs = df_db::plugins::latest_completed_runs(&db, project.id, snapshot.id)?;
+    if runs.is_empty() {
+        return Err(DfError::Validation(
+            "the latest snapshot has no completed plugin runs; run plugins first".to_string(),
+        ));
+    }
+    let mut findings = Vec::new();
+    for run in &runs {
+        let run_id = run.run_id.parse()?;
+        findings.extend(df_db::plugins::list_findings(&db, run_id, 500)?);
+    }
+    Ok(PluginReport {
+        snapshot_id: snapshot.id.to_string(),
+        runs,
+        findings,
+        evidence_only: true,
+    })
 }
 
 /// Latest sealed media evidence. Relations are explicitly informational and

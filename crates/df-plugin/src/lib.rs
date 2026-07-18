@@ -12,6 +12,7 @@
 mod contract;
 mod error;
 mod host;
+mod project;
 mod registry;
 
 pub use contract::{
@@ -21,6 +22,10 @@ pub use contract::{
 };
 pub use error::{LimitKind, PluginError, PluginResult};
 pub use host::{HostLimits, HostPolicy, PluginHost};
+pub use project::{
+    register_project_plugin, run_project_plugins, PluginProjectOptions, PluginRunOutcome,
+    PluginsOutcome,
+};
 pub use registry::{
     registration_signing_bytes, PluginKey, PluginRegistry, RegisteredPlugin,
     RegisteredPluginMetadata, SignedPluginPackage,

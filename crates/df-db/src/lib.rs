@@ -13,6 +13,7 @@ pub mod inventory;
 pub mod media;
 pub mod migrations;
 pub mod plans;
+pub mod plugins;
 pub mod repository;
 pub mod similarity;
 pub mod structure;

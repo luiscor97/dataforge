@@ -100,6 +100,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "media_intelligence",
         sql: include_str!("../migrations/0016_media_intelligence.sql"),
     },
+    Migration {
+        version: 17,
+        name: "plugin_ecosystem",
+        sql: include_str!("../migrations/0017_plugin_ecosystem.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {

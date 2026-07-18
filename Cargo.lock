@@ -2226,11 +2226,13 @@ dependencies = [
  "df-ledger",
  "df-media",
  "df-planner",
+ "df-plugin",
  "df-query",
  "df-scan",
  "df-search",
  "df-similarity",
  "df-verifier",
+ "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
@@ -2333,6 +2335,9 @@ dependencies = [
 name = "df-plugin"
 version = "0.2.0"
 dependencies = [
+ "df-db",
+ "df-domain",
+ "df-error",
  "ed25519-dalek",
  "hex",
  "jsonschema",

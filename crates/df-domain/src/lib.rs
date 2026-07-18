@@ -15,6 +15,7 @@ pub mod inventory;
 pub mod manifest;
 pub mod media;
 pub mod plan;
+pub mod plugins;
 pub mod profile;
 pub mod project;
 pub mod raw_path;
@@ -44,9 +45,10 @@ pub use fingerprint::{
 pub use ids::{
     AnalyticalSnapshotId, ArchiveEntryId, ChunkId, ContentId, DuplicateSetId, EventId,
     ExtractionRunId, FindingId, FolderId, HashJobId, MailAttachmentId, MailThreadId,
-    MediaEvidenceId, MediaRelationId, MediaRunId, OccurrenceId, OperationId, PlanId, ProjectId,
-    RepresentationId, ScanRunId, SearchIndexId, SimilarityRelationId, SimilarityRunId, SnapshotId,
-    SourceRootId, TextSubjectId, TreeCloneSetId, VerificationRunId,
+    MediaEvidenceId, MediaRelationId, MediaRunId, OccurrenceId, OperationId, PlanId,
+    PluginFindingId, PluginRegistrationId, PluginRunId, ProjectId, RepresentationId, ScanRunId,
+    SearchIndexId, SimilarityRelationId, SimilarityRunId, SnapshotId, SourceRootId, TextSubjectId,
+    TreeCloneSetId, VerificationRunId,
 };
 pub use inventory::{
     ContentObject, FolderRecord, HashState, PathOccurrence, ScanCounters, ScanEntryStatus, ScanRun,
@@ -60,6 +62,7 @@ pub use plan::{
     ApprovalState, Confidence, ExecutionState, OperationErrorCode, OperationType, Plan,
     PlanOperation, PlanStatus, RiskLevel,
 };
+pub use plugins::{PluginRun, PluginRunCounters, PluginRunStatus};
 pub use profile::{GenericMarker, Profile, ProtectedMarker, DEFAULT_PROFILE_ID};
 pub use project::{ProfileRef, Project};
 pub use raw_path::RawPath;

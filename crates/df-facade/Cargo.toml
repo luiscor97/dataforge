@@ -20,6 +20,7 @@ df-planner = { workspace = true }
 df-executor = { workspace = true }
 df-verifier = { workspace = true }
 df-media = { workspace = true }
+df-plugin = { workspace = true }
 df-similarity = { workspace = true }
 df-extract = { workspace = true }
 df-search = { workspace = true }
@@ -33,4 +34,5 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 df-db = { workspace = true, features = ["test-support"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
 tempfile = { workspace = true }

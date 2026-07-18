@@ -162,6 +162,18 @@ typed_id!(
     /// Identifier of a non-destructive media review relation.
     MediaRelationId
 );
+typed_id!(
+    /// Identifier of one signed plugin registration (M0.6).
+    PluginRegistrationId
+);
+typed_id!(
+    /// Identifier of one configuration-addressed plugin run.
+    PluginRunId
+);
+typed_id!(
+    /// Identifier of one append-only plugin finding.
+    PluginFindingId
+);
 
 #[cfg(test)]
 mod tests {

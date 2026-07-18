@@ -27,6 +27,7 @@
 | [ADR-0030](ADR-0030-streaming-content-similarity.md) | Similitud de contenido streaming y linaje candidato (M0.3) | Aceptada |
 | [ADR-0031](ADR-0031-content-intelligence-isolated-derived-artifacts.md) | Inteligencia documental, workers aislados y artefactos derivados (M0.4) | Aceptada |
 | [ADR-0032](ADR-0032-bounded-media-intelligence.md) | Inteligencia multimedia acotada y solo-revisión (M0.5) | Aceptada |
+| [ADR-0033](ADR-0033-plugin-ecosystem-integration.md) | Ecosistema de plugins: registro persistido y runs sellados (M0.6) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).

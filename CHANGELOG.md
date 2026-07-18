@@ -5,6 +5,37 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.6 — Plugin Ecosystem (implementación local)
+
+#### Añadido
+
+- Migración append-only `0017_plugin_ecosystem.sql`: registros firmados de
+  componentes (manifiesto, SHA-256, bytes, clave y firma Ed25519), runs
+  direccionados por configuración y findings inmutables validados por
+  triggers al sellar (ADR-0033).
+- Orquestación de proyecto en `df-plugin`: todo lo leído del almacén se
+  re-verifica (firma, hash, manifiesto, ABI, compilación) antes de
+  ejecutarse; sujetos = contenidos únicos del snapshot analizado, paginados
+  y acotados por `max_subjects` con sondeo del sujeto extra; trap, límite o
+  salida malformada cuentan como sujeto fallido visible.
+- Política de capacidades del operador: la fachada concede
+  `SubjectMetadata` por defecto y reserva `SubjectText` a `--grant-text`;
+  el host no concede nada por sí mismo.
+- Fachada (`register_plugin`, `list_plugins`, `run_plugins`,
+  `plugin_report`) y CLI (`plugin register|list|run`, `report plugins`).
+  Eventos `PLUGIN_REGISTERED`, `PLUGIN_RUN_STARTED` y
+  `PLUGIN_RUN_COMPLETED` en el ledger.
+- E2E real: el ejemplo firmado `metadata-reporter` se registra, ejecuta
+  sobre 2 sujetos, produce 2 findings INFO sellados y se reutiliza por
+  digest; un componente manipulado tras la firma se rechaza sin almacenar.
+
+#### Límites
+
+- Los findings son afirmaciones del plugin ligadas a su identidad firmada;
+  nunca autorizan una operación. `SubjectText` es concedible pero aún no se
+  puebla desde las representaciones M0.4; la revocación de registros queda
+  como decisión futura append-only.
+
 ### Milestone 0.5 — Media Intelligence (implementación local)
 
 #### Añadido
