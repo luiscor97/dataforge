@@ -86,18 +86,31 @@ pub fn hash_project(
     repository::update_project_state(db, ProjectState::Hashing, actor)?;
     inventory::enqueue_hash_jobs(db, snapshot.id, actor)?;
 
+    // One read buffer for the whole run, and one transaction per batch:
+    // per-file commits are what made large runs crawl, and the persistent
+    // queue keeps a crash safe — uncommitted results stay PENDING and are
+    // recomputed on resume.
+    let mut buffer = vec![0u8; options.read_buffer_bytes];
     let mut cancelled = false;
-    'runs: loop {
+    loop {
         let jobs = inventory::pending_hash_jobs(db, snapshot.id, options.job_batch)?;
         if jobs.is_empty() {
             break;
         }
-        for job in jobs {
+        let mut results = Vec::with_capacity(jobs.len());
+        for job in &jobs {
             if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 cancelled = true;
-                break 'runs;
+                break;
             }
-            process_job(db, &job, options)?;
+            results.push(inventory::HashJobResult {
+                job,
+                outcome: hash_one(job, &mut buffer),
+            });
+        }
+        inventory::record_hash_results(db, &results)?;
+        if cancelled {
+            break;
         }
     }
 
@@ -121,8 +134,11 @@ pub fn hash_project(
     })
 }
 
-/// Hash one file; only infrastructure (database) errors propagate.
-fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfResult<()> {
+/// Hash one file without touching the database; every per-file problem
+/// becomes a job outcome, never an error.
+fn hash_one(job: &PendingHashJob, buffer: &mut [u8]) -> inventory::HashJobOutcome {
+    use inventory::HashJobOutcome::{Closed, Hashed};
+
     let relative = job
         .raw_relative_path
         .as_ref()
@@ -133,12 +149,10 @@ fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfRe
     let pre = match current_fingerprint(&path) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
-            return inventory::record_hash_failure(
-                db,
-                job.job_id,
-                HashState::Failed,
-                &format!("cannot stat `{}`: {error}", path.display()),
-            );
+            return Closed {
+                state: HashState::Failed,
+                error: format!("cannot stat `{}`: {error}", path.display()),
+            };
         }
     };
     // Parsed comparison, never a string compare: a v1 token stored by an
@@ -148,32 +162,26 @@ fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfRe
     let stored = match FileFingerprint::parse(&job.fingerprint) {
         Ok(stored) => stored,
         Err(error) => {
-            return inventory::record_hash_failure(
-                db,
-                job.job_id,
-                HashState::Failed,
-                &format!("unreadable stored fingerprint: {error}"),
-            );
+            return Closed {
+                state: HashState::Failed,
+                error: format!("unreadable stored fingerprint: {error}"),
+            };
         }
     };
     if FileFingerprint::compare(&stored, &pre).is_changed() {
-        return inventory::record_hash_failure(
-            db,
-            job.job_id,
-            HashState::SourceChanged,
-            "file changed between scan and hash (RFC-0001 §14.5)",
-        );
+        return Closed {
+            state: HashState::SourceChanged,
+            error: "file changed between scan and hash (RFC-0001 §14.5)".to_string(),
+        };
     }
 
-    let digests = match stream_digests(&path, options.read_buffer_bytes) {
+    let digests = match stream_digests(&path, buffer) {
         Ok(digests) => digests,
         Err(error) => {
-            return inventory::record_hash_failure(
-                db,
-                job.job_id,
-                HashState::Failed,
-                &format!("cannot read `{}`: {error}", path.display()),
-            );
+            return Closed {
+                state: HashState::Failed,
+                error: format!("cannot read `{}`: {error}", path.display()),
+            };
         }
     };
 
@@ -181,17 +189,17 @@ fn process_job(db: &mut Db, job: &PendingHashJob, options: &HashOptions) -> DfRe
     match current_fingerprint(&path) {
         Ok(post) if !FileFingerprint::compare(&pre, &post).is_changed() => {}
         Ok(_) | Err(_) => {
-            return inventory::record_hash_failure(
-                db,
-                job.job_id,
-                HashState::SourceChanged,
-                "file changed while hashing (RFC-0001 §14.5)",
-            );
+            return Closed {
+                state: HashState::SourceChanged,
+                error: "file changed while hashing (RFC-0001 §14.5)".to_string(),
+            };
         }
     }
 
-    inventory::record_hash_success(db, job, &digests.sha256, &digests.blake3)?;
-    Ok(())
+    Hashed {
+        sha256: digests.sha256,
+        blake3: digests.blake3,
+    }
 }
 
 struct Digests {
@@ -200,13 +208,12 @@ struct Digests {
 }
 
 /// One streaming pass computing both digests (RFC-0001 ADR-0007).
-fn stream_digests(path: &Path, buffer_bytes: usize) -> std::io::Result<Digests> {
+fn stream_digests(path: &Path, buffer: &mut [u8]) -> std::io::Result<Digests> {
     let mut file = std::fs::File::open(path)?;
     let mut sha = sha2::Sha256::new();
     let mut blake = blake3::Hasher::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -304,7 +311,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vector.bin");
         std::fs::write(&path, b"abc").unwrap();
-        let digests = stream_digests(&path, 4).unwrap();
+        let digests = stream_digests(&path, &mut [0u8; 4]).unwrap();
         // FIPS 180-2 appendix B.1 test vector.
         assert_eq!(
             digests.sha256,
@@ -357,6 +364,28 @@ mod tests {
         assert_eq!(outcome.state, "HASHED");
         assert_eq!(outcome.hashed, 3);
         assert_eq!(outcome.pending, 0);
+    }
+
+    #[test]
+    fn duplicate_content_across_separate_batches_maps_to_one_content_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+
+        // One job per batch (and per transaction): the second copy of
+        // "same bytes" must find the content object committed by an
+        // earlier batch, not a row from its own transaction.
+        let options = HashOptions {
+            job_batch: 1,
+            ..HashOptions::default()
+        };
+        let outcome = hash_project(&mut db, Actor::Test, &options, None).unwrap();
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.failed, 0);
+
+        let snapshot_id = outcome.snapshot_id.parse().unwrap();
+        let sets = exact_duplicates(&db, snapshot_id).unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].occurrences.len(), 2);
     }
 
     #[test]

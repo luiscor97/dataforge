@@ -641,21 +641,62 @@ pub fn pending_hash_jobs(
     rows.into_iter().collect()
 }
 
-/// Record a successful hash: bind the occurrence to its (possibly already
-/// known) content object and close the job — one tx.
-pub fn record_hash_success(
-    db: &mut Db,
+/// Outcome of hashing one queued job, computed before touching the
+/// database.
+#[derive(Debug)]
+pub enum HashJobOutcome {
+    /// Both digests computed with the fingerprint stable around the read.
+    Hashed { sha256: String, blake3: String },
+    /// The job closes without digests: `FAILED` or `SOURCE_CHANGED`.
+    Closed { state: HashState, error: String },
+}
+
+/// One queued job together with its computed outcome.
+#[derive(Debug)]
+pub struct HashJobResult<'a> {
+    pub job: &'a PendingHashJob,
+    pub outcome: HashJobOutcome,
+}
+
+/// Persist a batch of hash results — one transaction for the whole batch.
+///
+/// Per-file commits are what made large runs crawl, and the queue makes
+/// them unnecessary: results not yet committed simply stay `PENDING` and
+/// are recomputed on resume (RFC-0001 §14, rule 13). Job failures are data,
+/// not errors; a batch aborts only on infrastructure failures, including a
+/// stored-content size conflict, which signals a corrupted inventory rather
+/// than a bad file.
+pub fn record_hash_results(db: &mut Db, results: &[HashJobResult<'_>]) -> DfResult<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for result in results {
+        match &result.outcome {
+            HashJobOutcome::Hashed { sha256, blake3 } => {
+                apply_hash_success(&tx, result.job, sha256, blake3)?;
+            }
+            HashJobOutcome::Closed { state, error } => {
+                apply_hash_closure(&tx, result.job.job_id, *state, error)?;
+            }
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Bind one occurrence to its (possibly already known) content object and
+/// close the job inside the batch transaction.
+fn apply_hash_success(
+    tx: &Transaction<'_>,
     job: &PendingHashJob,
     sha256: &str,
     blake3: &str,
 ) -> DfResult<ContentId> {
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
     let existing: Option<(String, i64)> = tx
-        .query_row(
-            "SELECT id, size_bytes FROM content_objects WHERE sha256 = ?1",
-            [sha256],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .prepare_cached("SELECT id, size_bytes FROM content_objects WHERE sha256 = ?1")
+        .map_err(db_err)?
+        .query_row([sha256], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()
         .map_err(db_err)?;
 
@@ -680,53 +721,54 @@ pub fn record_hash_success(
                 first_seen_snapshot: job.snapshot_id,
                 hash_state: HashState::Hashed,
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO content_objects
                     (id, size_bytes, sha256, blake3, mime_type,
                      first_seen_snapshot, hash_state, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    content.id.to_string(),
-                    content.size_bytes as i64,
-                    content.sha256,
-                    content.blake3,
-                    content.mime_type,
-                    content.first_seen_snapshot.to_string(),
-                    content.hash_state.as_str(),
-                    to_stored_timestamp(chrono::Utc::now()),
-                ],
             )
+            .map_err(db_err)?
+            .execute(params![
+                content.id.to_string(),
+                content.size_bytes as i64,
+                content.sha256,
+                content.blake3,
+                content.mime_type,
+                content.first_seen_snapshot.to_string(),
+                content.hash_state.as_str(),
+                to_stored_timestamp(chrono::Utc::now()),
+            ])
             .map_err(db_err)?;
             content.id
         }
     };
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO occurrence_content (occurrence_id, content_id, created_at)
          VALUES (?1, ?2, ?3)",
-        params![
-            job.occurrence_id.to_string(),
-            content_id.to_string(),
-            to_stored_timestamp(chrono::Utc::now()),
-        ],
     )
+    .map_err(db_err)?
+    .execute(params![
+        job.occurrence_id.to_string(),
+        content_id.to_string(),
+        to_stored_timestamp(chrono::Utc::now()),
+    ])
     .map_err(db_err)?;
-    tx.execute(
-        "UPDATE hash_jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        params![
+    tx.prepare_cached("UPDATE hash_jobs SET status = ?1, updated_at = ?2 WHERE id = ?3")
+        .map_err(db_err)?
+        .execute(params![
             HashState::Hashed.as_str(),
             to_stored_timestamp(chrono::Utc::now()),
             job.job_id.to_string(),
-        ],
-    )
-    .map_err(db_err)?;
-    tx.commit().map_err(db_err)?;
+        ])
+        .map_err(db_err)?;
     Ok(content_id)
 }
 
-/// Close a job as `FAILED` or `SOURCE_CHANGED` with its error text.
-pub fn record_hash_failure(
-    db: &mut Db,
+/// Close a job as `FAILED` or `SOURCE_CHANGED` inside the batch
+/// transaction.
+fn apply_hash_closure(
+    tx: &Transaction<'_>,
     job_id: HashJobId,
     state: HashState,
     error: &str,
@@ -736,17 +778,17 @@ pub fn record_hash_failure(
             "hash failures must be FAILED or SOURCE_CHANGED".to_string(),
         ));
     }
-    db.conn()
-        .execute(
-            "UPDATE hash_jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
-            params![
-                state.as_str(),
-                error,
-                to_stored_timestamp(chrono::Utc::now()),
-                job_id.to_string(),
-            ],
-        )
-        .map_err(db_err)?;
+    tx.prepare_cached(
+        "UPDATE hash_jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+    )
+    .map_err(db_err)?
+    .execute(params![
+        state.as_str(),
+        error,
+        to_stored_timestamp(chrono::Utc::now()),
+        job_id.to_string(),
+    ])
+    .map_err(db_err)?;
     Ok(())
 }
 

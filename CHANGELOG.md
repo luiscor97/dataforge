@@ -5,6 +5,30 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Rendimiento y robustez del motor (transversal)
+
+#### Cambiado
+
+- La base de proyecto se abre en modo WAL con `synchronous=FULL`,
+  `trusted_schema=off` (el modelo de amenazas asume un `.sqlite` que pudo
+  manipular un atacante) y `busy_timeout` de 5 s para que CLI y escritorio
+  sobre el mismo proyecto esperen en vez de fallar con BUSY. Un commit sigue
+  siendo durable al volver; en memoria y en sistemas de archivos sin WAL todo
+  sigue funcionando con el journal previo.
+- El hash persiste por lotes: una transacción por tanda de trabajos en lugar
+  de un commit (y sus fsync) por archivo. La cola persistente ya hacía esto
+  seguro — un corte pierde como mucho los resultados no confirmados, que se
+  recalculan al reanudar (§14, regla 13). Los fallos por archivo siguen
+  siendo datos del trabajo, nunca abortan la tanda.
+- Migración `0015_hash_queue_index.sql`: índice que cubre filtro y orden de
+  `pending_hash_jobs`; antes cada tanda reordenaba todos los PENDING
+  restantes (trabajo cuadrático en runs grandes). El buffer de lectura se
+  reserva una vez por run, no por archivo.
+- Evidencia medida con el corpus sintético en release: la fase de hash pasa
+  de 4,24 ms/archivo (run de 100 000) a 0,17 ms/archivo (20 000 archivos en
+  3,4 s), ~25×; el pipeline completo de 20 000 archivos termina en 107 s con
+  veredicto `COMPLETED` y ledger válido.
+
 ### Milestone 0.4 — Content Intelligence (implementación local)
 
 #### Añadido
