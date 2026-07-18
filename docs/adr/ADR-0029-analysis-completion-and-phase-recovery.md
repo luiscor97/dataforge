@@ -23,12 +23,13 @@ hayan terminado las etapas estructurales posteriores.
    (migración `0010_structural_review.sql`) guarda `snapshot_id`, proyecto,
    perfil y resumen canónico después de completar duplicados, firmas,
    contextos, relaciones, representantes, reglas y anomalías. Es append-only y
-   tiene una única fila por snapshot.
+   tiene una única fila por `(snapshot, versión de análisis)`; los consumidores
+   exigen la versión actual.
 
 2. **El evento final se emite una sola vez.** Insertar por primera vez el
    marcador añade `STRUCTURAL_ANALYSIS_COMPLETED` en la misma transacción. Un
-   reintento usa `INSERT OR IGNORE`, conserva la primera evidencia y no añade
-   otro evento final.
+   reintento usa `ON CONFLICT DO NOTHING`, compara proyecto, versión, perfil,
+   digest y resumen con la fila existente, y no añade otro evento final.
 
 3. **Los informes fallan cerrados.** Los informes del último snapshot completo
    solo se exponen cuando existe su marcador y el proyecto está en un estado
@@ -37,10 +38,17 @@ hayan terminado las etapas estructurales posteriores.
    vacío válido.
 
 4. **`analyze` se reanuda desde `ANALYZING`.** Desde `HASHED` realiza una sola
-   transición inicial; desde `ANALYZING` no la repite. Las etapas derivadas se
-   reejecutan de forma idempotente. Las evidencias automáticas nuevas usan ids
-   estables e inserciones ignorando duplicados; las decisiones humanas viven
-   aparte y no se borran.
+   transición inicial; desde `ANALYZING` no la repite. Si todavía no existe el
+   marcador final, las etapas derivadas se reejecutan de forma idempotente. Si
+   el marcador ya fue confirmado pero la caída ocurrió antes de
+   `ANALYZING → ANALYZED`, no se reescribe ninguna tabla sellada: se validan
+   proyecto, snapshot, versión, perfil y digest, se contrasta el resumen
+   canónico con consultas sobre la evidencia inmutable, se reconstruye de él
+   el mismo resultado público y se completa únicamente la transición que
+   falta. Una incoherencia falla cerrada. Para marcadores v1 anteriores al
+   campo `candidate_cap_reached`, la recuperación acepta el booleano histórico
+   `pairs_skipped` como alias de compatibilidad; todo marcador nuevo persiste y
+   sella únicamente el nombre vigente.
 
 5. **`plan create` se reanuda desde `PLANNING`.** Si todavía no hay plan,
    genera el siguiente normalmente. Si una caída dejó un plan `READY` del
@@ -62,6 +70,34 @@ hayan terminado las etapas estructurales posteriores.
    política reintentada o un manifiesto/hash incoherente producen error de
    conflicto. Recuperar significa continuar evidencia demostrable, no fabricar
    una historia plausible.
+
+8. **El marcador sella la evidencia automática.** La migración
+   `0011_derived_evidence_seal.sql` impide `INSERT`, `UPDATE` y `DELETE` para el
+   snapshot completado en `duplicate_sets`, `folder_signatures`,
+   `tree_clone_sets`, `folder_contexts`, `tree_relations` y
+   `duplicate_representatives`. `0010` ya aplica el mismo principio a reglas,
+   anomalías e ítems de revisión. Los triggers comprueban tanto `OLD` como
+   `NEW` al actualizar, por lo que tampoco se puede mover evidencia hacia o
+   desde un snapshot sellado. `review_decisions` queda deliberadamente fuera:
+   es el flujo humano append-only posterior al análisis.
+
+9. **Una versión nueva exige un snapshot nuevo.** Las tablas estructurales
+   selladas no llevan versión por fila y su significado histórico no se
+   reinterpreta. Si aumenta `ANALYSIS_VERSION`, un snapshot que ya tenga un
+   marcador de otra versión no se recalcula ni se migra en sitio: el operador
+   debe crear un proyecto nuevo sobre las mismas fuentes mediante el flujo
+   soportado de creación y ejecutar allí `scan → hash → analyze`, obteniendo un
+   snapshot nuevo con el contrato vigente. El estado `ANALYZED` del proyecto
+   sellado no admite volver directamente a `scan`.
+
+10. **El cierre de ejecución es atómico y recupera el formato anterior.** Un
+    proyecto que quedó en `EXECUTING` puede reanudar sus operaciones `RUNNING`
+    bajo el modelo local de un solo escritor. El hito
+    `EXECUTION_COMPLETED`/`EXECUTION_PAUSED`, el estado final del proyecto y su
+    evento `STATE_CHANGED` se confirman en una sola transacción. Si una versión
+    anterior cayó después de grabar el hito pero antes de cambiar el estado,
+    un reintento sin trabajo nuevo reutiliza solo el último hito del mismo plan;
+    cualquier reintento que sí ejecute una operación registra un hito nuevo.
 
 ## Alternativas consideradas
 
@@ -85,6 +121,12 @@ hayan terminado las etapas estructurales posteriores.
   versión de plan ni otra aprobación por el mismo trabajo ya confirmado.
 - Un informe vacío significa «análisis completo sin hallazgos», no «la fase no
   llegó a ejecutarse».
+- El resumen final no puede divergir de las tablas derivadas por una repetición
+  tardía ni por escritura SQLite directa; un snapshot nuevo sigue abierto hasta
+  recibir su propio marcador.
+- La actualización del algoritmo de análisis conserva los snapshots sellados:
+  incrementar `ANALYSIS_VERSION` implica un proyecto/snapshot nuevo mediante
+  el flujo soportado, no reescribir evidencia histórica.
 - El ledger conserva los reintentos de etapas, pero los hitos únicos
   (`STRUCTURAL_ANALYSIS_COMPLETED`, `PLAN_CREATED` reutilizado y
   `PLAN_APPROVED`) no se duplican en las ventanas cubiertas.
@@ -92,4 +134,5 @@ hayan terminado las etapas estructurales posteriores.
   escritores compitiendo sobre el mismo proyecto; SQLite sigue siendo la
   autoridad transaccional local.
 - Condición de revisión: toda nueva etapa añadida a `analyze` debe ejecutarse
-  antes del marcador y demostrar que su reintento no borra decisiones humanas.
+  antes del marcador, añadir su tabla automática al sellado y demostrar que su
+  reintento no borra decisiones humanas.

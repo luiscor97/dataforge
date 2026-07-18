@@ -1,0 +1,43 @@
+[package]
+name = "df-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-domain.workspace = true
+df-db.workspace = true
+df-error.workspace = true
+df-fs-safety.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+hex.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+html2text.workspace = true
+mail-parser.workspace = true
+encoding_rs.workspace = true
+unicode-normalization.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The main process applies an OS-enforced Job Object before sending any PDF
+# bytes to the isolated parser process.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+df-scan.workspace = true
+df-hash.workspace = true
+df-planner.workspace = true

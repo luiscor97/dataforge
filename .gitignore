@@ -27,3 +27,6 @@ Desktop.ini
 
 # Test artifacts
 *.profraw
+
+# Generated synthetic corpora (regenerable from seed; never versioned)
+fixtures/generated-large/

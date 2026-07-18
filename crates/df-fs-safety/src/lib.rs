@@ -98,6 +98,88 @@ impl From<FsSafetyError> for df_error::DfError {
 
 pub type FsResult<T> = Result<T, FsSafetyError>;
 
+/// The exact path string handed to the operating system, extended-length
+/// prefixed when it needs to be.
+///
+/// Win32 rejects paths at `MAX_PATH` (260) — 248 for directory creation —
+/// unless they carry the `\\?\` verbatim prefix. The scanner and hasher
+/// already extend their source paths, but the write path did not: at scale,
+/// the partial file name pushed ~98% of copies of a deep corpus over the
+/// limit and every one failed with `ERROR_PATH_NOT_FOUND`. The prefix is
+/// applied to the **final composed string** at each syscall site — never to
+/// an intermediate — because the limit is a property of what actually
+/// reaches the API.
+///
+/// The prefix is only valid on absolute drive paths without `.`/`..`
+/// (guaranteed here: roots are absolutized and relatives are validated).
+/// UNC (`\\server\…`) is left untouched: it needs the `\\?\UNC\` form and
+/// network roots are not a supported target yet.
+pub fn extended_for_io(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        // Headroom below both limits (260 files / 248 directories).
+        const THRESHOLD: usize = 240;
+        let os = path.as_os_str();
+        if os.len() >= THRESHOLD && path.is_absolute() {
+            let text = os.to_string_lossy();
+            if !text.starts_with(r"\\") {
+                // Build via OsString so a non-Unicode path is not corrupted.
+                let mut extended = OsString::from(r"\\?\");
+                extended.push(os);
+                return std::borrow::Cow::Owned(PathBuf::from(extended));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+const MAX_WINDOWS_COMPONENT_UTF16: usize = 255;
+
+/// Build the deterministic `~df-<hash>` collision name within the portable
+/// Windows component limit.
+///
+/// `file_name` is expected to be an already validated destination component.
+/// The stem is shortened by UTF-16 units only when necessary; the extension is
+/// preserved in full whenever it and the marker fit. A Unicode scalar is never
+/// split, so supplementary characters remain valid surrogate pairs on disk.
+pub fn deterministic_collision_file_name(file_name: &str, sha256: &str) -> String {
+    let tag = &sha256[..8.min(sha256.len())];
+    let marker = format!("~df-{tag}");
+    match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => {
+            let fixed_units = marker.encode_utf16().count() + 1 + extension.encode_utf16().count();
+            if fixed_units <= MAX_WINDOWS_COMPONENT_UTF16 {
+                let stem = truncate_to_utf16_units(stem, MAX_WINDOWS_COMPONENT_UTF16 - fixed_units);
+                return format!("{stem}{marker}.{extension}");
+            }
+        }
+        _ => {}
+    }
+
+    let file_name = truncate_to_utf16_units(
+        file_name,
+        MAX_WINDOWS_COMPONENT_UTF16 - marker.encode_utf16().count(),
+    );
+    format!("{file_name}{marker}")
+}
+
+/// Keep a UTF-8 string prefix that occupies at most `max_units` UTF-16 code
+/// units. Iterating by `char` means a surrogate pair is never split.
+fn truncate_to_utf16_units(value: &str, max_units: usize) -> String {
+    let mut units = 0;
+    value
+        .chars()
+        .take_while(|character| {
+            let next = units + character.len_utf16();
+            if next > max_units {
+                return false;
+            }
+            units = next;
+            true
+        })
+        .collect()
+}
+
 /// Physical identity of a filesystem object.
 ///
 /// On Windows this is `(volume serial, file index)` from
@@ -349,7 +431,7 @@ impl SafeOutputRoot {
         let mut current = self.path.clone();
         for component in relative.components() {
             current.push(component);
-            let metadata = match std::fs::symlink_metadata(&current) {
+            let metadata = match std::fs::symlink_metadata(extended_for_io(&current)) {
                 Ok(metadata) => metadata,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     out.push(ComponentInfo {
@@ -414,6 +496,33 @@ impl SafeOutputRoot {
         })
     }
 
+    /// Hold a strong, no-delete lease on every path component and a
+    /// no-write/no-delete read handle on the final regular file.
+    ///
+    /// Consumers may hash the returned handle and then let another library
+    /// reopen the same path for reading while this lease remains alive. On
+    /// Windows the sharing modes prevent replacing or modifying the object in
+    /// between those operations.
+    pub fn lease_existing_file(&self, relative: &SafeRelativePath) -> FsResult<ReadLease> {
+        self.revalidate()?;
+        platform::lease_existing(&self.path, relative, false, false)
+    }
+
+    /// Pin a regular operational file while allowing cooperating processes to
+    /// reopen it for read/write. Delete and rename remain denied. This narrow
+    /// variant is intended for library lockfiles, never evidence payloads.
+    pub fn lease_existing_mutable_file(&self, relative: &SafeRelativePath) -> FsResult<ReadLease> {
+        self.revalidate()?;
+        platform::lease_existing(&self.path, relative, false, true)
+    }
+
+    /// Hold a strong no-delete lease on an existing plain directory and all
+    /// of its ancestors below the authorised output root.
+    pub fn lease_existing_directory(&self, relative: &SafeRelativePath) -> FsResult<ReadLease> {
+        self.revalidate()?;
+        platform::lease_existing(&self.path, relative, true, false)
+    }
+
     /// Create a directory (and its missing parents) checking every step.
     ///
     /// Unlike `create_dir_all`, this refuses to walk through a component that
@@ -424,7 +533,7 @@ impl SafeOutputRoot {
         let mut current = self.path.clone();
         for component in relative.components() {
             current.push(component);
-            match std::fs::symlink_metadata(&current) {
+            match std::fs::symlink_metadata(extended_for_io(&current)) {
                 Ok(metadata) => {
                     if metadata_is_reparse_point(&metadata) {
                         return Err(FsSafetyError::ReparsePoint { path: current });
@@ -437,12 +546,12 @@ impl SafeOutputRoot {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    match std::fs::create_dir(&current) {
+                    match std::fs::create_dir(extended_for_io(&current)) {
                         Ok(()) => {}
                         // Someone else created it in the meantime: accept it
                         // only if it is a plain directory.
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            let metadata = std::fs::symlink_metadata(&current)
+                            let metadata = std::fs::symlink_metadata(extended_for_io(&current))
                                 .map_err(|e| FsSafetyError::io(&current, e))?;
                             if metadata_is_reparse_point(&metadata) {
                                 return Err(FsSafetyError::ReparsePoint { path: current });
@@ -467,12 +576,54 @@ impl SafeOutputRoot {
     pub fn create_partial_secure(&self, partial: &SafeRelativePath) -> FsResult<std::fs::File> {
         self.revalidate()?;
         let destination = self.resolve_destination_without_following_links(partial)?;
-        // create_new: never reuse or truncate an existing partial.
+        // create_new: never reuse or truncate an existing partial. The partial
+        // component holds two UUIDs (~92 chars), so this is the syscall
+        // most likely to cross MAX_PATH: extend the exact final string.
         std::fs::OpenOptions::new()
+            // Derived-artifact builders hash the exact claimed handle before
+            // finalization; opening read+write avoids a path reopen/TOCTOU.
+            .read(true)
             .write(true)
             .create_new(true)
-            .open(destination.absolute())
-            .map_err(|e| FsSafetyError::io(destination.absolute(), e))
+            .open(extended_for_io(destination.absolute()))
+            .map_err(|error| FsSafetyError::io(destination.absolute(), error))
+    }
+
+    /// Remove a partial covered by a durable executor lease.
+    ///
+    /// The caller must first prove ownership from its journal; a matching file
+    /// name alone is never authority to delete. This boundary then revalidates
+    /// the output root, refuses every reparse point and only removes a regular
+    /// file. A missing leased partial is a successful no-op: the prior attempt
+    /// may have crashed before creating it or after finalizing it.
+    pub fn remove_leased_partial_secure(
+        &self,
+        partial: &SafeRelativePath,
+        expected_identity: FileIdentity,
+    ) -> FsResult<bool> {
+        let destination = self.resolve_destination_without_following_links(partial)?;
+        platform::remove_regular_file_if_identity_matches(destination.absolute(), expected_identity)
+    }
+
+    /// Atomically finalize the exact partial object claimed by the executor.
+    ///
+    /// The platform implementation opens the partial with rename access,
+    /// validates its physical identity on that handle, and performs a
+    /// no-replace rename through the same handle. There is no path-based
+    /// check/rename window in which a foreign file could be substituted.
+    pub fn finalize_claimed_partial_no_replace(
+        &self,
+        partial: &SafeRelativePath,
+        destination: &SafeRelativePath,
+        expected_identity: FileIdentity,
+    ) -> FsResult<()> {
+        let partial = self.resolve_destination_without_following_links(partial)?;
+        let destination = self.resolve_destination_without_following_links(destination)?;
+        platform::finalize_file_if_identity_matches(
+            partial.absolute(),
+            destination.absolute(),
+            expected_identity,
+        )
     }
 }
 
@@ -481,6 +632,39 @@ impl SafeOutputRoot {
 pub struct SecureDestination {
     absolute: PathBuf,
     relative: SafeRelativePath,
+}
+
+/// Live filesystem lease preventing a verified object (and its path
+/// components) from being swapped while a derived artifact is consumed.
+pub struct ReadLease {
+    path: PathBuf,
+    target: std::fs::File,
+    _ancestors: Vec<std::fs::File>,
+    identity: FileIdentity,
+}
+
+impl std::fmt::Debug for ReadLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadLease")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReadLease {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file(&self) -> &std::fs::File {
+        &self.target
+    }
+
+    pub fn identity(&self) -> FileIdentity {
+        self.identity
+    }
 }
 
 impl SecureDestination {
@@ -530,7 +714,7 @@ pub fn metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
 
 /// Is this path a reparse point? Never follows it.
 pub fn is_reparse_point(path: &Path) -> FsResult<bool> {
-    match std::fs::symlink_metadata(path) {
+    match std::fs::symlink_metadata(extended_for_io(path)) {
         Ok(metadata) => Ok(metadata_is_reparse_point(&metadata)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(FsSafetyError::io(path, e)),
@@ -640,6 +824,18 @@ pub fn identity_of(path: &Path) -> FsResult<Option<FileIdentity>> {
     platform::identity_of(path)
 }
 
+/// Physical identity of an already-open file.
+///
+/// This is the ownership primitive for executor partials: the identity is
+/// captured from the exact handle returned by `create_new`, never by reopening
+/// a path that another process could have replaced in between.
+pub fn identity_of_open_file(
+    file: &std::fs::File,
+    context_path: &Path,
+) -> FsResult<Option<FileIdentity>> {
+    platform::identity_of_open_file(file, context_path)
+}
+
 fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     platform::metadata_is_reparse_point(metadata)
 }
@@ -649,17 +845,19 @@ fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
 mod platform {
-    use super::{FileIdentity, FsResult, FsSafetyError};
+    use super::{FileIdentity, FsResult, FsSafetyError, ReadLease, SafeRelativePath};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HANDLE};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        MOVEFILE_WRITE_THROUGH,
+        FileDispositionInfo, FileRenameInfo, GetFileInformationByHandle, MoveFileExW,
+        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, MOVEFILE_WRITE_THROUGH,
     };
 
     pub(super) fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
@@ -678,7 +876,192 @@ mod platform {
         std::fs::OpenOptions::new()
             .access_mode(0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
+            .open(super::extended_for_io(path))
+    }
+
+    fn file_information(file: &std::fs::File) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` owns a live handle for the duration of the call and
+        // `info` is a properly sized, zeroed output struct.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(info)
+        }
+    }
+
+    fn identity_from_information(info: &BY_HANDLE_FILE_INFORMATION) -> Option<FileIdentity> {
+        let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+        (file_index != 0).then_some(FileIdentity {
+            volume_serial: info.dwVolumeSerialNumber as u64,
+            file_index,
+        })
+    }
+
+    fn require_regular_identity(
+        path: &Path,
+        info: &BY_HANDLE_FILE_INFORMATION,
+        expected: FileIdentity,
+    ) -> FsResult<()> {
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FsSafetyError::ReparsePoint {
+                path: path.to_path_buf(),
+            });
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "leased partial exists but is not a regular file".to_string(),
+            });
+        }
+        if identity_from_information(info) != Some(expected) {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "leased partial physical identity no longer matches its durable claim"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn open_directory_guard(path: &Path) -> FsResult<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            // Refuse FILE_SHARE_DELETE: the component cannot be renamed or
+            // replaced while the handle lives. Writes inside the directory
+            // remain possible for a builder holding its own unique path.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(super::extended_for_io(path))
+            .map_err(|error| FsSafetyError::io(path, error))?;
+        let info = file_information(&file).map_err(|error| FsSafetyError::io(path, error))?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FsSafetyError::ReparsePoint {
+                path: path.to_path_buf(),
+            });
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "leased path component is not a directory".to_string(),
+            });
+        }
+        if identity_from_information(&info).is_none() {
+            return Err(FsSafetyError::InvalidRootPath {
+                path: path.to_path_buf(),
+                reason: "filesystem did not provide a strong directory identity".to_string(),
+            });
+        }
+        Ok(file)
+    }
+
+    fn open_regular_read_guard(path: &Path) -> FsResult<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            // Other readers (Tantivy/DataFusion) may reopen the path, but no
+            // writer/deleter can obtain a conflicting handle until we finish.
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(super::extended_for_io(path))
+            .map_err(|error| FsSafetyError::io(path, error))?;
+        let info = file_information(&file).map_err(|error| FsSafetyError::io(path, error))?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FsSafetyError::ReparsePoint {
+                path: path.to_path_buf(),
+            });
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "leased artifact is not a regular file".to_string(),
+            });
+        }
+        if identity_from_information(&info).is_none() {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "filesystem did not provide a strong file identity".to_string(),
+            });
+        }
+        Ok(file)
+    }
+
+    fn open_mutable_file_guard(path: &Path) -> FsResult<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            // Tantivy may reopen its lockfile for write; neither side may
+            // delete/rename it while the artifact reader is alive.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(super::extended_for_io(path))
+            .map_err(|error| FsSafetyError::io(path, error))?;
+        let info = file_information(&file).map_err(|error| FsSafetyError::io(path, error))?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FsSafetyError::ReparsePoint {
+                path: path.to_path_buf(),
+            });
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "leased operational object is not a regular file".to_string(),
+            });
+        }
+        if identity_from_information(&info).is_none() {
+            return Err(FsSafetyError::InvalidRelativePath {
+                path: path.to_path_buf(),
+                reason: "leased operational file has no strong physical identity".to_string(),
+            });
+        }
+        Ok(file)
+    }
+
+    pub(super) fn lease_existing(
+        root: &Path,
+        relative: &SafeRelativePath,
+        target_is_directory: bool,
+        target_is_mutable: bool,
+    ) -> FsResult<ReadLease> {
+        debug_assert!(!(target_is_directory && target_is_mutable));
+        let mut ancestors = vec![open_directory_guard(root)?];
+        let mut current = root.to_path_buf();
+        let count = relative.components().len();
+        let mut target = None;
+        for (index, component) in relative.components().iter().enumerate() {
+            current.push(component);
+            let last = index + 1 == count;
+            if last && !target_is_directory {
+                target = Some(if target_is_mutable {
+                    open_mutable_file_guard(&current)?
+                } else {
+                    open_regular_read_guard(&current)?
+                });
+            } else {
+                let directory = open_directory_guard(&current)?;
+                if last {
+                    target = Some(directory);
+                } else {
+                    ancestors.push(directory);
+                }
+            }
+        }
+        let target = target.ok_or_else(|| FsSafetyError::InvalidRelativePath {
+            path: relative.to_path(),
+            reason: "leased path has no target component".to_string(),
+        })?;
+        let info = file_information(&target).map_err(|error| FsSafetyError::io(&current, error))?;
+        let identity =
+            identity_from_information(&info).ok_or_else(|| FsSafetyError::InvalidRelativePath {
+                path: current.clone(),
+                reason: "leased target has no strong physical identity".to_string(),
+            })?;
+        Ok(ReadLease {
+            path: current,
+            target,
+            _ancestors: ancestors,
+            identity,
+        })
     }
 
     pub(super) fn identity_of(path: &Path) -> FsResult<Option<FileIdentity>> {
@@ -687,23 +1070,124 @@ mod platform {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(FsSafetyError::io(path, e)),
         };
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: `file` owns a live handle for the duration of the call and
-        // `info` is a properly sized, zeroed output struct.
-        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        let info = file_information(&file).map_err(|error| FsSafetyError::io(path, error))?;
+        Ok(identity_from_information(&info))
+    }
+
+    pub(super) fn identity_of_open_file(
+        file: &std::fs::File,
+        context_path: &Path,
+    ) -> FsResult<Option<FileIdentity>> {
+        let info =
+            file_information(file).map_err(|error| FsSafetyError::io(context_path, error))?;
+        Ok(identity_from_information(&info))
+    }
+
+    pub(super) fn remove_regular_file_if_identity_matches(
+        path: &Path,
+        expected: FileIdentity,
+    ) -> FsResult<bool> {
+        // Open with DELETE access while refusing FILE_SHARE_DELETE. Once this
+        // handle is acquired the named object cannot be swapped between the
+        // identity check and handle-based disposition.
+        let file = match std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(super::extended_for_io(path))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(FsSafetyError::io(path, error)),
+        };
+        let info = file_information(&file).map_err(|error| FsSafetyError::io(path, error))?;
+        require_regular_identity(path, &info, expected)?;
+
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        // SAFETY: `file` is held open with DELETE access; the buffer and size
+        // match FileDispositionInfo. Deletion applies to this handle's object,
+        // not to a path that could have been replaced after validation.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                &disposition as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
         if ok == 0 {
-            // Some filesystems (notably certain network redirectors) do not
-            // provide file indices. That is a degraded identity, not an error.
-            return Ok(None);
+            return Err(FsSafetyError::io(path, std::io::Error::last_os_error()));
         }
-        let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
-        if file_index == 0 {
-            return Ok(None);
+        drop(file);
+        Ok(true)
+    }
+
+    pub(super) fn finalize_file_if_identity_matches(
+        partial: &Path,
+        destination: &Path,
+        expected: FileIdentity,
+    ) -> FsResult<()> {
+        // No FILE_SHARE_DELETE: once this handle is acquired, no other handle
+        // can rename/delete the object between validation and finalization.
+        let file = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(super::extended_for_io(partial))
+            .map_err(|error| FsSafetyError::io(partial, error))?;
+        let info = file_information(&file).map_err(|error| FsSafetyError::io(partial, error))?;
+        require_regular_identity(partial, &info, expected)?;
+
+        // FILE_RENAME_INFO ends in a flexible UTF-16 array. A Vec<usize>
+        // supplies sufficient alignment for the native struct and tail.
+        let destination_wide: Vec<u16> = super::extended_for_io(destination)
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        let file_name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        // FileNameLength excludes the terminator, but FILE_RENAME_INFO still
+        // requires FileName itself to be NUL-terminated.
+        let buffer_bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+            + (destination_wide.len() + 1) * std::mem::size_of::<u16>();
+        debug_assert!(buffer_bytes >= file_name_offset + (destination_wide.len() + 1) * 2);
+        let word_bytes = std::mem::size_of::<usize>();
+        let mut storage = vec![0usize; buffer_bytes.div_ceil(word_bytes)];
+        let rename = storage.as_mut_ptr() as *mut FILE_RENAME_INFO;
+        // SAFETY: `storage` is aligned and large enough for the fixed fields
+        // plus all UTF-16 units. ReplaceIfExists=false is the no-overwrite
+        // contract enforced by the kernel.
+        unsafe {
+            (*rename).Anonymous.ReplaceIfExists = 0;
+            (*rename).RootDirectory = std::ptr::null_mut();
+            (*rename).FileNameLength = (destination_wide.len() * std::mem::size_of::<u16>()) as u32;
+            std::ptr::copy_nonoverlapping(
+                destination_wide.as_ptr(),
+                std::ptr::addr_of_mut!((*rename).FileName) as *mut u16,
+                destination_wide.len(),
+            );
         }
-        Ok(Some(FileIdentity {
-            volume_serial: info.dwVolumeSerialNumber as u64,
-            file_index,
-        }))
+        // SAFETY: live DELETE-capable handle and a correctly sized/aligned
+        // FILE_RENAME_INFO buffer. The rename applies to the handle's object.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileRenameInfo,
+                rename as *const core::ffi::c_void,
+                buffer_bytes as u32,
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_ALREADY_EXISTS) | Some(ERROR_FILE_EXISTS) => {
+                    Err(FsSafetyError::DestinationExists {
+                        path: destination.to_path_buf(),
+                    })
+                }
+                _ => Err(FsSafetyError::io(destination, error)),
+            };
+        }
+        Ok(())
     }
 
     /// FILETIME (100-ns ticks since 1601-01-01) -> Unix milliseconds.
@@ -773,8 +1257,10 @@ mod platform {
     }
 
     pub(super) fn finalize_no_replace(partial: &Path, destination: &Path) -> FsResult<()> {
-        let from = to_wide(partial);
-        let to = to_wide(destination);
+        // MoveFileExW accepts \\?\ paths; extend the exact strings so a long
+        // partial or destination does not fail at the very last step.
+        let from = to_wide(&super::extended_for_io(partial));
+        let to = to_wide(&super::extended_for_io(destination));
         // No MOVEFILE_REPLACE_EXISTING: the kernel refuses if `to` exists.
         // MOVEFILE_WRITE_THROUGH asks NTFS to flush the metadata change before
         // returning (see ADR-0021 on what this does and does not guarantee).
@@ -798,7 +1284,7 @@ mod platform {
 // ---------------------------------------------------------------------------
 #[cfg(not(windows))]
 mod platform {
-    use super::{FileIdentity, FsResult, FsSafetyError};
+    use super::{FileIdentity, FsResult, FsSafetyError, ReadLease, SafeRelativePath};
     use std::path::Path;
 
     pub(super) fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
@@ -807,6 +1293,43 @@ mod platform {
 
     pub(super) fn identity_of(_path: &Path) -> FsResult<Option<FileIdentity>> {
         Ok(None)
+    }
+
+    pub(super) fn identity_of_open_file(
+        _file: &std::fs::File,
+        _context_path: &Path,
+    ) -> FsResult<Option<FileIdentity>> {
+        Ok(None)
+    }
+
+    pub(super) fn lease_existing(
+        _root: &Path,
+        _relative: &SafeRelativePath,
+        _target_is_directory: bool,
+        _target_is_mutable: bool,
+    ) -> FsResult<ReadLease> {
+        Err(FsSafetyError::UnsupportedPlatform {
+            platform: std::env::consts::OS,
+        })
+    }
+
+    pub(super) fn remove_regular_file_if_identity_matches(
+        _path: &Path,
+        _expected: FileIdentity,
+    ) -> FsResult<bool> {
+        Err(FsSafetyError::UnsupportedPlatform {
+            platform: std::env::consts::OS,
+        })
+    }
+
+    pub(super) fn finalize_file_if_identity_matches(
+        _partial: &Path,
+        _destination: &Path,
+        _expected: FileIdentity,
+    ) -> FsResult<()> {
+        Err(FsSafetyError::UnsupportedPlatform {
+            platform: std::env::consts::OS,
+        })
     }
 
     pub(super) fn finalize_no_replace(_partial: &Path, _destination: &Path) -> FsResult<()> {
@@ -860,6 +1383,52 @@ mod tests {
         assert!(SafeRelativePath::parse(Path::new("ok/informe .txt")).is_ok());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn read_lease_blocks_file_mutation_and_path_replacement() {
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("artifact.bin");
+        std::fs::write(&path, b"trusted").unwrap();
+        let root = SafeOutputRoot::validate(temp.path()).unwrap();
+        let relative = SafeRelativePath::parse(Path::new("artifact.bin")).unwrap();
+        let lease = root.lease_existing_file(&relative).unwrap();
+        let mut reader = lease.file().try_clone().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"trusted");
+        drop(reader);
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::rename(&path, temp.path().join("swapped.bin")).is_err());
+
+        drop(lease);
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mutable_lease_allows_lockfile_writes_but_blocks_replacement() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("library.lock");
+        std::fs::write(&path, b"").unwrap();
+        let root = SafeOutputRoot::validate(temp.path()).unwrap();
+        let relative = SafeRelativePath::parse(Path::new("library.lock")).unwrap();
+        let lease = root.lease_existing_mutable_file(&relative).unwrap();
+        let mut cooperating = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        cooperating.write_all(b"locked").unwrap();
+        drop(cooperating);
+        assert!(std::fs::rename(&path, temp.path().join("swapped.lock")).is_err());
+        drop(lease);
+        std::fs::rename(&path, temp.path().join("swapped.lock")).unwrap();
+    }
+
     #[test]
     fn windows_device_names_and_illegal_characters_are_rejected_everywhere() {
         for component in [
@@ -898,6 +1467,16 @@ mod tests {
         assert!(SafeRelativePath::parse(Path::new("back\\slash.txt")).is_err());
         let too_long = format!("{}.txt", "a".repeat(252));
         assert!(SafeRelativePath::parse(Path::new(&too_long)).is_err());
+    }
+
+    #[test]
+    fn collision_names_fit_utf16_without_splitting_unicode() {
+        let original = format!("{}documento.txt", "📄".repeat(121));
+        assert_eq!(original.encode_utf16().count(), 255);
+        let collision = deterministic_collision_file_name(&original, "abcdef1234567890");
+        assert!(collision.encode_utf16().count() <= 255, "{collision}");
+        assert!(collision.ends_with("~df-abcdef12.txt"), "{collision}");
+        assert!(SafeRelativePath::parse(Path::new(&collision)).is_ok());
     }
 
     #[test]
@@ -950,6 +1529,28 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let root = SafeOutputRoot::validate(tmp.path()).unwrap();
             (tmp, root)
+        }
+
+        fn create_claimed_partial(
+            root: &SafeOutputRoot,
+            relative: &SafeRelativePath,
+            bytes: &[u8],
+        ) -> FileIdentity {
+            use std::io::Write as _;
+
+            let mut handle = root.create_partial_secure(relative).unwrap();
+            let absolute = root
+                .resolve_destination_without_following_links(relative)
+                .unwrap()
+                .absolute()
+                .to_path_buf();
+            let identity = identity_of_open_file(&handle, &absolute)
+                .unwrap()
+                .expect("NTFS must expose a physical identity");
+            handle.write_all(bytes).unwrap();
+            handle.sync_all().unwrap();
+            drop(handle);
+            identity
         }
 
         #[test]
@@ -1041,6 +1642,19 @@ mod tests {
         }
 
         #[test]
+        fn identity_is_captured_from_the_exact_open_handle() {
+            let (_tmp, root) = root();
+            let path = root.path().join("created.tmp");
+            let handle = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let from_handle = identity_of_open_file(&handle, &path).unwrap().unwrap();
+            assert_eq!(identity_of(&path).unwrap(), Some(from_handle));
+        }
+
+        #[test]
         fn a_source_junction_is_rejected_and_cannot_hide_physical_overlap() {
             let tmp = tempfile::tempdir().unwrap();
             let real = tmp.path().join("real");
@@ -1097,12 +1711,224 @@ mod tests {
         }
 
         #[test]
+        fn claimed_finalize_moves_the_same_identity_when_destination_is_free() {
+            let (_tmp, root) = root();
+            let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
+            let destination = SafeRelativePath::parse(Path::new("final.txt")).unwrap();
+            let identity = create_claimed_partial(&root, &partial, b"payload");
+
+            root.finalize_claimed_partial_no_replace(&partial, &destination, identity)
+                .unwrap();
+
+            assert!(!root.path().join("claimed.tmp").exists());
+            assert_eq!(
+                std::fs::read(root.path().join("final.txt")).unwrap(),
+                b"payload"
+            );
+            assert_eq!(
+                identity_of(&root.path().join("final.txt")).unwrap(),
+                Some(identity)
+            );
+        }
+
+        #[test]
+        fn claimed_finalize_never_replaces_an_existing_destination() {
+            let (_tmp, root) = root();
+            let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
+            let destination = SafeRelativePath::parse(Path::new("final.txt")).unwrap();
+            let identity = create_claimed_partial(&root, &partial, b"new bytes");
+            std::fs::write(root.path().join("final.txt"), b"foreign destination").unwrap();
+
+            let error = root
+                .finalize_claimed_partial_no_replace(&partial, &destination, identity)
+                .unwrap_err();
+
+            assert!(
+                matches!(error, FsSafetyError::DestinationExists { .. }),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("final.txt")).unwrap(),
+                b"foreign destination"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("claimed.tmp")).unwrap(),
+                b"new bytes"
+            );
+        }
+
+        #[test]
+        fn claimed_finalize_never_moves_a_substituted_partial() {
+            let (_tmp, root) = root();
+            let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
+            let destination = SafeRelativePath::parse(Path::new("final.txt")).unwrap();
+            let claimed = create_claimed_partial(&root, &partial, b"our partial");
+            std::fs::remove_file(root.path().join("claimed.tmp")).unwrap();
+            std::fs::write(root.path().join("claimed.tmp"), b"foreign replacement").unwrap();
+
+            let error = root
+                .finalize_claimed_partial_no_replace(&partial, &destination, claimed)
+                .unwrap_err();
+
+            assert!(
+                matches!(error, FsSafetyError::InvalidRelativePath { .. }),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("claimed.tmp")).unwrap(),
+                b"foreign replacement"
+            );
+            assert!(!root.path().join("final.txt").exists());
+        }
+
+        #[test]
+        fn claimed_finalize_rejects_a_directory() {
+            let (_tmp, root) = root();
+            let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
+            let destination = SafeRelativePath::parse(Path::new("final.txt")).unwrap();
+            std::fs::create_dir(root.path().join("claimed.tmp")).unwrap();
+
+            let error = root
+                .finalize_claimed_partial_no_replace(
+                    &partial,
+                    &destination,
+                    root.identity().unwrap(),
+                )
+                .unwrap_err();
+
+            assert!(root.path().join("claimed.tmp").is_dir());
+            assert!(!root.path().join("final.txt").exists());
+            assert!(matches!(
+                error,
+                FsSafetyError::InvalidRelativePath { .. } | FsSafetyError::Io { .. }
+            ));
+        }
+
+        #[test]
+        fn claimed_finalize_rejects_a_reparse_point() {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tmp.path().join("outside");
+            let output = tmp.path().join("output");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            let root = SafeOutputRoot::validate(&output).unwrap();
+            let planted = output.join("claimed.tmp");
+            if !make_junction(&planted, &outside) {
+                eprintln!("SKIP: could not create a junction on this system");
+                return;
+            }
+            let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
+            let destination = SafeRelativePath::parse(Path::new("final.txt")).unwrap();
+
+            let error = root
+                .finalize_claimed_partial_no_replace(
+                    &partial,
+                    &destination,
+                    root.identity().unwrap(),
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, FsSafetyError::ReparsePoint { .. }));
+            assert!(metadata_is_reparse_point(
+                &std::fs::symlink_metadata(&planted).unwrap()
+            ));
+            assert!(!output.join("final.txt").exists());
+        }
+
+        #[test]
+        fn claimed_finalize_supports_extended_length_paths() {
+            let (_tmp, root) = root();
+            let deep = ["a".repeat(90), "b".repeat(90), "c".repeat(90)].join("/");
+            let directory = SafeRelativePath::parse(Path::new(&deep)).unwrap();
+            root.create_directory_secure(&directory).unwrap();
+            let partial =
+                SafeRelativePath::parse(Path::new(&format!("{deep}/claimed.tmp"))).unwrap();
+            let destination =
+                SafeRelativePath::parse(Path::new(&format!("{deep}/final.txt"))).unwrap();
+            let identity = create_claimed_partial(&root, &partial, b"long payload");
+
+            root.finalize_claimed_partial_no_replace(&partial, &destination, identity)
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read(extended_for_io(&root.path().join(destination.to_path()))).unwrap(),
+                b"long payload"
+            );
+        }
+
+        #[test]
         fn create_partial_secure_never_reuses_an_existing_file() {
             let (_tmp, root) = root();
             let rel = SafeRelativePath::parse(Path::new("p.tmp")).unwrap();
             let _first = root.create_partial_secure(&rel).unwrap();
             // A second attempt must not truncate the first.
             assert!(root.create_partial_secure(&rel).is_err());
+        }
+
+        #[test]
+        fn a_leased_regular_partial_can_be_reclaimed_but_a_directory_cannot() {
+            let (_tmp, root) = root();
+            let file = SafeRelativePath::parse(Path::new("leased.tmp")).unwrap();
+            std::fs::write(root.path().join("leased.tmp"), b"owned partial").unwrap();
+            let identity = identity_of(&root.path().join("leased.tmp"))
+                .unwrap()
+                .unwrap();
+            assert!(root.remove_leased_partial_secure(&file, identity).unwrap());
+            assert!(!root.path().join("leased.tmp").exists());
+            assert!(!root.remove_leased_partial_secure(&file, identity).unwrap());
+
+            let directory = SafeRelativePath::parse(Path::new("not-a-file.tmp")).unwrap();
+            std::fs::create_dir(root.path().join("not-a-file.tmp")).unwrap();
+            let error = root
+                .remove_leased_partial_secure(&directory, identity)
+                .unwrap_err();
+            assert!(matches!(error, FsSafetyError::InvalidRelativePath { .. }));
+            assert!(root.path().join("not-a-file.tmp").is_dir());
+        }
+
+        #[test]
+        fn a_replaced_leased_partial_is_never_removed() {
+            let (_tmp, root) = root();
+            let relative = SafeRelativePath::parse(Path::new("leased.tmp")).unwrap();
+            let path = root.path().join("leased.tmp");
+            std::fs::write(&path, b"our old partial").unwrap();
+            let claimed = identity_of(&path).unwrap().unwrap();
+
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, b"foreign replacement").unwrap();
+            let replacement = identity_of(&path).unwrap().unwrap();
+            assert_ne!(claimed, replacement, "the test must replace the object");
+
+            let error = root
+                .remove_leased_partial_secure(&relative, claimed)
+                .unwrap_err();
+            assert!(matches!(error, FsSafetyError::InvalidRelativePath { .. }));
+            assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+        }
+
+        #[test]
+        fn a_leased_partial_reparse_point_is_never_removed_or_followed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tmp.path().join("outside");
+            let output = tmp.path().join("output");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::create_dir(&output).unwrap();
+            let root = SafeOutputRoot::validate(&output).unwrap();
+            let planted = output.join("leased.tmp");
+            if !make_junction(&planted, &outside) {
+                eprintln!("SKIP: could not create a junction on this system");
+                return;
+            }
+
+            let partial = SafeRelativePath::parse(Path::new("leased.tmp")).unwrap();
+            let error = root
+                .remove_leased_partial_secure(&partial, root.identity().unwrap())
+                .unwrap_err();
+            assert!(matches!(error, FsSafetyError::ReparsePoint { .. }));
+            assert!(metadata_is_reparse_point(
+                &std::fs::symlink_metadata(&planted).unwrap()
+            ));
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         }
 
         #[test]

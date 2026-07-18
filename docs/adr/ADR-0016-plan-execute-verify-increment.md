@@ -30,6 +30,9 @@ y se registran aquí.
    colisiones conocidas (nombres que solo difieren en mayúsculas); en
    ejecución, para destinos preexistentes con hash distinto (§27.3). El
    sufijo es determinista: `~df-<8 hex del SHA-256>` antes de la extensión.
+   Planner y executor comparten el mismo constructor: si el componente
+   excedería 255 unidades UTF-16, recortan determinísticamente el stem sin
+   partir un carácter y conservan la extensión completa siempre que quepa.
    La ruta real queda registrada en `operation_results.final_relative_path`;
    el plan aprobado no se modifica.
 
@@ -46,12 +49,25 @@ y se registran aquí.
    cada destino. Evita duplicar la E/S en ejecución sin perder la
    comprobación de extremo a extremo.
 
-6. **Los parciales propios se eliminan al fallar.** La regla "el MVP no
-   borra archivos" protege datos del usuario; los `.dataforge-partial-*`
-   son artefactos creados por el propio executor en el mismo intento y
-   dejarlos rompería la invariante "no parcial" del §28.2. Es el único
-   camino de borrado del código y solo alcanza rutas generadas por
-   `partial_path()`.
+6. **Los parciales solo se eliminan con propiedad física demostrada.** La
+   regla "el MVP no borra archivos" protege datos del usuario. Cada intento
+   reserva un token aleatorio y usa
+   `.dataforge-partial-<operation-id>-<lease-token>`; tras ganar `create_new`
+   captura la identidad física desde ese mismo handle y solo entonces la
+   persiste como claim. Reanudar exige simultáneamente `RUNNING`, token e
+   identidad coincidente, además de archivo regular y ausencia de reparse
+   point. El borrado y el finalize validan y actúan sobre el mismo handle.
+   Estado, nombre o token sin identidad nunca autorizan borrar. Si el proceso
+   cae en la estrecha ventana `create_new`→claim, queda un huérfano conservador:
+   no se adjudica ni se borra automáticamente y VERIFY lo reporta como
+   `PARTIAL_LEFTOVER` para inspección/limpieza manual. El componente no repite
+   el nombre documental, que puede ocupar las 255 unidades UTF-16 de NTFS.
+
+   Si retirar un claim válido falla por I/O transitorio, el resultado se
+   journaliza pero la operación permanece `RUNNING` y conserva token+identidad
+   hasta que otro reintento confirme el borrado. Solo una ausencia confirmada
+   o un conflicto de identidad/reparse (entrada extranjera) permiten limpiar
+   el claim sin borrar esa entrada.
 
 7. **Fallos clasificados como en §27.4/§27.5.** `NO_SPACE` e `IO_ERROR`
    son `FAILED_RETRYABLE` (reintento en la siguiente ejecución);

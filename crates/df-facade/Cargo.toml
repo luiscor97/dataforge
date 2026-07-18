@@ -19,9 +19,16 @@ df-hash = { workspace = true }
 df-planner = { workspace = true }
 df-executor = { workspace = true }
 df-verifier = { workspace = true }
+df-similarity = { workspace = true }
+df-extract = { workspace = true }
+df-search = { workspace = true }
+df-query = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 df-db = { workspace = true, features = ["test-support"] }

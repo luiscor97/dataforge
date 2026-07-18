@@ -34,6 +34,12 @@ jobs:
       - name: Tests
         run: cargo test
 
+      # df-corpus is not a default member (it is a dev tool), so its fast
+      # full-pipeline test needs an explicit invocation. The 100k scale run
+      # stays #[ignore]d and on-demand (docs/testing/corpus-and-scale.md).
+      - name: Corpus pipeline test
+        run: cargo test -p df-corpus
+
       - name: Build CLI
         run: cargo build -p dataforge-cli
 
@@ -60,6 +66,9 @@ jobs:
 
       - name: Typecheck
         run: pnpm --filter dataforge-desktop typecheck
+
+      - name: Accessible UI render tests
+        run: pnpm --filter dataforge-desktop test:ui
 
       - name: Build frontend
         run: pnpm --filter dataforge-desktop build

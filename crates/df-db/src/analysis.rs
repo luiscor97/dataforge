@@ -15,7 +15,7 @@ use df_domain::{
 };
 use df_error::{DfError, DfResult};
 use rusqlite::{params, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::repository::{append_event, to_stored_timestamp};
@@ -37,6 +37,35 @@ pub struct RuleEvaluationSummary {
 pub struct AnomalySummary {
     pub anomalies: u64,
     pub high: u64,
+    pub review_items: u64,
+}
+
+/// Canonical counters sealed by one completed structural-analysis run.
+///
+/// This is deliberately typed rather than an open JSON object: phase recovery
+/// must either reproduce the exact public outcome or fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisCompletionSummary {
+    pub duplicate_sets: u64,
+    pub folder_signatures: u64,
+    pub tree_clone_sets: u64,
+    pub partial_tree_clones: u64,
+    pub embedded_trees: u64,
+    /// Added while `ANALYSIS_VERSION` was still 1. Old v1 markers omit this
+    /// field, which is equivalent to zero because that evidence did not exist.
+    #[serde(default)]
+    pub repeated_components: u64,
+    /// True when bounded relation generation stopped before exhausting all
+    /// possible distinct candidates. Added compatibly within v1.
+    #[serde(default)]
+    pub candidate_cap_reached: bool,
+    pub generic_folders: u64,
+    pub protected_boundaries: u64,
+    pub duplicate_representatives: u64,
+    pub rule_matches: u64,
+    pub anomalies: u64,
+    pub high_anomalies: u64,
     pub review_items: u64,
 }
 
@@ -110,6 +139,8 @@ pub struct StructuralDiagnostics {
     pub exact_tree_clone_sets: u64,
     pub partial_tree_clones: u64,
     pub embedded_trees: u64,
+    pub repeated_components: u64,
+    pub candidate_cap_reached: bool,
     pub generic_folders: u64,
     pub protected_boundaries: u64,
     pub rule_matches: u64,
@@ -216,6 +247,218 @@ fn require_matching_completion_scope(
         }
     }
     Ok(())
+}
+
+/// Read the bounded-relation cutoff from immutable ledger evidence. Current
+/// events store the boolean directly; early v1 events stored the exact
+/// `pairs_skipped` count, which can be losslessly projected to the boolean.
+fn relation_candidate_cap_reached(db: &Db, snapshot_id: SnapshotId) -> DfResult<Option<bool>> {
+    let snapshot = snapshot_id.to_string();
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT payload_json
+             FROM audit_events
+             WHERE project_id = (
+                       SELECT project_id FROM snapshots WHERE id = ?1
+                   )
+               AND event_type = 'STRUCTURE_ANALYZED'
+             ORDER BY sequence DESC",
+        )
+        .map_err(db_err)?;
+    let payloads = stmt
+        .query_map([&snapshot], |row| row.get::<_, String>(0))
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    for stored in payloads {
+        let payload: serde_json::Value = serde_json::from_str(&stored)
+            .map_err(|error| DfError::Serialization(format!("structure event: {error}")))?;
+        if payload
+            .get("snapshot_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(snapshot.as_str())
+        {
+            continue;
+        }
+        if let Some(value) = payload.get("candidate_cap_reached") {
+            return value.as_bool().map(Some).ok_or_else(|| {
+                DfError::Serialization(
+                    "structure event candidate_cap_reached is not boolean".to_string(),
+                )
+            });
+        }
+        if let Some(value) = payload.get("pairs_skipped") {
+            return value.as_u64().map(|count| Some(count > 0)).ok_or_else(|| {
+                DfError::Serialization(
+                    "legacy structure event pairs_skipped is not an unsigned integer".to_string(),
+                )
+            });
+        }
+    }
+    Ok(None)
+}
+
+fn summary_from_immutable_evidence(
+    db: &Db,
+    snapshot_id: SnapshotId,
+) -> DfResult<AnalysisCompletionSummary> {
+    let scalar = |sql: &str| -> DfResult<u64> {
+        let value: i64 = db
+            .conn()
+            .query_row(sql, [snapshot_id.to_string()], |row| row.get(0))
+            .map_err(db_err)?;
+        Ok(value as u64)
+    };
+    let scalar_versioned = |sql: &str| -> DfResult<u64> {
+        let value: i64 = db
+            .conn()
+            .query_row(
+                sql,
+                params![snapshot_id.to_string(), ANALYSIS_VERSION as i64],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(value as u64)
+    };
+    Ok(AnalysisCompletionSummary {
+        duplicate_sets: scalar("SELECT COUNT(*) FROM duplicate_sets WHERE snapshot_id = ?1")?,
+        folder_signatures: scalar("SELECT COUNT(*) FROM folder_signatures WHERE snapshot_id = ?1")?,
+        tree_clone_sets: scalar("SELECT COUNT(*) FROM tree_clone_sets WHERE snapshot_id = ?1")?,
+        partial_tree_clones: scalar(
+            "SELECT COUNT(*) FROM tree_relations
+             WHERE snapshot_id = ?1 AND relationship = 'PARTIAL_TREE_CLONE'",
+        )?,
+        embedded_trees: scalar(
+            "SELECT COUNT(*) FROM tree_relations
+             WHERE snapshot_id = ?1 AND relationship = 'TREE_EMBEDDED'",
+        )?,
+        repeated_components: scalar(
+            "SELECT COUNT(*) FROM tree_relations
+             WHERE snapshot_id = ?1 AND relationship = 'REPEATED_COMPONENT_ONLY'",
+        )?,
+        candidate_cap_reached: relation_candidate_cap_reached(db, snapshot_id)?.ok_or_else(|| {
+            DfError::Conflict(format!(
+                "completed analysis for snapshot `{snapshot_id}` has no immutable tree-relation cap evidence"
+            ))
+        })?,
+        generic_folders: scalar(
+            "SELECT COUNT(*) FROM folder_contexts
+             WHERE snapshot_id = ?1 AND kind = 'GENERIC'",
+        )?,
+        protected_boundaries: scalar(
+            "SELECT COUNT(*) FROM folder_contexts
+             WHERE snapshot_id = ?1 AND is_protected_boundary = 1",
+        )?,
+        duplicate_representatives: scalar(
+            "SELECT COUNT(*) FROM duplicate_representatives WHERE snapshot_id = ?1",
+        )?,
+        rule_matches: scalar_versioned(
+            "SELECT COUNT(*) FROM rule_matches
+             WHERE snapshot_id = ?1 AND analysis_version = ?2",
+        )?,
+        anomalies: scalar_versioned(
+            "SELECT COUNT(*) FROM structural_anomalies
+             WHERE snapshot_id = ?1 AND analysis_version = ?2",
+        )?,
+        high_anomalies: scalar_versioned(
+            "SELECT COUNT(*) FROM structural_anomalies
+             WHERE snapshot_id = ?1 AND analysis_version = ?2 AND severity = 'HIGH'",
+        )?,
+        review_items: scalar_versioned(
+            "SELECT COUNT(*) FROM review_items
+             WHERE snapshot_id = ?1 AND analysis_version = ?2",
+        )?,
+    })
+}
+
+/// Load and validate the current sealed completion, if one exists for this
+/// snapshot. A completion from another analysis version deliberately requires
+/// a new project/snapshot through the supported creation flow: the unversioned
+/// derived tables are immutable once sealed, so silently rewriting their
+/// historical meaning is forbidden.
+pub fn sealed_analysis_summary(
+    db: &Db,
+    project_id: ProjectId,
+    snapshot_id: SnapshotId,
+    profile_id: &str,
+) -> DfResult<Option<AnalysisCompletionSummary>> {
+    let (profile, profile_sha256) = load_analysis_profile(db, project_id, snapshot_id, profile_id)?;
+    let stored: Option<(String, i64, String, String, String)> = db
+        .conn()
+        .query_row(
+            "SELECT project_id, analysis_version, profile_id, profile_sha256,
+                    summary_json
+             FROM analysis_completions
+             WHERE snapshot_id = ?1 AND analysis_version = ?2",
+            params![snapshot_id.to_string(), ANALYSIS_VERSION as i64],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((stored_project, stored_version, stored_profile, stored_digest, stored_json)) = stored
+    else {
+        let sealed_version: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT MAX(analysis_version) FROM analysis_completions
+                 WHERE snapshot_id = ?1",
+                [snapshot_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if let Some(sealed_version) = sealed_version {
+            return Err(DfError::Validation(format!(
+                "snapshot `{snapshot_id}` is sealed by analysis version {sealed_version}; \
+                 analysis version {ANALYSIS_VERSION} requires a new project/snapshot through \
+                 the supported project creation flow"
+            )));
+        }
+        return Ok(None);
+    };
+    if stored_project != project_id.to_string()
+        || stored_version != ANALYSIS_VERSION as i64
+        || stored_profile != profile.id
+        || stored_digest != profile_sha256
+    {
+        return Err(DfError::Conflict(format!(
+            "completed analysis scope for snapshot `{snapshot_id}` does not match"
+        )));
+    }
+    let summary_value: serde_json::Value = serde_json::from_str(&stored_json)
+        .map_err(|error| DfError::Serialization(format!("stored analysis summary: {error}")))?;
+    if canonical_json(&summary_value) != stored_json {
+        return Err(DfError::Conflict(format!(
+            "completed analysis summary for snapshot `{snapshot_id}` is not canonical"
+        )));
+    }
+    // Deserialize only after checking the original JSON. Reserializing the
+    // typed value would add defaulted fields and falsely reject canonical v1
+    // markers written before those counters existed.
+    let candidate_cap_was_stored = summary_value.get("candidate_cap_reached").is_some();
+    let mut summary: AnalysisCompletionSummary = serde_json::from_value(summary_value)
+        .map_err(|error| DfError::Serialization(format!("stored analysis summary: {error}")))?;
+    let materialized = summary_from_immutable_evidence(db, snapshot_id)?;
+    if !candidate_cap_was_stored {
+        // Early v1 markers predate this summary field. Recover the honest value
+        // from the immutable STRUCTURE_ANALYZED event (`pairs_skipped` in the
+        // old payload) instead of claiming the cap was not reached.
+        summary.candidate_cap_reached = materialized.candidate_cap_reached;
+    }
+    if materialized != summary {
+        return Err(DfError::Conflict(format!(
+            "completed analysis summary for snapshot `{snapshot_id}` does not match sealed evidence"
+        )));
+    }
+    Ok(Some(summary))
 }
 
 /// Require the current structural-analysis contract before planning or
@@ -1748,6 +1991,11 @@ pub fn diagnostics(db: &Db, snapshot_id: SnapshotId) -> DfResult<StructuralDiagn
             "SELECT COUNT(*) FROM tree_relations
              WHERE snapshot_id = ?1 AND relationship = 'TREE_EMBEDDED'",
         )?,
+        repeated_components: scalar(
+            "SELECT COUNT(*) FROM tree_relations
+             WHERE snapshot_id = ?1 AND relationship = 'REPEATED_COMPONENT_ONLY'",
+        )?,
+        candidate_cap_reached: relation_candidate_cap_reached(db, snapshot_id)?.unwrap_or(false),
         generic_folders: scalar(
             "SELECT COUNT(*) FROM folder_contexts
              WHERE snapshot_id = ?1 AND kind = 'GENERIC'",

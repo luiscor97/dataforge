@@ -12,9 +12,10 @@
 CREATE TABLE tree_relations (
     id             TEXT PRIMARY KEY,
     snapshot_id    TEXT NOT NULL REFERENCES snapshots(id),
-    -- Ordered pair: folder_a < folder_b by relative path, so a relation is
-    -- stored once. For TREE_EMBEDDED, `contained` names which side is inside
-    -- the other; it is not implied by the ordering.
+    -- Ordered pair by the detector's stable (source_root_id, relative_path)
+    -- key, so a relation is stored once independently of per-scan folder UUIDs.
+    -- For TREE_EMBEDDED, `contained` names which side is inside the other; it
+    -- is not implied by the ordering.
     folder_a       TEXT NOT NULL REFERENCES folders(id),
     folder_b       TEXT NOT NULL REFERENCES folders(id),
     relationship   TEXT NOT NULL,

@@ -34,6 +34,13 @@ pub struct AnalyzeOutcome {
     pub partial_tree_clones: u64,
     /// Folder pairs where one subtree's content is wholly inside the other's.
     pub embedded_trees: u64,
+    /// Repeated-content evidence: low-overlap components such as logos, plus
+    /// complete content sets found again inside their own ancestor branch.
+    /// These are evidence, never clone candidates.
+    pub repeated_components: u64,
+    /// True when bounded relation generation omitted an unknown tail of
+    /// distinct candidates. Results remain conservative but not exhaustive.
+    pub candidate_cap_reached: bool,
     /// Folders tagged as low-value generic containers (RFC-0001 §18.3).
     pub generic_folders: u64,
     /// Profile-defined protected boundaries that no duplicate policy crosses.
@@ -96,6 +103,73 @@ pub struct PlanValidationReport {
     pub problems: Vec<String>,
 }
 
+fn analyze_outcome_from_summary(
+    snapshot_id: df_domain::SnapshotId,
+    summary: df_db::analysis::AnalysisCompletionSummary,
+    state: ProjectState,
+) -> AnalyzeOutcome {
+    AnalyzeOutcome {
+        snapshot_id: snapshot_id.to_string(),
+        duplicate_sets: summary.duplicate_sets,
+        folder_signatures: summary.folder_signatures,
+        tree_clone_sets: summary.tree_clone_sets,
+        partial_tree_clones: summary.partial_tree_clones,
+        embedded_trees: summary.embedded_trees,
+        repeated_components: summary.repeated_components,
+        candidate_cap_reached: summary.candidate_cap_reached,
+        generic_folders: summary.generic_folders,
+        protected_boundaries: summary.protected_boundaries,
+        duplicate_representatives: summary.duplicate_representatives,
+        rule_matches: summary.rule_matches,
+        anomalies: summary.anomalies,
+        high_anomalies: summary.high_anomalies,
+        review_items: summary.review_items,
+        state: state.as_str().to_string(),
+    }
+}
+
+fn materialize_analysis_evidence(
+    db: &mut Db,
+    project_id: df_domain::ProjectId,
+    snapshot_id: df_domain::SnapshotId,
+    profile_id: &str,
+    actor: Actor,
+) -> DfResult<df_db::analysis::AnalysisCompletionSummary> {
+    let duplicate_sets = plans::materialize_duplicate_sets(db, project_id, snapshot_id, actor)?;
+    let structure =
+        df_db::structure::compute_folder_signatures(db, project_id, snapshot_id, actor)?;
+    let context = df_db::context::classify_folders(db, project_id, snapshot_id, profile_id, actor)?;
+    // Pairwise relations need the signatures, so they run after them.
+    let relations = df_db::structure::compute_tree_relations(
+        db,
+        project_id,
+        snapshot_id,
+        &df_db::structure::TreeRelationOptions::default(),
+        actor,
+    )?;
+    // Representatives need the context penalties, so this runs last.
+    let duplicate_representatives =
+        df_db::dedup::score_duplicate_representatives(db, project_id, snapshot_id, actor)?;
+    let rules = df_db::analysis::evaluate_rules(db, project_id, snapshot_id, profile_id, actor)?;
+    let anomalies = df_db::analysis::detect_anomalies(db, project_id, snapshot_id, actor)?;
+    Ok(df_db::analysis::AnalysisCompletionSummary {
+        duplicate_sets,
+        folder_signatures: structure.folders_signed,
+        tree_clone_sets: structure.tree_clone_sets,
+        partial_tree_clones: relations.partial_clones,
+        embedded_trees: relations.embedded,
+        repeated_components: relations.repeated_components,
+        candidate_cap_reached: relations.candidate_cap_reached,
+        generic_folders: context.generic_folders,
+        protected_boundaries: context.protected_boundaries,
+        duplicate_representatives,
+        rule_matches: rules.matches,
+        anomalies: anomalies.anomalies,
+        high_anomalies: anomalies.high,
+        review_items: anomalies.review_items,
+    })
+}
+
 /// Analyse the hashed snapshot: materialise exact duplicate sets (§15),
 /// compute folder signatures and tree clones (§19), and move the project
 /// `HASHED → ANALYZING → ANALYZED`.
@@ -116,7 +190,24 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
     let snapshot = df_db::inventory::latest_complete_snapshot(db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
     let legacy_upgrade = project.state == ProjectState::Analyzed;
-    if legacy_upgrade && df_db::analysis::is_analysis_complete(db, snapshot.id)? {
+    if let Some(summary) = df_db::analysis::sealed_analysis_summary(
+        db,
+        project.id,
+        snapshot.id,
+        project.profile.as_str(),
+    )? {
+        if project.state == ProjectState::Analyzing {
+            // The marker is committed immediately before the lifecycle
+            // transition. A crash in that narrow window must only finish the
+            // transition: migration 0011 has already sealed every derived
+            // table, so recomputing would be both unnecessary and forbidden.
+            let recovered = repository::update_project_state(db, ProjectState::Analyzed, actor)?;
+            return Ok(analyze_outcome_from_summary(
+                snapshot.id,
+                summary,
+                recovered.state,
+            ));
+        }
         return Err(DfError::Validation(
             "the latest snapshot already has a completed structural analysis".to_string(),
         ));
@@ -128,49 +219,13 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
     if project.state == ProjectState::Hashed {
         repository::update_project_state(db, ProjectState::Analyzing, actor)?;
     }
-    let duplicate_sets = plans::materialize_duplicate_sets(db, project.id, snapshot.id, actor)?;
-    let structure =
-        df_db::structure::compute_folder_signatures(db, project.id, snapshot.id, actor)?;
-    let context = df_db::context::classify_folders(
+    let summary = materialize_analysis_evidence(
         db,
         project.id,
         snapshot.id,
         project.profile.as_str(),
         actor,
     )?;
-    // Pairwise relations need the signatures, so they run after them.
-    let relations = df_db::structure::compute_tree_relations(
-        db,
-        project.id,
-        snapshot.id,
-        &df_db::structure::TreeRelationOptions::default(),
-        actor,
-    )?;
-    // Representatives need the context penalties, so this runs last.
-    let duplicate_representatives =
-        df_db::dedup::score_duplicate_representatives(db, project.id, snapshot.id, actor)?;
-    let rules = df_db::analysis::evaluate_rules(
-        db,
-        project.id,
-        snapshot.id,
-        project.profile.as_str(),
-        actor,
-    )?;
-    let anomalies = df_db::analysis::detect_anomalies(db, project.id, snapshot.id, actor)?;
-    let completion_summary = serde_json::json!({
-        "duplicate_sets": duplicate_sets,
-        "folder_signatures": structure.folders_signed,
-        "tree_clone_sets": structure.tree_clone_sets,
-        "partial_tree_clones": relations.partial_clones,
-        "embedded_trees": relations.embedded,
-        "generic_folders": context.generic_folders,
-        "protected_boundaries": context.protected_boundaries,
-        "duplicate_representatives": duplicate_representatives,
-        "rule_matches": rules.matches,
-        "anomalies": anomalies.anomalies,
-        "high_anomalies": anomalies.high,
-        "review_items": anomalies.review_items,
-    });
     // This append-only marker is the report visibility boundary: a crash in
     // any preceding stage cannot masquerade as a valid empty diagnostic.
     df_db::analysis::complete_analysis(
@@ -178,7 +233,7 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         project.id,
         snapshot.id,
         project.profile.as_str(),
-        &completion_summary,
+        &summary,
         actor,
     )?;
     let project = if legacy_upgrade {
@@ -191,22 +246,11 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         repository::update_project_state(db, ProjectState::Analyzed, actor)?
     };
 
-    Ok(AnalyzeOutcome {
-        snapshot_id: snapshot.id.to_string(),
-        duplicate_sets,
-        folder_signatures: structure.folders_signed,
-        tree_clone_sets: structure.tree_clone_sets,
-        partial_tree_clones: relations.partial_clones,
-        embedded_trees: relations.embedded,
-        generic_folders: context.generic_folders,
-        protected_boundaries: context.protected_boundaries,
-        duplicate_representatives,
-        rule_matches: rules.matches,
-        anomalies: anomalies.anomalies,
-        high_anomalies: anomalies.high,
-        review_items: anomalies.review_items,
-        state: project.state.as_str().to_string(),
-    })
+    Ok(analyze_outcome_from_summary(
+        snapshot.id,
+        summary,
+        project.state,
+    ))
 }
 
 /// Generate, validate and persist the plan for the analyzed snapshot;
@@ -719,23 +763,20 @@ fn route_destination(operation_type: OperationType, active_destination: &str) ->
 }
 
 /// Deterministic collision suffix (§27.3, applied at plan time): the first
-/// 8 hex chars of the content SHA-256 before the extension.
+/// 8 hex chars of the content SHA-256 before the extension. The file component
+/// is bounded by UTF-16 units exactly like the executor's runtime collision
+/// path, so a valid 255-unit source name cannot make the plan invalid.
 fn suffixed_destination(destination: &str, sha256: &str) -> String {
-    let tag = &sha256[..8.min(sha256.len())];
-    match destination.rfind('.') {
-        // Only suffix a real extension: a dot inside the last path segment.
-        Some(dot)
-            if dot > 0
-                && !destination[dot..].contains(std::path::MAIN_SEPARATOR)
-                && destination[..dot]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c != std::path::MAIN_SEPARATOR) =>
-        {
-            format!("{}~df-{tag}{}", &destination[..dot], &destination[dot..])
-        }
-        _ => format!("{destination}~df-{tag}"),
-    }
+    let separator = destination
+        .rfind('/')
+        .into_iter()
+        .chain(destination.rfind('\\'))
+        .max();
+    let (prefix, file_name) = separator.map_or(("", destination), |index| {
+        (&destination[..=index], &destination[index + 1..])
+    });
+    let file_name = df_fs_safety::deterministic_collision_file_name(file_name, sha256);
+    format!("{prefix}{file_name}")
 }
 
 /// Classify a duplicate set from the contexts of its members (§15.3).
@@ -1335,6 +1376,168 @@ mod tests {
     }
 
     #[test]
+    fn analyze_finishes_the_transition_without_rewriting_a_sealed_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = hashed_project(tmp.path());
+        let project = repository::load_project(&db).unwrap();
+        let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+            .unwrap()
+            .unwrap();
+
+        repository::update_project_state(&mut db, ProjectState::Analyzing, Actor::Test).unwrap();
+        let summary = materialize_analysis_evidence(
+            &mut db,
+            project.id,
+            snapshot.id,
+            project.profile.as_str(),
+            Actor::Test,
+        )
+        .unwrap();
+        df_db::analysis::complete_analysis(
+            &mut db,
+            project.id,
+            snapshot.id,
+            project.profile.as_str(),
+            &summary,
+            Actor::Test,
+        )
+        .unwrap();
+        assert_eq!(
+            repository::load_project(&db).unwrap().state,
+            ProjectState::Analyzing
+        );
+        let events_before = repository::list_events(&db, project.id).unwrap().len();
+        assert_eq!(
+            event_count(
+                &db,
+                project.id,
+                df_db::analysis::EVENT_STRUCTURAL_ANALYSIS_COMPLETED,
+            ),
+            1
+        );
+
+        // Simulate restart in the exact marker-committed/state-not-transitioned
+        // window. Any attempt to replay a derived repository would now be
+        // rejected by migration 0011.
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+        let expected = analyze_outcome_from_summary(snapshot.id, summary, ProjectState::Analyzed);
+        assert_eq!(
+            serde_json::to_value(outcome).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "recovery must reproduce the sealed public outcome exactly"
+        );
+        assert_eq!(
+            repository::list_events(&db, project.id).unwrap().len(),
+            events_before + 1,
+            "recovery may append only the missing lifecycle transition"
+        );
+        assert_eq!(transition_count(&db, project.id, "ANALYZING"), 1);
+        assert_eq!(transition_count(&db, project.id, "ANALYZED"), 1);
+        assert_eq!(
+            event_count(
+                &db,
+                project.id,
+                df_db::analysis::EVENT_STRUCTURAL_ANALYSIS_COMPLETED,
+            ),
+            1,
+            "the final marker/event must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn recovery_accepts_a_canonical_legacy_v1_summary_without_the_new_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = hashed_project(tmp.path());
+        let project = repository::load_project(&db).unwrap();
+        let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+            .unwrap()
+            .unwrap();
+
+        repository::update_project_state(&mut db, ProjectState::Analyzing, Actor::Test).unwrap();
+        let summary = materialize_analysis_evidence(
+            &mut db,
+            project.id,
+            snapshot.id,
+            project.profile.as_str(),
+            Actor::Test,
+        )
+        .unwrap();
+        assert_eq!(summary.repeated_components, 0);
+        // Early v1 builds sealed this exact schema before the
+        // repeated-components counter was added without bumping the version.
+        let legacy_v1_summary = serde_json::json!({
+            "duplicate_sets": summary.duplicate_sets,
+            "folder_signatures": summary.folder_signatures,
+            "tree_clone_sets": summary.tree_clone_sets,
+            "partial_tree_clones": summary.partial_tree_clones,
+            "embedded_trees": summary.embedded_trees,
+            "generic_folders": summary.generic_folders,
+            "protected_boundaries": summary.protected_boundaries,
+            "duplicate_representatives": summary.duplicate_representatives,
+            "rule_matches": summary.rule_matches,
+            "anomalies": summary.anomalies,
+            "high_anomalies": summary.high_anomalies,
+            "review_items": summary.review_items,
+        });
+        df_db::analysis::complete_analysis(
+            &mut db,
+            project.id,
+            snapshot.id,
+            project.profile.as_str(),
+            &legacy_v1_summary,
+            Actor::Test,
+        )
+        .unwrap();
+
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+        let expected = analyze_outcome_from_summary(snapshot.id, summary, ProjectState::Analyzed);
+        assert_eq!(
+            serde_json::to_value(outcome).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "defaulting the absent v1 counter must not alter any other sealed result"
+        );
+    }
+
+    #[test]
+    fn a_completion_from_another_analysis_version_requires_a_new_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = hashed_project(tmp.path());
+        let project = repository::load_project(&db).unwrap();
+        let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+            .unwrap()
+            .unwrap();
+        db.conn_for_tests()
+            .execute(
+                "INSERT INTO analysis_completions
+                    (snapshot_id, project_id, analysis_version, profile_id,
+                     profile_sha256, summary_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6)",
+                (
+                    snapshot.id.to_string(),
+                    project.id.to_string(),
+                    df_db::analysis::ANALYSIS_VERSION as i64 + 1,
+                    project.profile.as_str(),
+                    "0".repeat(64),
+                    chrono::Utc::now().to_rfc3339(),
+                ),
+            )
+            .unwrap();
+
+        let error = analyze_project(&mut db, Actor::Test).unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(message)
+                if message.contains("requires a new project/snapshot")
+                    && message.contains("project creation flow")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            repository::load_project(&db).unwrap().state,
+            ProjectState::Hashed,
+            "a sealed historical snapshot must not enter ANALYZING"
+        );
+    }
+
+    #[test]
     fn analyze_upgrades_a_legacy_analyzed_snapshot_without_moving_state_backwards() {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = hashed_project(tmp.path());
@@ -1649,6 +1852,16 @@ mod tests {
     }
 
     #[test]
+    fn suffixed_destination_stays_within_the_utf16_component_boundary() {
+        let destination = format!("dir/{}.txt", "x".repeat(251));
+        let suffixed = suffixed_destination(&destination, "abcdef1234567890");
+        let file_name = Path::new(&suffixed).file_name().unwrap().to_string_lossy();
+        assert_eq!(file_name.encode_utf16().count(), 255);
+        assert!(file_name.ends_with("~df-abcdef12.txt"), "{file_name}");
+        assert!(df_fs_safety::SafeRelativePath::parse(Path::new(&suffixed)).is_ok());
+    }
+
+    #[test]
     fn unsafe_source_names_receive_stable_portable_destinations() {
         let unsafe_folder = PathBuf::from("CON");
         let raw_folder = df_domain::RawPath::from_os_str(unsafe_folder.as_os_str());
@@ -1930,6 +2143,27 @@ mod tests {
         );
         // Coverage still holds.
         assert!(validate_plan(&db).unwrap().ok);
+
+        let unique_destination = unique
+            .destination_relative_path
+            .clone()
+            .expect("the unique copy has a destination");
+        approve_plan(&mut db, Actor::Test).unwrap();
+        let executed = df_executor::execute_plan(
+            &mut db,
+            Actor::Test,
+            &df_executor::ExecuteOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(executed.failed_final, 0);
+        assert_eq!(executed.failed_retryable, 0);
+        assert_eq!(executed.pending, 0);
+        assert_eq!(
+            std::fs::read(project.output_root.join(unique_destination)).unwrap(),
+            b"this exists nowhere else",
+            "the branch-exclusive bytes must survive planning and execution"
+        );
     }
 
     /// §19.3/§19.4: two branches that are almost the same but where EACH holds
@@ -1989,6 +2223,305 @@ mod tests {
         assert!(relation.similarity > 0.4 && relation.similarity < 1.0);
     }
 
+    /// §19.3/§19.4: when every content identity of one independent branch is
+    /// present in another, the relation is TREE_EMBEDDED. It remains a review
+    /// finding rather than permission to discard either branch, and a pending
+    /// review must preserve every byte through planning and execution.
+    #[test]
+    fn an_embedded_tree_is_reviewed_and_preserved_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let embedded = origin.join("base");
+        let containing = origin.join("base-ampliada");
+        std::fs::create_dir_all(&embedded).unwrap();
+        std::fs::create_dir_all(&containing).unwrap();
+
+        for (name, body) in [
+            ("documento.txt", b"shared document".as_slice()),
+            ("anexo.txt", b"shared attachment".as_slice()),
+        ] {
+            std::fs::write(embedded.join(name), body).unwrap();
+            std::fs::write(containing.join(name), body).unwrap();
+        }
+        std::fs::write(
+            containing.join("solo-ampliada.txt"),
+            b"content exclusive to the containing tree",
+        )
+        .unwrap();
+        // Give the source-root folder another identity so it cannot be a
+        // pass-through wrapper of the larger branch. Ancestor pairs are still
+        // intentionally excluded from ordinary embedded-tree evidence.
+        std::fs::write(origin.join("raiz.txt"), b"root-only content").unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Arbol embebido",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+        assert_eq!(outcome.tree_clone_sets, 0);
+        assert_eq!(outcome.partial_tree_clones, 0);
+        assert_eq!(outcome.embedded_trees, 1);
+        assert_eq!(outcome.repeated_components, 0);
+        assert_eq!(outcome.anomalies, 1);
+        assert_eq!(outcome.high_anomalies, 0);
+        assert_eq!(outcome.review_items, 1);
+
+        let snapshot: SnapshotId = outcome.snapshot_id.parse().unwrap();
+        let relations = df_db::structure::tree_relation_views(&db, snapshot).unwrap();
+        assert_eq!(
+            relations.len(),
+            1,
+            "expected only the independent branch pair"
+        );
+        let relation = &relations[0];
+        assert_eq!(relation.relationship, "TREE_EMBEDDED");
+        assert_eq!(relation.shared_files, 2);
+        assert_eq!(relation.unique_a_files + relation.unique_b_files, 1);
+        let (embedded_path, containing_path) = match relation.contained.as_deref() {
+            Some("A") => {
+                assert_eq!(relation.unique_a_files, 0);
+                assert_eq!(relation.unique_b_files, 1);
+                (&relation.path_a, &relation.path_b)
+            }
+            Some("B") => {
+                assert_eq!(relation.unique_a_files, 1);
+                assert_eq!(relation.unique_b_files, 0);
+                (&relation.path_b, &relation.path_a)
+            }
+            other => panic!("embedded relation needs a contained side, got {other:?}"),
+        };
+        assert_eq!(
+            Path::new(embedded_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "base"
+        );
+        assert_eq!(
+            Path::new(containing_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "base-ampliada"
+        );
+
+        let report = df_db::analysis::anomaly_report(&db, snapshot).unwrap();
+        assert_eq!(report.high, 0);
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.information, 1);
+        let anomaly = &report.anomalies[0];
+        assert_eq!(anomaly.kind, "EMBEDDED_TREE");
+        assert_eq!(anomaly.severity, "INFO");
+        assert!(anomaly.requires_review);
+        assert!(anomaly.folder_a.is_some() && anomaly.folder_b.is_some());
+        assert_eq!(anomaly.evidence["relationship"], "TREE_EMBEDDED");
+        assert_eq!(anomaly.evidence["shared_files"], 2);
+        assert_eq!(
+            anomaly.evidence["unique_a_files"].as_u64().unwrap()
+                + anomaly.evidence["unique_b_files"].as_u64().unwrap(),
+            1
+        );
+
+        let queue = df_db::analysis::review_queue(&db, snapshot).unwrap();
+        assert_eq!(queue.pending, 1);
+        assert_eq!(queue.decided, 0);
+        assert_eq!(queue.items.len(), 1);
+        let review = &queue.items[0];
+        assert_eq!(review.source, "ANOMALY");
+        assert_eq!(review.kind, "EMBEDDED_TREE");
+        assert_eq!(review.risk, "LOW");
+        assert_eq!(review.recommended_action, "COPY_REVIEW");
+        assert!(review.materializable);
+        assert_eq!(review.status, "PENDING");
+        assert_eq!(review.folder_a, anomaly.folder_a);
+        assert_eq!(review.folder_b, anomaly.folder_b);
+        assert_eq!(review.evidence.as_ref(), Some(&anomaly.evidence));
+
+        let occurrences = df_db::inventory::list_occurrences(&db, snapshot).unwrap();
+        let related_occurrences: HashMap<_, _> = occurrences
+            .into_iter()
+            .filter(|occurrence| {
+                occurrence.parent_relative_path == "base"
+                    || occurrence.parent_relative_path == "base-ampliada"
+            })
+            .map(|occurrence| (occurrence.id, occurrence.relative_path))
+            .collect();
+        assert_eq!(related_occurrences.len(), 5);
+
+        let plan_outcome =
+            create_plan(&mut db, Actor::Test, DuplicatePolicy::ConsolidateAll).unwrap();
+        assert_eq!(plan_outcome.skipped_represented, 0);
+        assert_eq!(plan_outcome.review_copies, 5);
+        let plan = plans::current_plan(&db, project.id).unwrap().unwrap();
+        let operations = plans::list_operations(&db, plan.id).unwrap();
+        let conserved: Vec<_> = operations
+            .iter()
+            .filter_map(|operation| {
+                let occurrence_id = operation.source_occurrence?;
+                related_occurrences
+                    .get(&occurrence_id)
+                    .map(|relative| (operation, relative))
+            })
+            .map(|(operation, source_relative)| {
+                assert_eq!(operation.operation_type, OperationType::CopyReview);
+                assert!(operation.reason.contains("pending human review"));
+                let destination = operation
+                    .destination_relative_path
+                    .as_ref()
+                    .expect("a review copy has a destination");
+                assert!(destination.starts_with(REVIEW_BUCKET));
+                (source_relative.clone(), destination.clone())
+            })
+            .collect();
+        assert_eq!(conserved.len(), 5);
+        assert!(validate_plan(&db).unwrap().ok);
+
+        approve_plan(&mut db, Actor::Test).unwrap();
+        let executed = df_executor::execute_plan(
+            &mut db,
+            Actor::Test,
+            &df_executor::ExecuteOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(executed.failed_final, 0);
+        assert_eq!(executed.failed_retryable, 0);
+        assert_eq!(executed.pending, 0);
+        for (source_relative, destination) in conserved {
+            assert_eq!(
+                std::fs::read(project.output_root.join(destination)).unwrap(),
+                std::fs::read(origin.join(source_relative)).unwrap(),
+                "every byte in both related branches must survive review routing"
+            );
+        }
+    }
+
+    /// A logo or template shared by otherwise unrelated branches is useful
+    /// structural evidence, but it must never promote the branches to clones.
+    /// The evidence is persisted so reports can explain that distinction.
+    #[test]
+    fn a_common_component_in_unrelated_branches_is_reported_but_not_a_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let blue = origin.join("rama-azul");
+        let green = origin.join("rama-verde");
+        std::fs::create_dir_all(&blue).unwrap();
+        std::fs::create_dir_all(&green).unwrap();
+
+        std::fs::write(blue.join("logo.svg"), b"shared company logo").unwrap();
+        std::fs::write(green.join("logo.svg"), b"shared company logo").unwrap();
+        std::fs::write(blue.join("campana.txt"), b"blue campaign").unwrap();
+        std::fs::write(blue.join("presupuesto.txt"), b"blue budget").unwrap();
+        std::fs::write(green.join("contrato.txt"), b"green contract").unwrap();
+        std::fs::write(green.join("factura.txt"), b"green invoice").unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Componente legítimamente repetido",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+        assert_eq!(outcome.tree_clone_sets, 0);
+        assert_eq!(outcome.partial_tree_clones, 0);
+        assert_eq!(outcome.embedded_trees, 0);
+        assert_eq!(outcome.repeated_components, 1);
+        assert_eq!(outcome.anomalies, 0);
+        assert_eq!(outcome.review_items, 0);
+
+        let snapshot: SnapshotId = outcome.snapshot_id.parse().unwrap();
+        let relations = df_db::structure::tree_relations(&db, snapshot).unwrap();
+        assert_eq!(relations.len(), 1);
+        let relation = &relations[0];
+        assert_eq!(
+            relation.relationship,
+            df_domain::TreeRelationship::RepeatedComponentOnly
+        );
+        assert_eq!(relation.shared_files, 1);
+        assert_eq!(relation.unique_a_files, 2);
+        assert_eq!(relation.unique_b_files, 2);
+        assert!((relation.similarity - 0.2).abs() < f64::EPSILON);
+
+        let diagnostics = df_db::analysis::diagnostics(&db, snapshot).unwrap();
+        assert_eq!(diagnostics.repeated_components, 1);
+    }
+
+    /// §19.1: a branch can contain another complete occurrence of its own
+    /// contents. Distinct sets alone make this look like a pass-through
+    /// wrapper; occurrence multiplicity proves that the ancestor also holds a
+    /// copy outside the descendant.
+    #[test]
+    fn a_complete_tree_nested_inside_itself_is_materialised_as_repeated_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let branch = origin.join("asunto-a");
+        let nested_copy = branch.join("asunto-a-copia");
+        std::fs::create_dir_all(&nested_copy).unwrap();
+
+        for (name, body) in [
+            ("documento.txt", b"same document".as_slice()),
+            ("anexo.txt", b"same attachment".as_slice()),
+        ] {
+            std::fs::write(branch.join(name), body).unwrap();
+            std::fs::write(nested_copy.join(name), body).unwrap();
+        }
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Árbol dentro de sí mismo",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        let outcome = analyze_project(&mut db, Actor::Test).unwrap();
+        assert_eq!(outcome.tree_clone_sets, 0);
+        assert_eq!(outcome.partial_tree_clones, 0);
+        assert_eq!(outcome.embedded_trees, 0);
+        assert_eq!(outcome.repeated_components, 1);
+        assert_eq!(outcome.anomalies, 0);
+        assert_eq!(outcome.review_items, 0);
+
+        let snapshot: SnapshotId = outcome.snapshot_id.parse().unwrap();
+        let views = df_db::structure::tree_relation_views(&db, snapshot).unwrap();
+        assert_eq!(views.len(), 1);
+        let relation = &views[0];
+        assert_eq!(relation.relationship, "REPEATED_COMPONENT_ONLY");
+        assert!(relation.path_a.ends_with("asunto-a"), "{relation:?}");
+        assert!(
+            relation.path_b.ends_with(&format!(
+                "asunto-a{}asunto-a-copia",
+                std::path::MAIN_SEPARATOR
+            )),
+            "{relation:?}"
+        );
+        assert_eq!(relation.shared_files, 2);
+        assert_eq!(relation.unique_a_files, 0);
+        assert_eq!(relation.unique_b_files, 0);
+        assert_eq!(relation.similarity, 1.0);
+    }
+
     /// A folder is not "embedded" in its own parent: that would be noise on
     /// every single snapshot.
     #[test]
@@ -1998,6 +2531,10 @@ mod tests {
         let outcome = analyze_project(&mut db, Actor::Test).unwrap();
         // origen/ contains origen/sub/, which would trivially be "embedded".
         assert_eq!(outcome.embedded_trees, 0);
+        assert_eq!(
+            outcome.repeated_components, 0,
+            "a pure wrapper has no occurrences outside its child"
+        );
         assert_eq!(outcome.partial_tree_clones, 0);
     }
 
@@ -2044,11 +2581,16 @@ mod tests {
             "the pass-through container must not add a duplicate relation"
         );
         assert_eq!(outcome.embedded_trees, 0);
+        assert_eq!(
+            outcome.repeated_components, 0,
+            "the ordinary Backup wrapper must remain suppressed"
+        );
 
         // And the surviving relation is between the two deepest folders.
         let snapshot: df_domain::SnapshotId = outcome.snapshot_id.parse().unwrap();
         let views = df_db::structure::tree_relation_views(&db, snapshot).unwrap();
         assert_eq!(views.len(), 1);
+        assert_eq!(views[0].relationship, "PARTIAL_TREE_CLONE");
         let sep = std::path::MAIN_SEPARATOR;
         assert!(
             views[0].path_a.ends_with(&format!("Backup{sep}casos"))

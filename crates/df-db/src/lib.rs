@@ -7,11 +7,13 @@
 pub mod analysis;
 pub mod context;
 pub mod dedup;
+pub mod extraction;
 pub mod integrity;
 pub mod inventory;
 pub mod migrations;
 pub mod plans;
 pub mod repository;
+pub mod similarity;
 pub mod structure;
 
 use std::path::Path;

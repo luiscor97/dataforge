@@ -83,7 +83,7 @@ impl RawPath {
 
     /// Read back the stored blob.
     pub fn from_blob(bytes: &[u8]) -> DfResult<Self> {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(DfError::Validation(format!(
                 "raw path blob has an odd length ({}); it is not UTF-16LE",
                 bytes.len()
@@ -103,7 +103,7 @@ impl RawPath {
     }
 
     pub fn from_hex(text: &str) -> DfResult<Self> {
-        if text.len() % 2 != 0 {
+        if !text.len().is_multiple_of(2) {
             return Err(DfError::Validation(
                 "raw path hex has an odd length".to_string(),
             ));

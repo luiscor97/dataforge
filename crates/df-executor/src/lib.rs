@@ -30,7 +30,7 @@ use df_domain::{
     Actor, ExecutionState, FileFingerprint, OperationErrorCode, OperationType, ProjectState,
 };
 use df_error::{DfError, DfResult};
-use df_fs_safety::{FsSafetyError, SafeOutputRoot, SafeRelativePath};
+use df_fs_safety::{FileIdentity, FsSafetyError, SafeOutputRoot, SafeRelativePath};
 use serde::Serialize;
 use sha2::Digest;
 
@@ -81,12 +81,13 @@ pub fn execute_plan(
     }
 
     let project = repository::load_project(db)?;
+    let recovering_executing = project.state == ProjectState::Executing;
     match project.state {
-        ProjectState::PlanApproved | ProjectState::ExecutionPaused => {}
+        ProjectState::PlanApproved | ProjectState::ExecutionPaused | ProjectState::Executing => {}
         other => {
             return Err(DfError::Validation(format!(
                 "cannot execute a project in state {other} \
-                 (expected PLAN_APPROVED or EXECUTION_PAUSED)"
+                 (expected PLAN_APPROVED, EXECUTION_PAUSED or recoverable EXECUTING)"
             )));
         }
     }
@@ -115,7 +116,12 @@ pub fn execute_plan(
     // repeat the proof before entering EXECUTING or running an operation.
     validate_source_output_boundary(&source_roots, safe_root.path())?;
 
-    repository::update_project_state(db, ProjectState::Executing, actor)?;
+    // EXECUTING can be the durable state left by a killed single writer. In
+    // that recovery case do not emit a redundant/invalid EXECUTING→EXECUTING
+    // transition; ADR-0029 explicitly excludes concurrent writers.
+    if !recovering_executing {
+        repository::update_project_state(db, ProjectState::Executing, actor)?;
+    }
 
     let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut bytes_copied: u64 = 0;
@@ -136,8 +142,34 @@ pub fn execute_plan(
                 break 'run;
             }
             attempted.insert(operation.operation_id.to_string());
-            plans::mark_operation_running(db, operation.operation_id)?;
-            let outcome = run_operation(&safe_root, &operation, options);
+            // Reclaim attempt A while A's token and physical identity are
+            // still the durable database state. A fresh lease B is issued
+            // only after this idempotent cleanup succeeds; otherwise a crash
+            // between B and cleanup would destroy the sole ownership proof.
+            if operation.operation_type != OperationType::CreateDirectory {
+                if let Err(failure) = reclaim_interrupted_partial(&safe_root, &operation) {
+                    let outcome = failure.into_outcome(chrono::Utc::now());
+                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                    continue;
+                }
+            }
+            // A copy receives a fresh unpredictable partial lease in the same
+            // durable update that marks it RUNNING. Directory operations do
+            // not create partials and therefore carry no ownership token.
+            let partial_lease_token = match operation.operation_type {
+                OperationType::CreateDirectory => {
+                    plans::mark_operation_running(db, operation.operation_id)?;
+                    None
+                }
+                _ => Some(plans::lease_copy_operation(db, operation.operation_id)?),
+            };
+            let outcome = run_operation(
+                db,
+                &safe_root,
+                &operation,
+                partial_lease_token.as_deref(),
+                options,
+            );
             bytes_copied += outcome.bytes_copied;
             plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
         }
@@ -160,8 +192,21 @@ pub fn execute_plan(
         "bytes_copied": bytes_copied,
         "cancelled": cancelled,
     });
-    plans::emit_event(db, project.id, event_type, &payload, actor)?;
-    let project = repository::update_project_state(db, next_state, actor)?;
+    // Only the zero-work recovery path can represent the legacy crash window
+    // between a terminal milestone and the old separate state transition.
+    // Once this invocation attempted an operation, a PAUSED result is new and
+    // must receive its own milestone even when the previous latest event has
+    // the same kind and plan id.
+    let reuse_interrupted_milestone = recovering_executing && attempted.is_empty() && !cancelled;
+    let project = plans::finish_execution(
+        db,
+        plan.id,
+        event_type,
+        &payload,
+        next_state,
+        reuse_interrupted_milestone,
+        actor,
+    )?;
 
     Ok(ExecuteOutcome {
         plan_id: plan.id.to_string(),
@@ -203,8 +248,10 @@ fn validate_source_output_boundary(source_roots: &[PathBuf], output_root: &Path)
 /// Execute one operation against the filesystem. Never returns `Err`: every
 /// failure becomes a journaled outcome (§27.5).
 fn run_operation(
+    db: &Db,
     safe_root: &SafeOutputRoot,
     operation: &ExecutableOperation,
+    partial_lease_token: Option<&str>,
     options: &ExecuteOptions,
 ) -> OperationOutcome {
     let started_at = chrono::Utc::now();
@@ -215,7 +262,14 @@ fn run_operation(
     let result = match SafeRelativePath::parse(Path::new(&operation.destination_relative_path)) {
         Ok(relative) => match operation.operation_type {
             OperationType::CreateDirectory => create_directory(safe_root, &relative, operation),
-            _ => copy_file(safe_root, &relative, operation, options),
+            _ => partial_lease_token
+                .ok_or_else(|| {
+                    OperationFailure::fatal(
+                        OperationErrorCode::InvalidPath,
+                        "copy operation without a durable partial lease",
+                    )
+                })
+                .and_then(|token| copy_file(db, safe_root, &relative, operation, token, options)),
         },
         Err(error) => Err(OperationFailure::from_fs_safety(error)),
     };
@@ -225,24 +279,16 @@ fn run_operation(
             outcome.started_at = started_at;
             outcome
         }
-        Err(failure) => OperationOutcome {
-            execution_state: failure.state,
-            outcome: failure.code.as_str().to_string(),
-            error_code: Some(failure.code),
-            detail: Some(failure.detail),
-            final_relative_path: None,
-            bytes_copied: 0,
-            sha256: None,
-            blake3: None,
-            started_at,
-        },
+        Err(failure) => failure.into_outcome(started_at),
     }
 }
 
+#[derive(Debug)]
 struct OperationFailure {
     code: OperationErrorCode,
     state: ExecutionState,
     detail: String,
+    retain_partial_lease: bool,
 }
 
 impl OperationFailure {
@@ -265,6 +311,7 @@ impl OperationFailure {
             code,
             state,
             detail: format!("{context}: {error}"),
+            retain_partial_lease: false,
         }
     }
 
@@ -273,6 +320,31 @@ impl OperationFailure {
             code,
             state: ExecutionState::FailedFinal,
             detail: detail.into(),
+            retain_partial_lease: false,
+        }
+    }
+
+    fn into_outcome(self, started_at: df_domain::Timestamp) -> OperationOutcome {
+        OperationOutcome {
+            execution_state: self.state,
+            outcome: self.code.as_str().to_string(),
+            error_code: Some(self.code),
+            detail: Some(self.detail),
+            final_relative_path: None,
+            bytes_copied: 0,
+            sha256: None,
+            blake3: None,
+            started_at,
+            retain_partial_lease: self.retain_partial_lease,
+        }
+    }
+
+    fn retained_cleanup(detail: impl Into<String>) -> Self {
+        Self {
+            code: OperationErrorCode::IoError,
+            state: ExecutionState::Running,
+            detail: detail.into(),
+            retain_partial_lease: true,
         }
     }
 
@@ -292,11 +364,13 @@ impl OperationFailure {
                 code: OperationErrorCode::InvalidPath,
                 state: ExecutionState::FailedFinal,
                 detail: error.to_string(),
+                retain_partial_lease: false,
             },
             FsSafetyError::DestinationExists { .. } => Self {
                 code: OperationErrorCode::DestinationChanged,
                 state: ExecutionState::FailedFinal,
                 detail: error.to_string(),
+                retain_partial_lease: false,
             },
             FsSafetyError::InvalidRelativePath { .. }
             | FsSafetyError::InvalidRootPath { .. }
@@ -304,10 +378,26 @@ impl OperationFailure {
                 code: OperationErrorCode::InvalidPath,
                 state: ExecutionState::FailedFinal,
                 detail: error.to_string(),
+                retain_partial_lease: false,
             },
             FsSafetyError::Io { ref source, .. } => {
-                let mut failure = Self::from_io(source, "filesystem safety");
-                failure.detail = error.to_string();
+                // fs-safety only ever touches the OUTPUT boundary, so a
+                // NotFound here is a destination-side condition (a parent
+                // directory missing or vanished), never a missing source.
+                // The 100k scale run proved why this matters: long-path
+                // failures while creating partials were journaled as
+                // SOURCE_MISSING, pointing the investigation at the wrong
+                // side of the copy.
+                let mut failure = match source.kind() {
+                    std::io::ErrorKind::NotFound => Self {
+                        code: OperationErrorCode::IoError,
+                        state: ExecutionState::FailedRetryable,
+                        detail: String::new(),
+                        retain_partial_lease: false,
+                    },
+                    _ => Self::from_io(source, "filesystem safety"),
+                };
+                failure.detail = format!("output-side failure: {error}");
                 failure
             }
         }
@@ -334,13 +424,52 @@ fn create_directory(
         sha256: None,
         blake3: None,
         started_at: chrono::Utc::now(),
+        retain_partial_lease: false,
     })
 }
 
+/// Reclaim the exact partial from an interrupted attempt before replacing its
+/// durable lease with a new one.
+fn reclaim_interrupted_partial(
+    safe_root: &SafeOutputRoot,
+    operation: &ExecutableOperation,
+) -> Result<(), OperationFailure> {
+    if operation.previous_execution_state != ExecutionState::Running {
+        return Ok(());
+    }
+    let (Some(previous_token), Some(previous_identity)) = (
+        operation.previous_partial_lease_token.as_deref(),
+        operation.previous_partial_lease_identity.as_deref(),
+    ) else {
+        // Token/state without a post-create physical claim is not ownership.
+        return Ok(());
+    };
+    let planned_relative = SafeRelativePath::parse(Path::new(&operation.destination_relative_path))
+        .map_err(OperationFailure::from_fs_safety)?;
+    let leased_partial_relative = planned_relative
+        .with_file_name(&partial_file_name(operation, previous_token)?)
+        .map_err(OperationFailure::from_fs_safety)?;
+    let expected_identity = parse_partial_identity(previous_identity)?;
+    match safe_root.remove_leased_partial_secure(&leased_partial_relative, expected_identity) {
+        Ok(_) => {}
+        Err(
+            error @ (FsSafetyError::Io { .. } | FsSafetyError::OutputRootIdentityChanged { .. }),
+        ) => {
+            return Err(OperationFailure::retained_cleanup(format!(
+                "cleanup of the interrupted physically claimed partial must be retried: {error}"
+            )));
+        }
+        Err(error) => return Err(OperationFailure::from_fs_safety(error)),
+    }
+    Ok(())
+}
+
 fn copy_file(
+    db: &Db,
     safe_root: &SafeOutputRoot,
     planned_relative: &SafeRelativePath,
     operation: &ExecutableOperation,
+    partial_lease_token: &str,
     options: &ExecuteOptions,
 ) -> Result<OperationOutcome, OperationFailure> {
     validate_source_root(safe_root, operation)?;
@@ -396,11 +525,6 @@ fn copy_file(
         expected_sha256,
         options,
     )?;
-    let destination = safe_root
-        .resolve_destination_without_following_links(&relative)
-        .map_err(OperationFailure::from_fs_safety)?
-        .absolute()
-        .to_path_buf();
     if skip {
         return Ok(OperationOutcome {
             execution_state: ExecutionState::Completed,
@@ -414,6 +538,7 @@ fn copy_file(
             sha256: Some(expected_sha256.to_string()),
             blake3: operation.expected_blake3.clone(),
             started_at: chrono::Utc::now(),
+            retain_partial_lease: false,
         });
     }
 
@@ -427,7 +552,7 @@ fn copy_file(
     // The partial is created through the safe boundary with create_new, so it
     // can neither follow a link nor reuse someone else's file.
     let partial_relative = relative
-        .with_file_name(&partial_file_name(&relative, operation))
+        .with_file_name(&partial_file_name(operation, partial_lease_token)?)
         .map_err(OperationFailure::from_fs_safety)?;
     let partial = safe_root
         .resolve_destination_without_following_links(&partial_relative)
@@ -437,25 +562,61 @@ fn copy_file(
     let handle = safe_root
         .create_partial_secure(&partial_relative)
         .map_err(OperationFailure::from_fs_safety)?;
+    // Ownership is claimed only *after* create_new succeeded, using identity
+    // read from that exact open handle. A path reopen here would let a rename
+    // race claim somebody else's replacement.
+    let partial_identity = df_fs_safety::identity_of_open_file(&handle, &partial)
+        .map_err(OperationFailure::from_fs_safety)?
+        .ok_or_else(|| {
+            OperationFailure::fatal(
+                OperationErrorCode::InvalidPath,
+                "filesystem did not provide a physical identity for the new partial",
+            )
+        })?;
+    let stored_identity = format_partial_identity(partial_identity);
+    if let Err(error) = plans::claim_copy_partial(
+        db,
+        operation.operation_id,
+        partial_lease_token,
+        &stored_identity,
+    ) {
+        drop(handle);
+        let _ = safe_root.remove_leased_partial_secure(&partial_relative, partial_identity);
+        return Err(OperationFailure {
+            code: OperationErrorCode::IoError,
+            state: ExecutionState::FailedRetryable,
+            detail: format!("persisting partial ownership claim: {error}"),
+            retain_partial_lease: false,
+        });
+    }
     let copy = stream_copy(&source, handle, options.copy_buffer_bytes)
         .map_err(|e| OperationFailure::from_io(&e, "copying"));
     let copy = match copy {
         Ok(copy) => copy,
         Err(failure) => {
-            remove_own_partial(&partial);
-            return Err(failure);
+            return Err(cleanup_after_claimed_failure(
+                safe_root,
+                &partial_relative,
+                partial_identity,
+                failure,
+            ));
         }
     };
 
     // 6. Compare against the identity recorded at hash time (§27.1).
     if copy.sha256 != expected_sha256 {
-        remove_own_partial(&partial);
-        return Err(OperationFailure::fatal(
+        let failure = OperationFailure::fatal(
             OperationErrorCode::HashMismatch,
             format!(
                 "copied bytes hash to {} but the snapshot recorded {expected_sha256}",
                 copy.sha256
             ),
+        );
+        return Err(cleanup_after_claimed_failure(
+            safe_root,
+            &partial_relative,
+            partial_identity,
+            failure,
         ));
     }
 
@@ -463,24 +624,47 @@ fn copy_file(
     match current_fingerprint(&source) {
         Ok(post) if !FileFingerprint::compare(&pre, &post).is_changed() => {}
         _ => {
-            remove_own_partial(&partial);
-            return Err(OperationFailure::fatal(
+            let failure = OperationFailure::fatal(
                 OperationErrorCode::SourceChanged,
                 "source changed while copying (RFC-0001 §27.5)",
+            );
+            return Err(cleanup_after_claimed_failure(
+                safe_root,
+                &partial_relative,
+                partial_identity,
+                failure,
             ));
         }
     }
     // Re-prove the root boundary after reading and before committing the
     // destination. This catches a junction/root swap during a long copy; the
     // file fingerprint above independently catches a source-object swap.
-    validate_source_root(safe_root, operation)?;
+    if let Err(failure) = validate_source_root(safe_root, operation) {
+        return Err(cleanup_after_claimed_failure(
+            safe_root,
+            &partial_relative,
+            partial_identity,
+            failure,
+        ));
+    }
 
     // 8. Finalize. The no-overwrite guarantee comes from the platform, not
     // from a prior exists() check, which would be a race (ADR-0021): if the
-    // destination appeared during the copy, the kernel itself refuses.
-    if let Err(error) = df_fs_safety::finalize_no_replace(&partial, &destination) {
-        remove_own_partial(&partial);
-        return Err(OperationFailure::from_fs_safety(error));
+    // destination appeared during the copy, the kernel itself refuses. The
+    // identity check and rename both happen on the same handle, so a foreign
+    // replacement cannot enter between them.
+    if let Err(error) = safe_root.finalize_claimed_partial_no_replace(
+        &partial_relative,
+        &relative,
+        partial_identity,
+    ) {
+        let failure = OperationFailure::from_fs_safety(error);
+        return Err(cleanup_after_claimed_failure(
+            safe_root,
+            &partial_relative,
+            partial_identity,
+            failure,
+        ));
     }
 
     Ok(OperationOutcome {
@@ -495,6 +679,7 @@ fn copy_file(
         sha256: Some(copy.sha256),
         blake3: Some(copy.blake3),
         started_at: chrono::Utc::now(),
+        retain_partial_lease: false,
     })
 }
 
@@ -564,7 +749,10 @@ fn resolve_collision(
     expected_sha256: &str,
     options: &ExecuteOptions,
 ) -> Result<(SafeRelativePath, bool), OperationFailure> {
-    if !planned_absolute.exists() {
+    // Existence and re-hash must use the extended form: a long path probed
+    // without it reports "not found" for a file that is really there, and the
+    // collision logic would mis-see a taken destination as free.
+    if !df_fs_safety::extended_for_io(planned_absolute).exists() {
         return Ok((planned_relative.clone(), false));
     }
     let existing_sha = hash_existing(planned_absolute, options.copy_buffer_bytes)
@@ -580,7 +768,7 @@ fn resolve_collision(
         .map_err(OperationFailure::from_fs_safety)?
         .absolute()
         .to_path_buf();
-    if !suffixed_absolute.exists() {
+    if !df_fs_safety::extended_for_io(&suffixed_absolute).exists() {
         return Ok((suffixed_relative, false));
     }
     let suffixed_sha = hash_existing(&suffixed_absolute, options.copy_buffer_bytes)
@@ -597,29 +785,104 @@ fn resolve_collision(
     ))
 }
 
-/// `.<name>.dataforge-partial-<operation-id>` next to the destination (§27.2).
-fn partial_file_name(relative: &SafeRelativePath, operation: &ExecutableOperation) -> String {
+/// `.dataforge-partial-<operation-id>-<lease-token>` next to the destination.
+///
+/// The original file name deliberately does not participate. A valid NTFS
+/// component may already occupy all 255 UTF-16 units; adding our bookkeeping
+/// suffix to it would make the partial impossible to create even with a
+/// `\\?\` path. Two UUIDs still consume fewer than 100 UTF-16 units. The
+/// random lease is committed before file creation, so a pre-existing name
+/// cannot acquire executor ownership merely by a state transition.
+fn partial_file_name(
+    operation: &ExecutableOperation,
+    lease_token: &str,
+) -> Result<String, OperationFailure> {
+    let parsed = uuid::Uuid::parse_str(lease_token).map_err(|_| {
+        OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease token is not a UUID",
+        )
+    })?;
+    let canonical = parsed.hyphenated().to_string();
+    if canonical != lease_token {
+        return Err(OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease token is not in canonical form",
+        ));
+    }
+    let name = format!(".dataforge-partial-{}-{canonical}", operation.operation_id);
+    debug_assert!(name.encode_utf16().count() <= 255);
+    Ok(name)
+}
+
+fn format_partial_identity(identity: FileIdentity) -> String {
     format!(
-        ".{}.dataforge-partial-{}",
-        relative.file_name(),
-        operation.operation_id
+        "{:016x}:{:016x}",
+        identity.volume_serial, identity.file_index
     )
+}
+
+fn parse_partial_identity(value: &str) -> Result<FileIdentity, OperationFailure> {
+    let (volume, file) = value.split_once(':').ok_or_else(|| {
+        OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease identity has no separator",
+        )
+    })?;
+    if value.len() != 33 || volume.len() != 16 || file.len() != 16 {
+        return Err(OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease identity has an invalid length",
+        ));
+    }
+    let volume_serial = u64::from_str_radix(volume, 16).map_err(|_| {
+        OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease volume identity is invalid",
+        )
+    })?;
+    let file_index = u64::from_str_radix(file, 16).map_err(|_| {
+        OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease file identity is invalid",
+        )
+    })?;
+    if format!("{volume_serial:016x}:{file_index:016x}") != value || file_index == 0 {
+        return Err(OperationFailure::fatal(
+            OperationErrorCode::InvalidPath,
+            "partial lease identity is not canonical physical identity",
+        ));
+    }
+    Ok(FileIdentity {
+        volume_serial,
+        file_index,
+    })
 }
 
 /// Deterministic suffix before the extension (§27.3), matching the planner.
 fn suffixed_file_name(relative: &SafeRelativePath, sha256: &str) -> String {
-    let tag = &sha256[..8.min(sha256.len())];
-    let name = relative.file_name();
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem}~df-{tag}.{ext}"),
-        _ => format!("{name}~df-{tag}"),
-    }
+    df_fs_safety::deterministic_collision_file_name(relative.file_name(), sha256)
 }
 
-/// Remove a partial file this run created. Own artefacts only — the path
-/// always comes from [`partial_path`].
-fn remove_own_partial(partial: &Path) {
-    let _ = std::fs::remove_file(partial);
+/// Resolve a failure after a durable partial claim without losing recovery
+/// authority. A transient cleanup I/O failure keeps RUNNING+claim; an identity
+/// conflict is foreign and fails closed without retaining ownership.
+fn cleanup_after_claimed_failure(
+    safe_root: &SafeOutputRoot,
+    partial: &SafeRelativePath,
+    identity: FileIdentity,
+    original: OperationFailure,
+) -> OperationFailure {
+    match safe_root.remove_leased_partial_secure(partial, identity) {
+        Ok(_) => original,
+        Err(
+            error @ (FsSafetyError::Io { .. } | FsSafetyError::OutputRootIdentityChanged { .. }),
+        ) => OperationFailure::retained_cleanup(format!(
+            "{}; cleanup of the physically claimed partial must be retried: {error}",
+            original.detail
+        )),
+        Err(error) => OperationFailure::from_fs_safety(error),
+    }
 }
 
 struct StreamedCopy {
@@ -663,7 +926,7 @@ fn stream_copy(
 }
 
 fn hash_existing(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
-    let mut reader = std::fs::File::open(path)?;
+    let mut reader = std::fs::File::open(df_fs_safety::extended_for_io(path))?;
     let mut sha = sha2::Sha256::new();
     let mut buffer = vec![0u8; buffer_bytes];
     loop {
@@ -763,6 +1026,56 @@ mod tests {
             }
         }
         true
+    }
+
+    fn first_copy_operation(db: &Db) -> ExecutableOperation {
+        let project = repository::load_project(db).unwrap();
+        let plan = plans::current_plan(db, project.id).unwrap().unwrap();
+        plans::executable_operations(db, plan.id, u32::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.expected_sha256.is_some())
+            .expect("the fixture has at least one executable copy")
+    }
+
+    fn planted_partial(
+        output: &Path,
+        operation: &ExecutableOperation,
+        lease_token: &str,
+    ) -> PathBuf {
+        let destination = output.join(&operation.destination_relative_path);
+        let parent = destination.parent().expect("copy destination has a parent");
+        std::fs::create_dir_all(parent).unwrap();
+        parent.join(partial_file_name(operation, lease_token).unwrap())
+    }
+
+    fn create_and_claim_partial(
+        db: &Db,
+        output: &Path,
+        operation: &ExecutableOperation,
+        lease_token: &str,
+        bytes: &[u8],
+    ) -> (PathBuf, FileIdentity) {
+        let partial = planted_partial(output, operation, lease_token);
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .unwrap();
+        let identity = df_fs_safety::identity_of_open_file(&handle, &partial)
+            .unwrap()
+            .expect("the executor requires physical identity");
+        plans::claim_copy_partial(
+            db,
+            operation.operation_id,
+            lease_token,
+            &format_partial_identity(identity),
+        )
+        .unwrap();
+        handle.write_all(bytes).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+        (partial, identity)
     }
 
     /// Create a directory junction with `mklink /J`. Returns false when the
@@ -1098,6 +1411,493 @@ mod tests {
             execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
         assert_eq!(outcome.state, "EXECUTED");
         assert_eq!(outcome.completed, 6);
+    }
+
+    /// Threat T8: a RUNNING operation plus its random durable token identifies
+    /// the executor-owned partial. A killed process must not strand it forever.
+    #[test]
+    fn crash_with_partial_file_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+
+        // Exact durable state left by a killed attempt: token + RUNNING were
+        // committed before create; physical ownership was then claimed from
+        // the create_new handle before this partial was partially written.
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (partial, _) = create_and_claim_partial(
+            &fx.db,
+            &fx.output,
+            &operation,
+            &token,
+            b"prefix copied before the crash",
+        );
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        let mut statement = fx
+            .db
+            .conn_for_tests()
+            .prepare(
+                "SELECT p.destination_relative_path, r.outcome, r.detail
+                 FROM operation_results r
+                 JOIN plan_operations p ON p.id = r.operation_id
+                 ORDER BY p.sequence",
+            )
+            .unwrap();
+        let diagnostics: Vec<(Option<String>, String, Option<String>)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}; {diagnostics:#?}");
+        assert_eq!(outcome.failed_retryable, 0, "{outcome:?}");
+        assert_eq!(outcome.failed_final, 0, "{outcome:?}");
+        assert!(
+            !partial.exists(),
+            "the leased stale partial must be reclaimed"
+        );
+        assert_eq!(
+            std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
+            b"same bytes"
+        );
+    }
+
+    /// Crash ordering invariant: attempt A remains the durable claim until
+    /// reclaim(A) succeeds. A crash after removal but before lease(B) is then
+    /// replayable as a missing-file no-op with A still in the database.
+    #[test]
+    fn crash_between_reclaim_and_new_lease_is_replayable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (partial, identity) =
+            create_and_claim_partial(&fx.db, &fx.output, &operation, &token, b"stale");
+        let interrupted = first_copy_operation(&fx.db);
+        let safe_root = SafeOutputRoot::validate(&fx.output).unwrap();
+
+        reclaim_interrupted_partial(&safe_root, &interrupted).unwrap();
+        assert!(!partial.exists());
+        let (state, stored_token, stored_identity): (String, Option<String>, Option<String>) = fx
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT execution_state, partial_lease_token, partial_lease_identity
+                 FROM plan_operations WHERE id = ?1",
+                [operation.operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "RUNNING");
+        assert_eq!(stored_token.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            stored_identity.as_deref(),
+            Some(format_partial_identity(identity).as_str())
+        );
+
+        // Simulated crash here: no B was issued. Full execute repeats the A
+        // cleanup as a no-op, then leases B and completes.
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blocked_reclaim_retains_claim_until_retry_can_remove_it() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (partial, identity) =
+            create_and_claim_partial(&fx.db, &fx.output, &operation, &token, b"stale");
+        let interrupted = first_copy_operation(&fx.db);
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no SHARE_DELETE.
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&partial)
+            .unwrap();
+        let safe_root = SafeOutputRoot::validate(&fx.output).unwrap();
+
+        let failure = reclaim_interrupted_partial(&safe_root, &interrupted).unwrap_err();
+        assert!(failure.retain_partial_lease, "{failure:?}");
+        assert_eq!(failure.state, ExecutionState::Running);
+        let outcome = failure.into_outcome(chrono::Utc::now());
+        plans::record_operation_outcome(&mut fx.db, operation.operation_id, &outcome).unwrap();
+
+        let (state, stored_token, stored_identity): (String, Option<String>, Option<String>) = fx
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT execution_state, partial_lease_token, partial_lease_identity
+                 FROM plan_operations WHERE id = ?1",
+                [operation.operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "RUNNING");
+        assert_eq!(stored_token.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            stored_identity.as_deref(),
+            Some(format_partial_identity(identity).as_str())
+        );
+        assert_eq!(std::fs::read(&partial).unwrap(), b"stale");
+
+        drop(blocker);
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn reopened_executing_project_with_claim_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let database = tmp.path().join("state.sqlite");
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (partial, _) =
+            create_and_claim_partial(&fx.db, &fx.output, &operation, &token, b"stale");
+        repository::update_project_state(&mut fx.db, ProjectState::Executing, Actor::Test).unwrap();
+        drop(fx.db);
+
+        let mut reopened = Db::open(&database).unwrap();
+        let outcome =
+            execute_plan(&mut reopened, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn reopened_executing_project_before_first_operation_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let database = tmp.path().join("state.sqlite");
+        let mut fx = approved_project(tmp.path());
+        repository::update_project_state(&mut fx.db, ProjectState::Executing, Actor::Test).unwrap();
+        drop(fx.db);
+
+        let mut reopened = Db::open(&database).unwrap();
+        let outcome =
+            execute_plan(&mut reopened, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(outcome.completed, 6);
+    }
+
+    #[test]
+    fn executing_with_terminal_operations_reuses_latest_completion_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        let project = repository::load_project(&fx.db).unwrap();
+        let plan = plans::current_plan(&fx.db, project.id).unwrap().unwrap();
+        // Exact legacy crash window: operations terminal, project still
+        // EXECUTING, and EXECUTION_COMPLETED is already the latest event.
+        fx.db
+            .conn_for_tests()
+            .execute(
+                "UPDATE projects SET state = 'EXECUTING' WHERE id = ?1",
+                [project.id.to_string()],
+            )
+            .unwrap();
+        plans::emit_event(
+            &mut fx.db,
+            project.id,
+            plans::EVENT_EXECUTION_COMPLETED,
+            &serde_json::json!({"plan_id": plan.id.to_string(), "legacy_crash": true}),
+            Actor::Test,
+        )
+        .unwrap();
+        let completed_events = |db: &Db| -> i64 {
+            db.conn_for_tests()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_events
+                     WHERE event_type = 'EXECUTION_COMPLETED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let before = completed_events(&fx.db);
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(
+            completed_events(&fx.db),
+            before,
+            "recovery must not duplicate the already-committed milestone"
+        );
+    }
+
+    /// A reserved-looking file is not executor-owned merely because it uses
+    /// the operation UUID and a valid token shape. A fresh attempt leases a
+    /// different unpredictable name and preserves the foreign bytes.
+    #[test]
+    fn a_pending_partial_squatter_is_never_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let foreign_token = uuid::Uuid::new_v4().to_string();
+        let squatted = planted_partial(&fx.output, &operation, &foreign_token);
+        std::fs::write(&squatted, b"foreign bytes; never delete").unwrap();
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(outcome.failed_retryable, 0, "{outcome:?}");
+        assert_eq!(
+            std::fs::read(&squatted).unwrap(),
+            b"foreign bytes; never delete"
+        );
+    }
+
+    /// Regression for the unsafe RUNNING-only design: a foreign partial that
+    /// predates `mark RUNNING`, followed by a crash before create_new, must not
+    /// be reclassified as ours and deleted by the next execution.
+    #[test]
+    fn a_preexisting_squatter_does_not_become_owned_after_mark_then_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let foreign_token = uuid::Uuid::new_v4().to_string();
+        let squatted = planted_partial(&fx.output, &operation, &foreign_token);
+        std::fs::write(&squatted, b"present before the lease").unwrap();
+
+        // Simulate the precise crash window: the database transition commits,
+        // but the process dies before creating/writing its own token path.
+        let leased_token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        assert_ne!(leased_token, foreign_token);
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(
+            std::fs::read(&squatted).unwrap(),
+            b"present before the lease",
+            "RUNNING alone must never transfer ownership of a foreign entry"
+        );
+    }
+
+    /// Adversarial crash window: create_new sees a foreign file at the exact
+    /// reserved token and fails, then the process dies before recording the
+    /// outcome. With no post-create identity claim, retry must never delete it.
+    #[test]
+    fn create_new_collision_then_crash_never_authorizes_foreign_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let squatted = planted_partial(&fx.output, &operation, &token);
+        std::fs::write(&squatted, b"foreign exact-token squatter").unwrap();
+        let relative_destination =
+            SafeRelativePath::parse(Path::new(&operation.destination_relative_path)).unwrap();
+        let partial_relative = relative_destination
+            .with_file_name(&partial_file_name(&operation, &token).unwrap())
+            .unwrap();
+        let safe_root = SafeOutputRoot::validate(&fx.output).unwrap();
+        assert!(
+            safe_root.create_partial_secure(&partial_relative).is_err(),
+            "the simulated create_new must collide"
+        );
+        let claim: Option<String> = fx
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT partial_lease_identity FROM plan_operations WHERE id = ?1",
+                [operation.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(claim.is_none(), "failed create_new must never gain a claim");
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(
+            std::fs::read(&squatted).unwrap(),
+            b"foreign exact-token squatter"
+        );
+    }
+
+    /// The only unavoidable crash window is after our `create_new` succeeds
+    /// but before its physical identity is committed. With no durable claim,
+    /// retry must favor preservation: finish under a fresh lease and leave the
+    /// old object for the independent verifier to report as a partial orphan.
+    #[test]
+    fn crash_after_create_before_claim_preserves_the_unclaimed_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let orphan = planted_partial(&fx.output, &operation, &token);
+        let relative_destination =
+            SafeRelativePath::parse(Path::new(&operation.destination_relative_path)).unwrap();
+        let partial_relative = relative_destination
+            .with_file_name(&partial_file_name(&operation, &token).unwrap())
+            .unwrap();
+        let safe_root = SafeOutputRoot::validate(&fx.output).unwrap();
+        let mut handle = safe_root.create_partial_secure(&partial_relative).unwrap();
+        handle.write_all(b"ours, but not durably claimed").unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        let claim: Option<String> = fx
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT partial_lease_identity FROM plan_operations WHERE id = ?1",
+                [operation.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(claim.is_none(), "the simulated crash precedes the claim");
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"ours, but not durably claimed",
+            "a token without physical identity is never deletion authority"
+        );
+        assert_eq!(
+            std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
+            b"same bytes"
+        );
+    }
+
+    /// A claimed partial can still be replaced after a crash. The persisted
+    /// physical identity must make retry reject and preserve the substitute.
+    #[test]
+    fn a_partial_substituted_after_claim_is_never_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (partial, claimed) =
+            create_and_claim_partial(&fx.db, &fx.output, &operation, &token, b"ours");
+        std::fs::remove_file(&partial).unwrap();
+        std::fs::write(&partial, b"foreign replacement").unwrap();
+        assert_ne!(
+            df_fs_safety::identity_of(&partial).unwrap(),
+            Some(claimed),
+            "the test must replace the physical object"
+        );
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.failed_final, 1, "{outcome:?}");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"foreign replacement");
+    }
+
+    /// If the process dies after atomic finalize but before recording its
+    /// result, retry sees no partial and the identical destination completes
+    /// as already represented. The lease is cleared with that outcome.
+    #[test]
+    fn crash_after_finalize_before_outcome_resumes_and_clears_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let source_bytes = std::fs::read(source_path(&operation).unwrap()).unwrap();
+        let (partial, identity) =
+            create_and_claim_partial(&fx.db, &fx.output, &operation, &token, &source_bytes);
+        let destination = fx.output.join(&operation.destination_relative_path);
+        let safe_root = SafeOutputRoot::validate(&fx.output).unwrap();
+        let destination_relative =
+            SafeRelativePath::parse(Path::new(&operation.destination_relative_path)).unwrap();
+        let partial_relative = destination_relative
+            .with_file_name(&partial_file_name(&operation, &token).unwrap())
+            .unwrap();
+        safe_root
+            .finalize_claimed_partial_no_replace(&partial_relative, &destination_relative, identity)
+            .unwrap();
+        assert!(!partial.exists());
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert_eq!(std::fs::read(&destination).unwrap(), source_bytes);
+        let (stored_token, stored_identity): (Option<String>, Option<String>) = fx
+            .db
+            .conn_for_tests()
+            .query_row(
+                "SELECT partial_lease_token, partial_lease_identity
+                 FROM plan_operations WHERE id = ?1",
+                [operation.operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(stored_token.is_none(), "outcome must clear the lease");
+        assert!(stored_identity.is_none(), "outcome must clear the claim");
+    }
+
+    /// Even with a RUNNING lease, reclamation is restricted to plain files.
+    /// A directory (and, at the fs-safety boundary, any reparse point) is an
+    /// unsafe ownership conflict, not something the executor may remove.
+    #[test]
+    fn a_running_non_file_partial_is_refused_without_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (planted, _) = create_and_claim_partial(&fx.db, &fx.output, &operation, &token, b"");
+        std::fs::remove_file(&planted).unwrap();
+        std::fs::create_dir(&planted).unwrap();
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.failed_final, 1, "{outcome:?}");
+        assert!(
+            planted.is_dir(),
+            "the non-file conflict must survive untouched"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_claimed_partial_replaced_by_reparse_is_refused_without_following() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        let (planted, _) =
+            create_and_claim_partial(&fx.db, &fx.output, &operation, &token, b"ours");
+        std::fs::remove_file(&planted).unwrap();
+        let outside = tmp.path().join("outside-partial-target");
+        std::fs::create_dir(&outside).unwrap();
+        if !make_junction(&planted, &outside) {
+            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            return;
+        }
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert_eq!(outcome.failed_final, 1, "{outcome:?}");
+        assert!(df_fs_safety::is_reparse_point(&planted).unwrap());
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "recovery must never follow the replacement"
+        );
     }
 
     #[test]

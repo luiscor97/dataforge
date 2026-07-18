@@ -6,11 +6,23 @@
 //! - §35: a project lives in its own directory with a JSON marker and a
 //!   SQLite database under `state/`.
 
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
+use df_db::extraction::{
+    self, AnalyticalSnapshotRecord, ExtractionContentSource, ExtractionRunSpec, MailThreadInput,
+    MailThreadMemberInput, SearchIndexRecord, ThreadMessageRow,
+};
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
-use df_domain::{Actor, ProfileRef, Project, ProjectState, SnapshotId, SourceRoot, TreeCloneSet};
+use df_domain::{
+    Actor, ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus,
+    FileFingerprint, MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId,
+    SnapshotId, SourceRoot, TreeCloneSet,
+};
+use sha2::{Digest, Sha256};
 
 /// Re-exported so clients can name a policy without depending on `df-domain`
 /// (RFC-0001 rules 16/17: clients only ever talk to the facade).
@@ -24,7 +36,12 @@ pub use df_executor::ExecuteOutcome;
 pub use df_hash::HashOutcome;
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
 pub use df_scan::ScanOutcome;
+pub use df_similarity::{SimilarityOptions, SimilarityOutcome};
 pub use df_verifier::VerifyOutcome;
+
+pub use df_extract::ExtractionLimits;
+pub use df_query::{QueryColumn, QueryOptions, QueryResult, SnapshotBuildOptions};
+pub use df_search::{SearchBuildOptions, SearchHit, SearchRequest};
 
 /// Version of the engine that clients report and projects record.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,6 +54,8 @@ pub const PROJECT_DB_RELATIVE: &str = "state/dataforge.sqlite";
 
 const MARKER_SCHEMA: &str = "dataforge.project";
 const MARKER_SCHEMA_VERSION: &str = "1.0.0";
+const DEFAULT_EXTRACTION_PAGE_SIZE: u32 = 64;
+const MAX_EXTRACTION_PAGE_SIZE: u32 = 4_096;
 
 /// Request to create a project (RFC-0001 §9.1, §35).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +119,252 @@ pub struct ProjectStatus {
     /// scan even when analysis has not completed, so clients can distinguish
     /// “not analysed” from a genuine zero count.
     pub structural_diagnostics: Option<StructuralDiagnostics>,
+    /// Latest sealed M0.3 content-similarity evidence for this snapshot.
+    pub similarity: Option<SimilarityStatus>,
     /// Present when an integrity pass was executed (project_status).
     pub integrity: Option<IntegrityReport>,
+}
+
+/// Compact, human-readable relation. It is evidence only: `automatic_action`
+/// is not a field because no such action exists in the M0.3 contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarityRelationView {
+    pub id: String,
+    pub content_a: String,
+    pub content_b: String,
+    pub path_a: String,
+    pub path_b: String,
+    pub kind: String,
+    pub direction: String,
+    pub similarity: f64,
+    pub shared_chunks: u64,
+    pub shared_bytes: u64,
+    pub union_bytes: u64,
+    pub estimated_similarity: f64,
+    pub confidence: f64,
+    pub evidence: serde_json::Value,
+}
+
+/// Sealed similarity summary embedded in project status and reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarityStatus {
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub algorithm_version: String,
+    pub config_digest: String,
+    pub config: serde_json::Value,
+    pub counters: df_domain::SimilarityRunCounters,
+    pub candidate_cap_reached: bool,
+    pub relationships: Vec<SimilarityRelationView>,
+    pub relationships_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarityReport {
+    pub status: SimilarityStatus,
+    pub evidence_only: bool,
+}
+
+/// Bounded, persisted content-extraction settings. `page_size` affects only
+/// scheduling and is deliberately excluded from the evidence digest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentExtractionOptions {
+    #[serde(default)]
+    pub limits: ExtractionLimits,
+    #[serde(default = "default_extraction_page_size")]
+    pub page_size: u32,
+    /// Optional absolute path to the isolated PDF worker. This is an
+    /// operational deployment choice, never part of the evidence digest.
+    #[serde(default)]
+    pub pdf_worker: Option<PathBuf>,
+}
+
+const fn default_extraction_page_size() -> u32 {
+    DEFAULT_EXTRACTION_PAGE_SIZE
+}
+
+impl Default for ContentExtractionOptions {
+    fn default() -> Self {
+        Self {
+            limits: ExtractionLimits::default(),
+            page_size: DEFAULT_EXTRACTION_PAGE_SIZE,
+            pdf_worker: None,
+        }
+    }
+}
+
+impl ContentExtractionOptions {
+    fn validate(&self) -> DfResult<()> {
+        self.limits.validate()?;
+        if self.page_size == 0 || self.page_size > MAX_EXTRACTION_PAGE_SIZE {
+            return Err(DfError::Validation(format!(
+                "content extraction page_size must be between 1 and {MAX_EXTRACTION_PAGE_SIZE}"
+            )));
+        }
+        if let Some(path) = self.pdf_worker.as_deref() {
+            if !path.is_absolute() {
+                return Err(DfError::Validation(
+                    "PDF worker path must be absolute; PATH lookup is disabled".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_worker_path(path: &Path, worker_name: &str, explicit: bool) -> DfResult<()> {
+    if !path.is_absolute() {
+        return Err(DfError::Validation(format!(
+            "{worker_name} worker path must be absolute; PATH lookup is disabled"
+        )));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if explicit && error.kind() == std::io::ErrorKind::NotFound {
+            DfError::NotFound(format!("{worker_name} worker `{}`", path.display()))
+        } else {
+            DfError::io(path, error)
+        }
+    })?;
+    if !metadata.is_file() || df_fs_safety::metadata_is_reparse(&metadata) {
+        return Err(DfError::Validation(format!(
+            "{worker_name} worker `{}` must be a plain regular file, never a reparse point",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_pdf_worker(explicit: Option<&Path>) -> DfResult<Option<df_extract::PdfWorkerConfig>> {
+    let path = match explicit {
+        Some(path) => {
+            validate_worker_path(path, "PDF", true)?;
+            path.to_path_buf()
+        }
+        None => {
+            let executable = std::env::current_exe().map_err(|error| {
+                DfError::Validation(format!("cannot locate the DataForge executable: {error}"))
+            })?;
+            let parent = executable.parent().ok_or_else(|| {
+                DfError::Validation(
+                    "DataForge executable has no directory for a PDF worker sidecar".to_string(),
+                )
+            })?;
+            #[cfg(windows)]
+            let candidate = parent.join("df-extract-worker.exe");
+            #[cfg(not(windows))]
+            let candidate = parent.join("df-extract-worker");
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    validate_worker_path(&candidate, "PDF", false)?;
+                    candidate
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(DfError::io(&candidate, error)),
+            }
+        }
+    };
+    Ok(Some(df_extract::PdfWorkerConfig::new(path)))
+}
+
+fn resolve_query_worker(explicit: Option<&Path>) -> DfResult<df_query::QueryWorkerConfig> {
+    let path = match explicit {
+        Some(path) => {
+            validate_worker_path(path, "analytical", true)?;
+            path.to_path_buf()
+        }
+        None => {
+            let executable = std::env::current_exe().map_err(|error| {
+                DfError::Validation(format!("cannot locate the DataForge executable: {error}"))
+            })?;
+            let parent = executable.parent().ok_or_else(|| {
+                DfError::Validation(
+                    "DataForge executable has no directory for an analytical worker sidecar"
+                        .to_string(),
+                )
+            })?;
+            #[cfg(windows)]
+            let candidate = parent.join("df-query-worker.exe");
+            #[cfg(not(windows))]
+            let candidate = parent.join("df-query-worker");
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    validate_worker_path(&candidate, "analytical", false)?;
+                    candidate
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(DfError::Validation(
+                        "analytical SQL requires the resource-isolated `df-query-worker` sidecar; PATH lookup and in-process fallback are disabled"
+                            .to_string(),
+                    ))
+                }
+                Err(error) => return Err(DfError::io(&candidate, error)),
+            }
+        }
+    };
+    Ok(df_query::QueryWorkerConfig::new(path))
+}
+
+/// Stable CLI/desktop view of an extraction run. Per-invocation counters make
+/// resumptions and cross-snapshot evidence reuse visible without weakening the
+/// sealed database counters.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentExtractionOutcome {
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub status: String,
+    pub extractor_version: String,
+    pub config_digest: String,
+    pub counters: ExtractionRunCounters,
+    pub processed_this_invocation: u64,
+    pub reused_this_invocation: u64,
+    pub threads_built_this_invocation: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchIndexView {
+    pub id: String,
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub schema_version: String,
+    pub relative_path: String,
+    pub content_digest: String,
+    pub documents: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalyticalSnapshotView {
+    pub id: String,
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub schema_version: String,
+    pub relative_path: String,
+    pub sha256: String,
+    pub rows: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentArtifactBuildOutcome {
+    pub run_id: String,
+    pub search_index: SearchIndexView,
+    pub analytical_snapshot: AnalyticalSnapshotView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentSearchOutcome {
+    pub run_id: String,
+    pub index: SearchIndexView,
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentQueryOutcome {
+    pub run_id: String,
+    pub snapshot: AnalyticalSnapshotView,
+    pub result: QueryResult,
 }
 
 /// Content of `project.dataforge.json` (versioned per RFC-0001 §36).
@@ -250,6 +513,15 @@ fn status_from_db(
         .as_ref()
         .map(|snapshot| df_db::analysis::diagnostics(db, snapshot.id))
         .transpose()?;
+    let similarity = match (
+        snapshot.as_ref(),
+        df_db::similarity::latest_completed_run(db, project.id)?,
+    ) {
+        (Some(snapshot), Some(run)) if run.snapshot_id == snapshot.id => {
+            Some(similarity_status(db, &run, 20)?)
+        }
+        _ => None,
+    };
 
     Ok(ProjectStatus {
         project_id: project.id.to_string(),
@@ -281,7 +553,56 @@ fn status_from_db(
         latest_snapshot_id: snapshot.map(|s| s.id.to_string()),
         inventory,
         structural_diagnostics,
+        similarity,
         integrity,
+    })
+}
+
+fn similarity_status(
+    db: &Db,
+    run: &df_domain::SimilarityRun,
+    limit: u32,
+) -> DfResult<SimilarityStatus> {
+    let relationships = df_db::similarity::list_relationships(db, run.id, limit)?
+        .into_iter()
+        .map(|relation| {
+            Ok(SimilarityRelationView {
+                id: relation.id.to_string(),
+                content_a: relation.content_a.to_string(),
+                content_b: relation.content_b.to_string(),
+                path_a: df_db::similarity::representative_display_path(
+                    db,
+                    relation.snapshot_id,
+                    relation.content_a,
+                )?,
+                path_b: df_db::similarity::representative_display_path(
+                    db,
+                    relation.snapshot_id,
+                    relation.content_b,
+                )?,
+                kind: relation.kind.as_str().to_string(),
+                direction: relation.direction.as_str().to_string(),
+                similarity: relation.similarity,
+                shared_chunks: relation.shared_chunks,
+                shared_bytes: relation.shared_bytes,
+                union_bytes: relation.union_bytes,
+                estimated_similarity: relation.estimated_similarity,
+                confidence: relation.confidence,
+                evidence: relation.evidence,
+            })
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    let relationships_truncated = run.counters.relations_total > relationships.len() as u64;
+    Ok(SimilarityStatus {
+        run_id: run.id.to_string(),
+        snapshot_id: run.snapshot_id.to_string(),
+        algorithm_version: run.algorithm_version.clone(),
+        config_digest: run.config_digest.clone(),
+        config: run.config.clone(),
+        counters: run.counters,
+        candidate_cap_reached: run.candidate_cap_reached,
+        relationships,
+        relationships_truncated,
     })
 }
 
@@ -589,6 +910,608 @@ pub fn analyze_project(project_dir: &Path, actor: Actor) -> DfResult<AnalyzeOutc
     df_planner::analyze_project(&mut db, actor)
 }
 
+/// Discover version-like relationships between non-identical contents using
+/// the bounded default M0.3 configuration.
+pub fn analyze_similarity(project_dir: &Path, actor: Actor) -> DfResult<SimilarityOutcome> {
+    analyze_similarity_with_options(project_dir, actor, &SimilarityOptions::default())
+}
+
+/// Configurable entry point used by tests and future advanced clients. The
+/// serialized options are part of the immutable run identity.
+pub fn analyze_similarity_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &SimilarityOptions,
+) -> DfResult<SimilarityOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    df_similarity::analyze_project(&mut db, actor, options, None)
+}
+
+/// Latest sealed similarity evidence. Relations are explicitly informational
+/// and cannot be translated to plan operations by this API.
+pub fn similarity_report(project_dir: &Path) -> DfResult<SimilarityReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let run = df_db::similarity::latest_completed_run(&db, project.id)?
+        .filter(|run| run.snapshot_id == snapshot.id)
+        .ok_or_else(|| {
+            DfError::Validation(
+                "the latest snapshot has no completed similarity run; run similarity first"
+                    .to_string(),
+            )
+        })?;
+    Ok(SimilarityReport {
+        status: similarity_status(&db, &run, 1_000)?,
+        evidence_only: true,
+    })
+}
+
+fn extraction_outcome(
+    run: ExtractionRun,
+    processed: u64,
+    reused: u64,
+    threads: u64,
+) -> ContentExtractionOutcome {
+    ContentExtractionOutcome {
+        run_id: run.id.to_string(),
+        snapshot_id: run.snapshot_id.to_string(),
+        status: run.status.as_str().to_string(),
+        extractor_version: run.extractor_version,
+        config_digest: run.config_digest,
+        counters: run.counters,
+        processed_this_invocation: processed,
+        reused_this_invocation: reused,
+        threads_built_this_invocation: threads,
+        error: run.error,
+    }
+}
+
+fn extraction_spec(
+    project_id: ProjectId,
+    snapshot_id: SnapshotId,
+    limits: &ExtractionLimits,
+) -> DfResult<ExtractionRunSpec> {
+    limits.validate()?;
+    Ok(ExtractionRunSpec {
+        project_id,
+        snapshot_id,
+        extractor_version: df_extract::EXTRACTOR_VERSION.to_string(),
+        // The extractor version is a separate part of the database identity.
+        // The digest is intentionally just the canonical limit structure.
+        config_digest: limits.digest()?,
+        config_json: serde_json::to_string(limits)
+            .map_err(|error| DfError::Serialization(format!("extraction limits: {error}")))?,
+        max_input_bytes: limits.max_input_bytes,
+        max_text_chars: limits.max_text_chars,
+        text_segment_chars: limits.text_segment_chars,
+        max_archive_entries: u32::try_from(limits.max_archive_entries)
+            .map_err(|_| DfError::Validation("max_archive_entries does not fit u32".to_string()))?,
+        max_archive_entry_bytes: limits.max_archive_entry_bytes,
+        max_archive_total_bytes: limits.max_archive_total_bytes,
+        max_archive_ratio: limits.max_archive_compression_ratio as f64,
+        max_archive_depth: u32::try_from(limits.max_archive_nesting_depth).map_err(|_| {
+            DfError::Validation("max_archive_nesting_depth does not fit u32".to_string())
+        })?,
+    })
+}
+
+fn raw_source_relative(source: &ExtractionContentSource) -> DfResult<PathBuf> {
+    let raw = source.raw_relative_path.as_ref().ok_or_else(|| {
+        DfError::Validation(format!(
+            "content `{}` cannot be reopened safely because its raw path evidence is missing",
+            source.content_id
+        ))
+    })?;
+    if raw.is_lossy() {
+        return Err(DfError::Validation(format!(
+            "content `{}` has a raw path that the strong read-lease boundary cannot represent safely",
+            source.content_id
+        )));
+    }
+    let relative = PathBuf::from(raw.to_os_string());
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DfError::Validation(format!(
+            "content `{}` has a non-relative raw source path",
+            source.content_id
+        )));
+    }
+    Ok(relative)
+}
+
+struct VerifiedSource {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+/// Read only the bounded prefix needed by the extractor while streaming the
+/// whole file through SHA-256. Fingerprint, physical root identity, size and
+/// canonical digest are checked around the read to close the ordinary TOCTOU
+/// windows without ever opening a source for writing.
+fn read_verified_source(
+    source: &ExtractionContentSource,
+    max_input_bytes: u64,
+) -> DfResult<VerifiedSource> {
+    let relative = raw_source_relative(source)?;
+    let safe_relative = df_fs_safety::SafeRelativePath::parse(&relative)?;
+    let safe_root = df_fs_safety::SafeOutputRoot::validate(&source.root_path)?;
+    let lease = safe_root.lease_existing_file(&safe_relative)?;
+    let path = lease.path().to_path_buf();
+    let stored = FileFingerprint::parse(&source.fingerprint)?;
+    let pre = df_fs_safety::capture_fingerprint(&path)?;
+    if FileFingerprint::compare(&stored, &pre).is_changed() || pre.size_bytes() != source.size_bytes
+    {
+        return Err(DfError::Conflict(format!(
+            "source `{}` changed after inventory/hash evidence was recorded",
+            source.relative_path
+        )));
+    }
+
+    let prefix_limit = usize::try_from(max_input_bytes)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            DfError::Validation("max_input_bytes cannot reserve a bounded prefix".to_string())
+        })?;
+    let mut file = lease
+        .file()
+        .try_clone()
+        .map_err(|error| DfError::io(&path, error))?;
+    file.rewind().map_err(|error| DfError::io(&path, error))?;
+    let mut digest = Sha256::new();
+    let source_capacity = usize::try_from(source.size_bytes).unwrap_or(prefix_limit);
+    let mut bytes = Vec::with_capacity(prefix_limit.min(source_capacity));
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| DfError::io(&path, error))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        read_total = read_total
+            .checked_add(read as u64)
+            .ok_or_else(|| DfError::Validation("source byte count overflow".to_string()))?;
+        if bytes.len() < prefix_limit {
+            let take = read.min(prefix_limit - bytes.len());
+            bytes.extend_from_slice(&buffer[..take]);
+        }
+    }
+    drop(file);
+
+    let post = df_fs_safety::capture_fingerprint(&path)?;
+    safe_root.revalidate()?;
+    if FileFingerprint::compare(&pre, &post).is_changed()
+        || FileFingerprint::compare(&stored, &post).is_changed()
+        || read_total != source.size_bytes
+    {
+        return Err(DfError::Conflict(format!(
+            "source `{}` changed while content was being read",
+            source.relative_path
+        )));
+    }
+    let sha256 = hex::encode(digest.finalize());
+    if sha256 != source.sha256 {
+        return Err(DfError::Conflict(format!(
+            "source `{}` no longer matches its canonical SHA-256",
+            source.relative_path
+        )));
+    }
+    Ok(VerifiedSource { bytes, sha256 })
+}
+
+fn normalized_message_id(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches(['<', '>']).trim();
+    (!value.is_empty()).then(|| value.to_lowercase())
+}
+
+fn deterministic_thread_id(
+    run_id: ExtractionRunId,
+    root_representation_id: RepresentationId,
+) -> MailThreadId {
+    let mut digest = Sha256::new();
+    digest.update(b"dataforge-mail-thread-v1\0");
+    digest.update(run_id.to_string().as_bytes());
+    digest.update([0]);
+    digest.update(root_representation_id.to_string().as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 9562 variant + custom version 8 bits communicate that this is a
+    // stable SHA-256-derived identifier rather than a random UUIDv4.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    MailThreadId::from_str(&uuid::Uuid::from_bytes(bytes).to_string())
+        .expect("a constructed UUID always parses as a typed thread id")
+}
+
+fn reconstruct_mail_threads(
+    run_id: ExtractionRunId,
+    messages: &[ThreadMessageRow],
+) -> Vec<MailThreadInput> {
+    let mut positions = HashMap::new();
+    let mut duplicate_ids = HashSet::new();
+    for (position, message) in messages.iter().enumerate() {
+        if let Some(id) = message
+            .message_id
+            .as_deref()
+            .and_then(normalized_message_id)
+        {
+            if positions.insert(id.clone(), position).is_some() {
+                duplicate_ids.insert(id);
+            }
+        }
+    }
+    for id in duplicate_ids {
+        positions.remove(&id);
+    }
+
+    let mut parents = vec![None; messages.len()];
+    let mut last_by_subject: HashMap<&str, usize> = HashMap::new();
+    for (position, message) in messages.iter().enumerate() {
+        let explicit = message
+            .references
+            .iter()
+            .rev()
+            .chain(message.in_reply_to.iter().rev())
+            .filter_map(|id| normalized_message_id(id))
+            .filter_map(|id| positions.get(&id).copied())
+            .find(|candidate| *candidate < position);
+        let subject = message
+            .normalized_subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        parents[position] =
+            explicit.or_else(|| subject.and_then(|key| last_by_subject.get(key).copied()));
+        if let Some(subject) = subject {
+            last_by_subject.insert(subject, position);
+        }
+    }
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for position in 0..messages.len() {
+        let mut root = position;
+        while let Some(parent) = parents[root] {
+            root = parent;
+        }
+        groups.entry(root).or_default().push(position);
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(root, _)| messages[*root].representation_id.to_string());
+    groups
+        .into_iter()
+        .map(|(root, members)| MailThreadInput {
+            id: deterministic_thread_id(run_id, messages[root].representation_id),
+            root_message_id: messages[root].message_id.clone(),
+            normalized_subject: messages[root].normalized_subject.clone(),
+            members: members
+                .into_iter()
+                .map(|position| MailThreadMemberInput {
+                    representation_id: messages[position].representation_id,
+                    parent_representation_id: parents[position]
+                        .map(|parent| messages[parent].representation_id),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn build_threads_if_needed(db: &mut Db, run_id: ExtractionRunId, actor: Actor) -> DfResult<u64> {
+    let messages = extraction::mail_messages_for_threading(db, run_id)?;
+    let (thread_count, member_count) = extraction::mail_thread_counts(db, run_id)?;
+    if thread_count > 0 {
+        if usize::try_from(member_count).ok() != Some(messages.len()) {
+            return Err(DfError::LedgerIntegrity(format!(
+                "run `{run_id}` has partial mail-thread evidence"
+            )));
+        }
+        return Ok(0);
+    }
+    let threads = reconstruct_mail_threads(run_id, &messages);
+    extraction::persist_mail_threads(db, run_id, &threads, actor)
+}
+
+/// Extract all unique contents of the latest analysed snapshot. Committed
+/// contents are omitted on replay, so rerunning after interruption resumes at
+/// the first gap. Operational errors leave the run RUNNING: after restoring
+/// the immutable source, the same command can safely continue.
+pub fn extract_project_content(
+    project_dir: &Path,
+    actor: Actor,
+    options: &ContentExtractionOptions,
+) -> DfResult<ContentExtractionOutcome> {
+    options.validate()?;
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let spec = extraction_spec(project.id, snapshot.id, &options.limits)?;
+    let run = extraction::start_or_resume_run(&mut db, &spec, actor)?;
+    if run.status == ExtractionRunStatus::Completed {
+        return Ok(extraction_outcome(run, 0, 0, 0));
+    }
+    let pdf_worker = resolve_pdf_worker(options.pdf_worker.as_deref())?;
+
+    let mut processed = 0_u64;
+    let mut reused = 0_u64;
+    let mut after: Option<String> = None;
+    loop {
+        let sources = extraction::pending_content_sources_after(
+            &db,
+            run.id,
+            after.as_deref(),
+            options.page_size,
+        )?;
+        if sources.is_empty() {
+            break;
+        }
+        for source in &sources {
+            if source.reusable_representation_id.is_some()
+                && extraction::bind_reusable_representation(&mut db, run.id, source.content_id)?
+                    .is_some()
+            {
+                reused = reused.checked_add(1).ok_or_else(|| {
+                    DfError::Validation("extraction reuse counter overflow".to_string())
+                })?;
+            } else {
+                let verified = read_verified_source(source, options.limits.max_input_bytes)?;
+                let representation_id = RepresentationId::new();
+                let request = df_extract::ExtractionRequest {
+                    content_id: source.content_id,
+                    representation_id,
+                    source_sha256: &verified.sha256,
+                    source_size_bytes: source.size_bytes,
+                    display_name: &source.file_name,
+                    mime_hint: None,
+                    bytes: &verified.bytes,
+                    extractor_version: df_extract::EXTRACTOR_VERSION,
+                    config_digest: &spec.config_digest,
+                    created_at: chrono::Utc::now(),
+                };
+                let bundle = match pdf_worker.as_ref() {
+                    Some(worker) => {
+                        df_extract::extract_with_pdf_worker(request, &options.limits, worker)?
+                    }
+                    None => df_extract::extract(request, &options.limits)?,
+                };
+                let input = bundle.into_db_input()?;
+                extraction::persist_content_result(&mut db, run.id, &input)?;
+                processed = processed.checked_add(1).ok_or_else(|| {
+                    DfError::Validation("extraction processed counter overflow".to_string())
+                })?;
+            }
+        }
+        after = sources.last().map(|source| source.content_id.to_string());
+        if sources.len() < options.page_size as usize {
+            break;
+        }
+    }
+    let threads = build_threads_if_needed(&mut db, run.id, actor)?;
+    let completed = extraction::complete_run(&mut db, run.id, actor)?;
+    Ok(extraction_outcome(completed, processed, reused, threads))
+}
+
+/// Explicitly seal an unrecoverable extraction run. Normal extraction errors
+/// do not call this: keeping the run open is what makes source restoration and
+/// crash recovery possible.
+pub fn fail_content_extraction(
+    project_dir: &Path,
+    run_id: &str,
+    reason: &str,
+    actor: Actor,
+) -> DfResult<ContentExtractionOutcome> {
+    if reason.trim().is_empty() || reason.chars().count() > 4_096 {
+        return Err(DfError::Validation(
+            "failure reason must contain between 1 and 4096 characters".to_string(),
+        ));
+    }
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let run_id = ExtractionRunId::from_str(run_id)?;
+    let run = extraction::load_run(&db, run_id)?;
+    if run.project_id != project.id {
+        return Err(DfError::NotFound(format!("extraction run `{run_id}`")));
+    }
+    let failed = extraction::fail_run(&mut db, run_id, reason.trim(), actor)?;
+    Ok(extraction_outcome(failed, 0, 0, 0))
+}
+
+fn resolve_completed_extraction_run(
+    db: &Db,
+    project_id: ProjectId,
+    requested: Option<&str>,
+) -> DfResult<ExtractionRun> {
+    let run_id = match requested {
+        Some(id) => ExtractionRunId::from_str(id)?,
+        None => {
+            let snapshot =
+                df_db::inventory::latest_complete_snapshot(db, project_id)?.ok_or_else(|| {
+                    DfError::Validation("the project has no complete snapshot".to_string())
+                })?;
+            extraction::latest_completed_run(db, project_id, Some(snapshot.id))?
+                .ok_or_else(|| {
+                    DfError::Validation(
+                        "the latest snapshot has no completed content extraction; run `content extract` first"
+                            .to_string(),
+                    )
+                })?
+                .id
+        }
+    };
+    let run = extraction::load_run(db, run_id)?;
+    if run.project_id != project_id {
+        return Err(DfError::NotFound(format!("extraction run `{run_id}`")));
+    }
+    if run.status != ExtractionRunStatus::Completed {
+        return Err(DfError::Conflict(format!(
+            "extraction run `{run_id}` is not completed"
+        )));
+    }
+    Ok(run)
+}
+
+fn search_index_view(record: &SearchIndexRecord) -> SearchIndexView {
+    SearchIndexView {
+        id: record.id.to_string(),
+        run_id: record.run_id.to_string(),
+        snapshot_id: record.snapshot_id.to_string(),
+        schema_version: record.schema_version.clone(),
+        relative_path: record.relative_path.clone(),
+        content_digest: record.content_digest.clone(),
+        documents: record.documents,
+        created_at: df_ledger::canonical_timestamp(record.created_at),
+    }
+}
+
+fn analytical_snapshot_view(record: &AnalyticalSnapshotRecord) -> AnalyticalSnapshotView {
+    AnalyticalSnapshotView {
+        id: record.id.to_string(),
+        run_id: record.run_id.to_string(),
+        snapshot_id: record.snapshot_id.to_string(),
+        schema_version: record.schema_version.clone(),
+        relative_path: record.relative_path.clone(),
+        sha256: record.sha256.clone(),
+        rows: record.rows,
+        created_at: df_ledger::canonical_timestamp(record.created_at),
+    }
+}
+
+fn ensure_content_artifacts_outside_sources(
+    db: &Db,
+    project_id: ProjectId,
+    project_dir: &Path,
+) -> DfResult<()> {
+    for source in repository::load_source_roots(db, project_id)? {
+        ensure_disjoint(
+            &source.absolute_path,
+            "source root",
+            project_dir,
+            "content artifact root",
+        )?;
+    }
+    Ok(())
+}
+
+/// Rebuild both disposable M0.4 artifacts from sealed SQLite evidence.
+pub fn build_content_artifacts(
+    project_dir: &Path,
+    run_id: Option<&str>,
+    search_options: SearchBuildOptions,
+    snapshot_options: SnapshotBuildOptions,
+    actor: Actor,
+) -> DfResult<ContentArtifactBuildOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    ensure_content_artifacts_outside_sources(&db, project.id, &project_dir)?;
+    let run = resolve_completed_extraction_run(&db, project.id, run_id)?;
+    let search = df_search::build_index(&mut db, run.id, &project_dir, search_options, actor)?;
+    let analytical = df_query::build_analytical_snapshot(
+        &mut db,
+        run.id,
+        &project_dir,
+        snapshot_options,
+        actor,
+    )?;
+    Ok(ContentArtifactBuildOutcome {
+        run_id: run.id.to_string(),
+        search_index: search_index_view(&search),
+        analytical_snapshot: analytical_snapshot_view(&analytical),
+    })
+}
+
+/// Search the newest verified index for a completed extraction run.
+pub fn search_project_content(
+    project_dir: &Path,
+    run_id: Option<&str>,
+    request: &SearchRequest,
+) -> DfResult<ContentSearchOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    ensure_content_artifacts_outside_sources(&db, project.id, &project_dir)?;
+    let run = resolve_completed_extraction_run(&db, project.id, run_id)?;
+    let index = extraction::latest_search_index(&db, run.id)?.ok_or_else(|| {
+        DfError::Validation(
+            "the extraction run has no search index; run `content build` first".to_string(),
+        )
+    })?;
+    let hits = df_search::search_index(&project_dir, &index, request)?;
+    Ok(ContentSearchOutcome {
+        run_id: run.id.to_string(),
+        index: search_index_view(&index),
+        query: request.query.clone(),
+        hits,
+    })
+}
+
+/// Execute bounded, read-only SQL against the newest registered Parquet
+/// snapshot using only the trusted sibling analytical worker.
+pub fn query_project_content(
+    project_dir: &Path,
+    run_id: Option<&str>,
+    sql: &str,
+    options: QueryOptions,
+) -> DfResult<ContentQueryOutcome> {
+    query_project_content_with_worker(project_dir, run_id, sql, options, None)
+}
+
+/// Same query boundary with an explicit absolute worker path. This exists for
+/// development and managed deployments; PATH and environment discovery remain
+/// disabled and there is no in-process fallback for untrusted SQL.
+pub fn query_project_content_with_worker(
+    project_dir: &Path,
+    run_id: Option<&str>,
+    sql: &str,
+    options: QueryOptions,
+    query_worker: Option<&Path>,
+) -> DfResult<ContentQueryOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    ensure_content_artifacts_outside_sources(&db, project.id, &project_dir)?;
+    let run = resolve_completed_extraction_run(&db, project.id, run_id)?;
+    let snapshot = extraction::latest_analytical_snapshot(&db, run.id)?.ok_or_else(|| {
+        DfError::Validation(
+            "the extraction run has no analytical snapshot; run `content build` first".to_string(),
+        )
+    })?;
+    drop(db);
+    let requested_memory = u64::try_from(options.memory_limit_bytes).map_err(|_| {
+        DfError::Validation("analytical memory limit does not fit worker protocol".to_string())
+    })?;
+    let worker_memory = (1024_u64 * 1024 * 1024).max(requested_memory);
+    let worker = resolve_query_worker(query_worker)?.with_memory_limit_bytes(worker_memory);
+    let result = df_query::query_snapshot_isolated(&project_dir, &snapshot, sql, options, &worker)?;
+    Ok(ContentQueryOutcome {
+        run_id: run.id.to_string(),
+        snapshot: analytical_snapshot_view(&snapshot),
+        result,
+    })
+}
+
 /// Generate and validate the plan for the analysed snapshot (§26).
 /// Ends in `PLAN_READY`.
 ///
@@ -849,6 +1772,8 @@ pub struct TreeRelationReport {
     pub partial_clones: u64,
     /// Pairs where one subtree's content is wholly inside the other's.
     pub embedded: u64,
+    /// Pairs whose only meaningful overlap is a repeated component.
+    pub repeated_components: u64,
     pub relations: Vec<df_db::structure::TreeRelationView>,
 }
 
@@ -870,10 +1795,15 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
         .iter()
         .filter(|r| r.relationship == "TREE_EMBEDDED")
         .count() as u64;
+    let repeated_components = relations
+        .iter()
+        .filter(|r| r.relationship == "REPEATED_COMPONENT_ONLY")
+        .count() as u64;
     Ok(TreeRelationReport {
         snapshot_id: snapshot.id.to_string(),
         partial_clones,
         embedded,
+        repeated_components,
         relations,
     })
 }
@@ -1065,6 +1995,18 @@ mod tests {
         }
     }
 
+    fn pseudo_random_bytes(length: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
     #[cfg(windows)]
     fn make_junction(link: &Path, target: &Path) -> bool {
         let status = std::process::Command::new("cmd")
@@ -1086,7 +2028,9 @@ mod tests {
         ];
         for report in reports {
             assert!(
-                matches!(&report, Err(DfError::Validation(message)) if message.contains("has not completed")),
+                matches!(&report, Err(DfError::Validation(message))
+                    if message.contains("has not completed")
+                        || message.contains("has no completed structural analysis")),
                 "analysis report should be unavailable, got {report:?}"
             );
         }
@@ -1322,6 +2266,53 @@ mod tests {
 
         // Nothing was written inside the origin during the whole pipeline.
         assert_eq!(std::fs::read_dir(&origin).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn similarity_is_available_through_facade_status_and_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        let first = pseudo_random_bytes(512 * 1024, 0x1234);
+        let mut second = first.clone();
+        second[220 * 1024..228 * 1024].fill(0x5A);
+        std::fs::write(origin.join("informe-v1.bin"), &first).unwrap();
+        std::fs::write(origin.join("informe-v2.bin"), &second).unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).unwrap();
+        hash_project(&req.project_dir, Actor::Test).unwrap();
+        analyze_project(&req.project_dir, Actor::Test).unwrap();
+
+        let options = SimilarityOptions {
+            threshold: 0.25,
+            min_shared_chunks: 1,
+            min_shared_bytes: 8 * 1024,
+            ..SimilarityOptions::default()
+        };
+        let outcome =
+            analyze_similarity_with_options(&req.project_dir, Actor::Test, &options).unwrap();
+        assert_eq!(outcome.status, "COMPLETED");
+        assert_eq!(outcome.counters.relations_total, 1);
+
+        let report = similarity_report(&req.project_dir).unwrap();
+        assert!(report.evidence_only);
+        assert_eq!(report.status.relationships.len(), 1);
+        assert!(report.status.relationships[0].path_a.contains("informe-v"));
+
+        let status = project_status(&req.project_dir).unwrap();
+        let similarity = status.similarity.expect("M0.3 status is visible");
+        assert_eq!(similarity.run_id, outcome.run_id);
+        assert_eq!(similarity.relationships.len(), 1);
+
+        // The complete read-only pipeline left the origin byte-for-byte intact.
+        assert_eq!(std::fs::read(origin.join("informe-v1.bin")).unwrap(), first);
+        assert_eq!(
+            std::fs::read(origin.join("informe-v2.bin")).unwrap(),
+            second
+        );
     }
 
     #[test]
@@ -1650,5 +2641,174 @@ mod tests {
             open_project(&req.project_dir),
             Err(DfError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn extraction_config_json_and_digest_are_the_same_canonical_bytes() {
+        let limits = ExtractionLimits::default();
+        let spec = extraction_spec(ProjectId::new(), SnapshotId::new(), &limits).unwrap();
+        assert_eq!(spec.config_json, serde_json::to_string(&limits).unwrap());
+        assert_eq!(spec.config_digest, limits.digest().unwrap());
+        assert_eq!(
+            spec.config_digest,
+            hex::encode(Sha256::digest(spec.config_json.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn explicit_pdf_worker_never_uses_a_relative_or_path_searched_name() {
+        let options = ContentExtractionOptions {
+            pdf_worker: Some(PathBuf::from("df-extract-worker.exe")),
+            ..ContentExtractionOptions::default()
+        };
+        assert!(
+            matches!(options.validate(), Err(DfError::Validation(message)) if message.contains("absolute") && message.contains("PATH"))
+        );
+    }
+
+    #[test]
+    fn explicit_query_worker_never_uses_a_relative_or_path_searched_name() {
+        assert!(matches!(
+            resolve_query_worker(Some(Path::new("df-query-worker.exe"))),
+            Err(DfError::Validation(message))
+                if message.contains("absolute") && message.contains("PATH")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_source_checks_canonical_sha_and_never_needs_a_display_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let relative = PathBuf::from("expediente.txt");
+        let path = temp.path().join(&relative);
+        std::fs::write(&path, b"canonical evidence").unwrap();
+        let fingerprint = df_fs_safety::capture_fingerprint(&path).unwrap();
+        let source = ExtractionContentSource {
+            content_id: df_domain::ContentId::new(),
+            size_bytes: 18,
+            sha256: hex::encode(Sha256::digest(b"canonical evidence")),
+            root_path: temp.path().to_path_buf(),
+            raw_relative_path: Some(df_domain::RawPath::from_os_str(relative.as_os_str())),
+            relative_path: "lossy display must not be opened.txt".to_string(),
+            file_name: "expediente.txt".to_string(),
+            fingerprint: fingerprint.token(),
+            modified_at: None,
+            reusable_representation_id: None,
+        };
+        let verified = read_verified_source(&source, 1024).unwrap();
+        assert_eq!(verified.bytes, b"canonical evidence");
+        assert_eq!(verified.sha256, source.sha256);
+
+        std::fs::write(&path, b"different evidence").unwrap();
+        assert!(matches!(
+            read_verified_source(&source, 1024),
+            Err(DfError::Conflict(_))
+        ));
+    }
+
+    fn thread_message(id: &str, normalized_subject: &str, references: &[&str]) -> ThreadMessageRow {
+        ThreadMessageRow {
+            representation_id: RepresentationId::new(),
+            message_id: Some(id.to_string()),
+            in_reply_to: Vec::new(),
+            references: references
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            from: Vec::new(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            sent_at: None,
+            subject: None,
+            normalized_subject: Some(normalized_subject.to_string()),
+            body_sha256: None,
+        }
+    }
+
+    #[test]
+    fn mail_threading_prefers_explicit_references_over_subject_fallback() {
+        let root = thread_message("<root@example>", "topic", &[]);
+        let fallback = thread_message("<other@example>", "topic", &[]);
+        let child = thread_message("<child@example>", "topic", &["root@example"]);
+        let root_id = root.representation_id;
+        let child_id = child.representation_id;
+        let run_id = ExtractionRunId::new();
+        let messages = [root, fallback, child];
+        let threads = reconstruct_mail_threads(run_id, &messages);
+        assert_eq!(threads.len(), 1);
+        let child = threads[0]
+            .members
+            .iter()
+            .find(|member| member.representation_id == child_id)
+            .unwrap();
+        assert_eq!(child.parent_representation_id, Some(root_id));
+        assert_eq!(
+            threads,
+            reconstruct_mail_threads(run_id, &messages),
+            "thread IDs and members must be deterministic across replay"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_intelligence_round_trips_through_the_public_facade() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("brief.txt"),
+            b"alpha contract evidence for searchable content",
+        )
+        .unwrap();
+        let mut create = request(temp.path());
+        create.source_roots.push(source);
+        create_project(&create, Actor::Test).unwrap();
+        scan_project(&create.project_dir, Actor::Test).unwrap();
+        hash_project(&create.project_dir, Actor::Test).unwrap();
+        analyze_project(&create.project_dir, Actor::Test).unwrap();
+
+        let extracted = extract_project_content(
+            &create.project_dir,
+            Actor::Test,
+            &ContentExtractionOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(extracted.status, "COMPLETED");
+        assert_eq!(extracted.counters.contents_total, 1);
+        assert_eq!(extracted.counters.extracted, 1);
+
+        let replay = extract_project_content(
+            &create.project_dir,
+            Actor::Test,
+            &ContentExtractionOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(replay.run_id, extracted.run_id);
+        assert_eq!(replay.processed_this_invocation, 0);
+
+        let artifacts = build_content_artifacts(
+            &create.project_dir,
+            Some(&extracted.run_id),
+            SearchBuildOptions::default(),
+            SnapshotBuildOptions::default(),
+            Actor::Test,
+        )
+        .unwrap();
+        assert_eq!(artifacts.search_index.documents, 1);
+        assert_eq!(artifacts.analytical_snapshot.rows, 1);
+
+        let search = search_project_content(
+            &create.project_dir,
+            Some(&extracted.run_id),
+            &SearchRequest {
+                query: "alpha contract".to_string(),
+                limit: 10,
+                offset: 0,
+                snippet_chars: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(search.hits.len(), 1);
+        assert_eq!(search.hits[0].file_name, "brief.txt");
     }
 }

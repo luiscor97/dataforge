@@ -26,6 +26,7 @@ use sha2::Digest;
 
 const SEVERITY_PROBLEM: &str = "PROBLEM";
 const SEVERITY_WARNING: &str = "WARNING";
+const PARTIAL_FILE_PREFIX: &str = ".dataforge-partial-";
 
 /// Tuning knobs of one verification run.
 #[derive(Debug, Clone)]
@@ -136,7 +137,12 @@ pub fn verify_project(
     let mut expected_files: HashSet<String> = HashSet::new();
     let mut expected_dirs: HashSet<String> = HashSet::new();
     for artefact in &artefacts {
-        let destination = project.output_root.join(&artefact.final_relative_path);
+        // Long outputs are legitimate (the executor writes them via the
+        // extended-length prefix), so the verifier must re-read them the same
+        // way or it would report every deep artefact as missing.
+        let destination =
+            df_fs_safety::extended_for_io(&project.output_root.join(&artefact.final_relative_path))
+                .into_owned();
         checked += 1;
         if artefact.operation_type == OperationType::CreateDirectory {
             expected_dirs.insert(artefact.final_relative_path.to_lowercase());
@@ -349,7 +355,7 @@ fn walk_output(
             }
         }
 
-        let entries = match std::fs::read_dir(&dir_abs) {
+        let entries = match std::fs::read_dir(df_fs_safety::extended_for_io(&dir_abs)) {
             Ok(entries) => entries,
             Err(error) => {
                 // Never a silent continue: an output we cannot read is an
@@ -383,7 +389,7 @@ fn walk_output(
             let abs = output_root.join(&rel);
 
             // symlink_metadata: describes the entry itself, not its target.
-            let metadata = match std::fs::symlink_metadata(&abs) {
+            let metadata = match std::fs::symlink_metadata(df_fs_safety::extended_for_io(&abs)) {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     findings.push(VerificationFinding {
@@ -425,7 +431,7 @@ fn walk_output(
                 continue;
             }
 
-            if name.contains(".dataforge-partial-") {
+            if name.starts_with(PARTIAL_FILE_PREFIX) {
                 findings.push(VerificationFinding {
                     kind: "PARTIAL_LEFTOVER".to_string(),
                     severity: SEVERITY_PROBLEM.to_string(),
@@ -518,6 +524,143 @@ mod tests {
         approve_plan(&mut db, Actor::Test).unwrap();
         execute_plan(&mut db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
         Fixture { db, origin, output }
+    }
+
+    #[cfg(windows)]
+    fn approved_project_with_file_name(tmp: &Path, file_name: &str) -> Fixture {
+        let origin = tmp.join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        let source = origin.join(file_name);
+        std::fs::write(df_fs_safety::extended_for_io(&source), b"long-name payload").unwrap();
+
+        let output = tmp.join("salida");
+        let mut db = Db::open(&tmp.join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Prueba nombres largos",
+            ProfileRef::default(),
+            output.clone(),
+            tmp.join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
+        approve_plan(&mut db, Actor::Test).unwrap();
+        Fixture { db, origin, output }
+    }
+
+    #[cfg(windows)]
+    fn copied_file_artefact(db: &Db) -> plans::VerifiableArtefact {
+        let project = repository::load_project(db).unwrap();
+        let plan = plans::current_plan(db, project.id).unwrap().unwrap();
+        plans::verifiable_artefacts(db, plan.id)
+            .unwrap()
+            .into_iter()
+            .find(|artefact| artefact.expected_sha256.is_some())
+            .expect("the single source file must produce a verifiable copy")
+    }
+
+    /// Regression: the old partial name prepended the complete destination
+    /// name, so a perfectly valid 204-unit component became >255 and failed
+    /// final before copying a byte.
+    #[cfg(windows)]
+    #[test]
+    fn a_204_unit_file_name_executes_and_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = format!("{}.txt", "a".repeat(200));
+        assert_eq!(file_name.encode_utf16().count(), 204);
+        let mut fx = approved_project_with_file_name(tmp.path(), &file_name);
+
+        let execution =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert_eq!(execution.failed_final, 0, "{execution:?}");
+        assert_eq!(execution.failed_retryable, 0, "{execution:?}");
+        let artefact = copied_file_artefact(&fx.db);
+        assert_eq!(
+            std::fs::read(df_fs_safety::extended_for_io(
+                &fx.output.join(&artefact.final_relative_path),
+            ))
+            .unwrap(),
+            b"long-name payload"
+        );
+
+        let verification =
+            verify_project(&mut fx.db, Actor::Test, &VerifyOptions::default()).unwrap();
+        assert_eq!(
+            verification.verdict, "COMPLETED",
+            "{:?}",
+            verification.findings
+        );
+    }
+
+    /// At the NTFS component boundary, a conflicting destination needs both a
+    /// bounded collision name and a short partial. The squatted file must stay
+    /// byte-for-byte untouched, while the verified copy lands under the
+    /// deterministic suffix with its extension preserved.
+    #[cfg(windows)]
+    #[test]
+    fn a_255_unit_collision_executes_without_overwrite_and_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_name = format!("{}.txt", "b".repeat(251));
+        assert_eq!(file_name.encode_utf16().count(), 255);
+        let mut fx = approved_project_with_file_name(tmp.path(), &file_name);
+
+        let project = repository::load_project(&fx.db).unwrap();
+        let plan = plans::current_plan(&fx.db, project.id).unwrap().unwrap();
+        let planned_relative = plans::manifest(&fx.db, plan.id)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.expected_sha256.is_some())
+            .and_then(|entry| entry.destination_relative_path)
+            .expect("the file copy must have a planned destination");
+        let squatted = fx.output.join(&planned_relative);
+        std::fs::create_dir_all(df_fs_safety::extended_for_io(squatted.parent().unwrap())).unwrap();
+        std::fs::write(
+            df_fs_safety::extended_for_io(&squatted),
+            b"do not overwrite",
+        )
+        .unwrap();
+
+        let execution =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert_eq!(execution.failed_final, 0, "{execution:?}");
+        assert_eq!(execution.failed_retryable, 0, "{execution:?}");
+        assert_eq!(
+            std::fs::read(df_fs_safety::extended_for_io(&squatted)).unwrap(),
+            b"do not overwrite",
+            "the collision path must never be replaced"
+        );
+
+        let artefact = copied_file_artefact(&fx.db);
+        assert_ne!(artefact.final_relative_path, planned_relative);
+        let final_name = Path::new(&artefact.final_relative_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(final_name.contains("~df-"), "{final_name}");
+        assert!(final_name.ends_with(".txt"), "{final_name}");
+        assert!(final_name.encode_utf16().count() <= 255, "{final_name}");
+        assert_eq!(
+            std::fs::read(df_fs_safety::extended_for_io(
+                &fx.output.join(&artefact.final_relative_path),
+            ))
+            .unwrap(),
+            b"long-name payload"
+        );
+
+        // The squatter was test-owned and has already proved no-overwrite.
+        // Remove it so independent verification judges only plan artefacts.
+        std::fs::remove_file(df_fs_safety::extended_for_io(&squatted)).unwrap();
+        let verification =
+            verify_project(&mut fx.db, Actor::Test, &VerifyOptions::default()).unwrap();
+        assert_eq!(
+            verification.verdict, "COMPLETED",
+            "{:?}",
+            verification.findings
+        );
     }
 
     /// Threat T7 / P0-2: a junction planted after execution must make the
@@ -772,9 +915,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fx = executed_project(tmp.path());
         std::fs::write(
-            fx.output
-                .join("origen")
-                .join(".x.txt.dataforge-partial-deadbeef"),
+            fx.output.join("origen").join(format!(
+                "{PARTIAL_FILE_PREFIX}{}-{}",
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4()
+            )),
             b"leftover",
         )
         .unwrap();

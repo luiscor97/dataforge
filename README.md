@@ -9,16 +9,18 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
-**Estado actual: Milestone 0.2 — Structural Intelligence (cierre, objetivo
-`0.2.0`), sobre la base endurecida por Filesystem Safety Hardening.** El
-pipeline completo llega de la carpeta caótica a una copia verificada, y M0.2
-añade diagnóstico estructural, perfiles, reglas seguras y revisión auditable.
+**Estado actual: Milestone 0.4 — Content Intelligence (implementación local),
+sobre los cierres demostrados de M0.2 y M0.3.** El pipeline completo llega de
+la carpeta caótica a una copia verificada; M0.4 añade extracción documental,
+correo/ZIP virtual, búsqueda y consulta analítica sin confundir texto derivado
+con identidad ni autoridad para modificar un plan.
 
 DataForge **no está listo para producción general**. Lo que hay hoy es una
 **copia segura, explicable y verificable**: inventaría un origen sin tocarlo,
-detecta relaciones estructurales acotadas, propone un plan conservador y audita
-cada decisión. Todavía no interpreta el significado de los documentos ni
-reconstruye automáticamente expedientes a partir de su contenido.
+detecta relaciones estructurales y versiones binarias acotadas, extrae e
+indexa contenido documental, propone un plan conservador y audita cada
+decisión. No reconstruye automáticamente expedientes por significado ni deja
+que una búsqueda/consulta cambie el origen o el plan.
 
 Qué debes saber antes de apuntarlo a datos reales:
 
@@ -37,7 +39,8 @@ Detalle completo en
 
 Qué existe hoy (real, con pruebas):
 
-- Monorepo Rust (workspace de 11 crates) + pnpm.
+- Monorepo Rust (crates de motor, sidecars aislados, CLI, shell desktop y
+  herramientas de corpus) + pnpm.
 - **Frontera segura del sistema de archivos** (`df-fs-safety`): ninguna
   escritura sale del output root a través de junctions, symlinks o reparse
   points; el finalize no sobrescribe por semántica de plataforma, no por una
@@ -47,7 +50,7 @@ Qué existe hoy (real, con pruebas):
 - Dominio: IDs tipados, `Project`, `SourceRoot`, `Snapshot`, `AuditEvent`,
   inventario (`PathOccurrence`, `ContentObject`, fingerprints) y la máquina
   de estados completa de RFC-0001 §11.
-- SQLite como única fuente de verdad: migraciones `0001`–`0010` con checksum,
+- SQLite como única fuente de verdad: migraciones `0001`–`0013` con checksum,
   repositorios transaccionales y comprobación de integridad
   (`integrity_check`, FK, migraciones, ledger).
 - Escaneo seguro (`df-scan`): valida orígenes, inventaría archivos y
@@ -78,6 +81,23 @@ Qué existe hoy (real, con pruebas):
   snapshot distingue un informe vacío válido de una caída entre etapas. Los
   informes fallan cerrados hasta que el marcador y un estado estable confirman
   el final del análisis.
+- **Similitud y versionado M0.3** (`df-similarity`): FastCDC streaming,
+  chunks BLAKE3 normalizados, MinHash/LSH acotado y fallback de chunks raros.
+  Cada candidato se reevalúa con similitud exacta ponderada por bytes; los
+  runs son configurables, reanudables, auditados y sellados. SHA-256 sigue
+  siendo la única identidad y una relación nunca crea una operación.
+- **Inteligencia documental M0.4** (`df-extract`): TXT/HTML/DOCX/EML/ZIP
+  normalizados y segmentados con límites absolutos; adjuntos y rutas de ZIP
+  permanecen virtuales; correo conserva metadata y construye hilos básicos
+  deterministas. PDF superior, adjunto o contenido en ZIP se procesa solo en
+  `df-extract-worker`, bajo memoria/deadline de sistema operativo; sin sidecar
+  queda `LIMITED`, nunca cae a un parser dentro del proceso principal.
+- **Búsqueda y consulta reconstruibles**: Tantivy indexa texto, ruta y contexto;
+  Parquet expone metadata acotada a DataFusion. Los artefactos tienen schema y
+  digest versionados, se fijan mediante leases contra sustitución y se pueden
+  regenerar desde SQLite. SQL de clientes se ejecuta solo en
+  `df-query-worker`, sin DDL/DML/spill y con límites de filas, celdas, memoria,
+  bytes y tiempo.
 - Planificación (`df-planner`): plan con cobertura completa de cada aparición,
   política explícita de duplicados, guía de reglas/revisión, razones por
   operación, validación y aprobación que congela un manifiesto bajo SHA-256.
@@ -87,7 +107,12 @@ Qué existe hoy (real, con pruebas):
 - Ejecución segura (`df-executor`): copia por archivo con fingerprint
   pre/post, archivo parcial, doble hash en streaming, comparación, rename
   atómico; sin sobrescritura, con colisiones resueltas de forma
-  determinista, errores tipados y reanudación tras interrupción.
+  determinista, errores tipados y reanudación tras interrupción. Los parciales
+  usan `.dataforge-partial-<operation-id>-<lease-token>` (sin repetir nombres
+  que pueden ocupar 255 unidades UTF-16). La propiedad se reclama solo tras
+  `create_new`, con la identidad física capturada desde ese mismo handle; un
+  nombre/token o `RUNNING` sin identidad nunca autorizan borrar. Los sufijos
+  de colisión recortan solo el stem cuando necesitan reservar espacio.
 - Verificación independiente (`df-verifier`): re-hash de cada copia,
   cobertura, plan no manipulado, parciales, archivos no registrados y
   origen intacto; veredicto `COMPLETED`, `COMPLETED_WITH_WARNINGS` o
@@ -95,19 +120,22 @@ Qué existe hoy (real, con pruebas):
 - Ledger de auditoría append-only con encadenamiento SHA-256, verificación
   y eventos de todo el pipeline.
 - CLI `dataforge`: `project create/status`, `scan`, `hash`, `analyze`,
-  `plan create/validate/approve`, `review list/decide`, `execute`, `verify`,
-  `report duplicates/tree-clones/tree-relations/contexts/anomalies` y
+  `similarity`, `content extract/fail/build/search/query`,
+  `plan create/validate/approve`, `review list/decide`, `execute`,
+  `verify`, informes de duplicados/árboles/contextos/anomalías/similitudes y
   `audit verify` (con `--json` y códigos de salida documentados).
 - App de escritorio (Tauri 2 + React + TypeScript strict): crear/abrir proyecto
-  y ver estado, inventario, integridad y diagnóstico estructural M0.2, usando
-  la misma `df-facade` que la CLI.
+  y ver estado, inventario, integridad, diagnóstico estructural M0.2 y
+  relaciones de versiones M0.3; M0.4 permite extraer/reanudar/cerrar, construir
+  artefactos, buscar y consultar SQL con estados accesibles, usando la misma
+  `df-facade` que la CLI.
 
-Qué **no** existe todavía (y no está simulado): extracción de contenido,
-relaciones documentales por significado, reconstrucción automática de
-expedientes, búsqueda, informes exportables, perfiles de usuario en runtime,
-plugins o IA. Las relaciones M0.2 comparan identidades exactas de contenido y
-nombres declarados; no son una comprensión semántica. Tampoco se consolidan
-automáticamente árboles completos o parciales.
+Qué **no** existe todavía (y no está simulado): relaciones documentales por
+significado, reconstrucción automática de expedientes, inteligencia
+multimedia, plugins de producto, IA asistida, informes finales exportables o
+perfiles de usuario en runtime. La extracción M0.4 produce evidencia derivada
+y búsquedas; no es comprensión semántica ni autoriza consolidar contenido o
+árboles automáticamente.
 Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro).
 
 ## Inicio rápido (Windows)
@@ -130,6 +158,8 @@ cargo run -p dataforge-cli -- project create `
 cargo run -p dataforge-cli -- scan --path D:\proyectos\demo
 cargo run -p dataforge-cli -- hash --path D:\proyectos\demo
 cargo run -p dataforge-cli -- analyze --path D:\proyectos\demo
+cargo run -p dataforge-cli -- similarity --path D:\proyectos\demo
+cargo run -p dataforge-cli -- report similarities --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report duplicates --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report tree-clones --path D:\proyectos\demo
 cargo run -p dataforge-cli -- report tree-relations --path D:\proyectos\demo
@@ -162,7 +192,9 @@ pnpm --filter dataforge-desktop tauri dev
 apps/cli/        CLI `dataforge`
 apps/desktop/    Tauri 2 + React + TS strict (cliente de df-facade)
 crates/df-*      motor: error, domain, fs-safety, ledger, db, scan, hash,
-                 planner, executor, verifier, facade
+                 similarity, planner, executor, verifier, facade
+tools/df-corpus  generador de corpus sintético determinista y prueba de
+                 escala del pipeline (docs/testing/corpus-and-scale.md)
 docs/            RFCs, ADRs, arquitectura, threat model, guías
 scripts/         bootstrap reproducible del entorno (PowerShell)
 .codex/skills/   skills del repositorio para agentes de codificación
@@ -180,6 +212,8 @@ scripts/         bootstrap reproducible del entorno (PowerShell)
    dentro del conjunto de copias seguras.
 6. Ningún informe estructural se publica antes del marcador final de su
    snapshot.
+7. Similitud no es identidad: MinHash solo genera candidatos, el porcentaje
+   publicado se recalcula desde chunks y ninguna relación modifica un plan.
 
 ## Contribuir
 

@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_candidate_pairs_are_deterministic_and_count_unique_omissions() {
+    fn bounded_candidate_pairs_are_deterministic_and_report_the_cutoff() {
         let key = |path: &str| StableFolderKey::new("root", path);
         let mut first = HashMap::new();
         first.insert("shared-1".to_string(), vec![key("c"), key("a"), key("b")]);
@@ -580,9 +580,12 @@ mod tests {
         let expected = limited_candidate_pairs(&first, 32, 2);
         let reordered = limited_candidate_pairs(&reversed, 32, 2);
         assert_eq!(expected, reordered);
-        assert_eq!(expected.0.len(), 2);
-        assert_eq!(expected.1, 1, "only the distinct third pair was omitted");
-        assert_eq!(expected.0, vec![(key("a"), key("b")), (key("a"), key("c"))]);
+        assert_eq!(expected.pairs.len(), 2);
+        assert!(expected.candidate_cap_reached);
+        assert_eq!(
+            expected.pairs,
+            vec![(key("a"), key("b")), (key("a"), key("c"))]
+        );
     }
 
     #[test]
@@ -594,6 +597,8 @@ mod tests {
                     folder_id: folder_id.to_string(),
                     contents: ["shared-content".to_string()].into_iter().collect(),
                     bytes_by_content: HashMap::new(),
+                    occurrence_count: 1,
+                    occurrences_by_content: HashMap::from([("shared-content".to_string(), 1)]),
                 },
             )
         }
@@ -618,9 +623,9 @@ mod tests {
         let expected = limited_candidate_pairs_for_folders(&first_scan, 32, 2);
         let actual = limited_candidate_pairs_for_folders(&rescanned, 32, 2);
         assert_eq!(actual, expected);
-        assert_eq!(actual.1, 1, "the cap must omit the same logical pair");
+        assert!(actual.candidate_cap_reached);
         assert_eq!(
-            actual.0,
+            actual.pairs,
             vec![
                 (
                     StableFolderKey::new("source-root", "a"),
@@ -631,6 +636,213 @@ mod tests {
                     StableFolderKey::new("source-root", "c"),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn only_proven_nested_repetitions_reenter_ancestor_pairs_and_share_the_cap() {
+        fn folder(
+            relative_path: &str,
+            occurrence_count: u64,
+            unique_content: Option<&str>,
+        ) -> (StableFolderKey, SubtreeContents) {
+            let mut contents: std::collections::HashSet<String> =
+                ["shared-content".to_string()].into_iter().collect();
+            let mut occurrences_by_content =
+                HashMap::from([("shared-content".to_string(), occurrence_count)]);
+            if let Some(unique) = unique_content {
+                contents.insert(unique.to_string());
+                occurrences_by_content.insert(unique.to_string(), 1);
+            }
+            (
+                StableFolderKey::new("source-root", relative_path),
+                SubtreeContents {
+                    folder_id: relative_path.to_string(),
+                    contents,
+                    bytes_by_content: HashMap::new(),
+                    occurrence_count: occurrence_count + u64::from(unique_content.is_some()),
+                    occurrences_by_content,
+                },
+            )
+        }
+
+        let folders = HashMap::from([
+            folder("a", 1, None),
+            folder("a/copy", 1, None),
+            folder("z", 1, Some("z-only")),
+        ]);
+        let no_nested = limited_relation_candidate_pairs(&folders, 32, 10);
+        assert_eq!(
+            no_nested.pairs,
+            vec![
+                (
+                    StableFolderKey::new("source-root", "a"),
+                    StableFolderKey::new("source-root", "z"),
+                ),
+                (
+                    StableFolderKey::new("source-root", "a/copy"),
+                    StableFolderKey::new("source-root", "z"),
+                ),
+            ],
+            "ordinary ancestor inclusion must stay filtered"
+        );
+
+        assert!(!no_nested.candidate_cap_reached);
+
+        let nested_folders = HashMap::from([
+            folder("a", 2, None),
+            folder("a/copy", 1, None),
+            folder("z", 1, Some("z-only")),
+        ]);
+        let capped = limited_relation_candidate_pairs(&nested_folders, 32, 1);
+        assert_eq!(
+            capped.pairs,
+            vec![(
+                StableFolderKey::new("source-root", "a"),
+                StableFolderKey::new("source-root", "a/copy"),
+            )]
+        );
+        assert!(capped.candidate_cap_reached);
+    }
+
+    #[test]
+    fn zero_unique_content_pairs_cannot_starve_a_relation_candidate() {
+        fn folder(path: &str, contents: &[&str]) -> (StableFolderKey, SubtreeContents) {
+            (
+                StableFolderKey::new("source-root", path),
+                SubtreeContents {
+                    folder_id: path.to_string(),
+                    contents: contents.iter().map(|value| (*value).to_string()).collect(),
+                    bytes_by_content: HashMap::new(),
+                    occurrence_count: contents.len() as u64,
+                    occurrences_by_content: contents
+                        .iter()
+                        .map(|value| ((*value).to_string(), 1))
+                        .collect(),
+                },
+            )
+        }
+
+        let folders = HashMap::from([
+            folder("exact-a", &["00-exact", "01-exact"]),
+            folder("exact-b", &["00-exact", "01-exact"]),
+            folder("partial-a", &["10-shared", "11-only-a"]),
+            folder("partial-b", &["10-shared", "12-only-b"]),
+        ]);
+
+        let selected = limited_relation_candidate_pairs(&folders, 32, 1);
+
+        assert_eq!(
+            selected.pairs,
+            vec![(
+                StableFolderKey::new("source-root", "partial-a"),
+                StableFolderKey::new("source-root", "partial-b"),
+            )],
+            "pairs with no content identity exclusive to either side must not consume the relation cap"
+        );
+        assert!(!selected.candidate_cap_reached);
+    }
+
+    #[test]
+    fn one_extra_component_does_not_prove_a_complete_self_nested_copy() {
+        let key = |path: &str| StableFolderKey::new("source-root", path);
+        let ancestor_key = key("A");
+        let descendant_key = key("A/sub");
+        let folders = HashMap::from([
+            (
+                ancestor_key.clone(),
+                SubtreeContents {
+                    folder_id: "ancestor".to_string(),
+                    contents: ["x".to_string(), "y".to_string()].into_iter().collect(),
+                    bytes_by_content: HashMap::new(),
+                    occurrence_count: 3,
+                    occurrences_by_content: HashMap::from([
+                        ("x".to_string(), 2),
+                        ("y".to_string(), 1),
+                    ]),
+                },
+            ),
+            (
+                descendant_key.clone(),
+                SubtreeContents {
+                    folder_id: "descendant".to_string(),
+                    contents: ["x".to_string(), "y".to_string()].into_iter().collect(),
+                    bytes_by_content: HashMap::new(),
+                    occurrence_count: 2,
+                    occurrences_by_content: HashMap::from([
+                        ("x".to_string(), 1),
+                        ("y".to_string(), 1),
+                    ]),
+                },
+            ),
+        ]);
+
+        assert!(!proven_nested_repetition(
+            &folders,
+            &ancestor_key,
+            &descendant_key
+        ));
+        let selected = limited_relation_candidate_pairs(&folders, 32, 1);
+        assert!(selected.pairs.is_empty());
+        assert!(
+            !selected.candidate_cap_reached,
+            "a partially repeated component must neither reenter ancestor pairs nor consume the cap"
+        );
+    }
+
+    #[test]
+    fn exact_set_filter_canonicalizes_each_folder_once_not_per_shared_content() {
+        let shared: Vec<String> = (0..1_999)
+            .map(|index| format!("shared-{index:05}"))
+            .collect();
+        let make_folder = |path: &str, unique: &str| {
+            let mut contents: std::collections::HashSet<String> = shared.iter().cloned().collect();
+            contents.insert(unique.to_string());
+            (
+                StableFolderKey::new("source-root", path),
+                SubtreeContents {
+                    folder_id: path.to_string(),
+                    occurrence_count: contents.len() as u64,
+                    occurrences_by_content: contents
+                        .iter()
+                        .cloned()
+                        .map(|content| (content, 1))
+                        .collect(),
+                    contents,
+                    bytes_by_content: HashMap::new(),
+                },
+            )
+        };
+        let folders = HashMap::from([
+            make_folder("near-a", "only-a"),
+            make_folder("near-b", "only-b"),
+        ]);
+
+        let selected = limited_relation_candidate_pairs(&folders, 32, 1);
+
+        assert_eq!(selected.pairs.len(), 1);
+        assert_eq!(selected.exact_sets_canonicalized, folders.len());
+        assert_eq!(selected.candidates_considered, shared.len());
+        assert_eq!(selected.peak_selected, 1);
+        assert!(!selected.candidate_cap_reached);
+    }
+
+    #[test]
+    fn adversarial_single_content_stops_after_the_first_pair_beyond_the_cap() {
+        let key = |index: usize| StableFolderKey::new("source-root", format!("f-{index:05}"));
+        let holders: Vec<_> = (0..2_000).map(key).collect();
+        let by_content = HashMap::from([("widely-shared-but-allowed".to_string(), holders)]);
+        let max_pairs = 17;
+
+        let selected = limited_candidate_pairs(&by_content, 2_000, max_pairs);
+
+        assert_eq!(selected.pairs.len(), max_pairs);
+        assert!(selected.candidate_cap_reached);
+        assert_eq!(selected.peak_selected, max_pairs);
+        assert_eq!(
+            selected.candidates_considered,
+            max_pairs + 1,
+            "one holder combination must stop at the first new pair beyond the cap, not enumerate ~2M pairs"
         );
     }
 
@@ -948,6 +1160,53 @@ mod tests {
         assert_eq!(summary.complete_folders, 3);
         assert_eq!(summary.tree_clone_sets, 0);
     }
+
+    #[test]
+    fn public_relation_summary_and_event_report_a_real_generation_cutoff() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project_id, s) = seed(&mut db);
+        add_folder(&db, &s, "", None, "in");
+        for branch in ["A", "B", "C"] {
+            add_folder(&db, &s, branch, Some(""), branch);
+            add_file(&db, &s, branch, "shared.txt", Some(&"a".repeat(64)));
+        }
+        add_file(&db, &s, "A", "only-a.txt", Some(&"b".repeat(64)));
+        add_file(&db, &s, "B", "only-b.txt", Some(&"c".repeat(64)));
+        add_file(&db, &s, "C", "only-c.txt", Some(&"d".repeat(64)));
+        compute_folder_signatures(&mut db, project_id, s.snapshot, Actor::Test).unwrap();
+
+        let summary = compute_tree_relations(
+            &mut db,
+            project_id,
+            s.snapshot,
+            &TreeRelationOptions {
+                max_pairs: 1,
+                ..TreeRelationOptions::default()
+            },
+            Actor::Test,
+        )
+        .unwrap();
+
+        assert!(summary.candidate_cap_reached);
+        assert_eq!(tree_relations(&db, s.snapshot).unwrap().len(), 1);
+        assert!(
+            crate::analysis::diagnostics(&db, s.snapshot)
+                .unwrap()
+                .candidate_cap_reached,
+            "the cutoff must remain visible beyond the transient relation summary"
+        );
+        let event = repository::list_events(&db, project_id)
+            .unwrap()
+            .into_iter()
+            .rfind(|event| event.event_type == EVENT_STRUCTURE_ANALYZED)
+            .expect("tree-relation analysis event");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload["candidate_cap_reached"], true);
+        assert!(
+            payload.get("pairs_skipped").is_none(),
+            "the event must not claim an exact count that generation did not compute"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -964,12 +1223,13 @@ pub struct TreeRelationOptions {
     /// (a logo, a template, a licence): it says nothing about two folders
     /// being related, and pairing every holder of it explodes quadratically.
     pub max_folders_per_content: usize,
-    /// Only report pairs at or above this Jaccard similarity. Below it the
-    /// overlap is indistinguishable from coincidence
-    /// (`REPEATED_COMPONENT_ONLY`).
+    /// Classify pairs at or above this Jaccard similarity as partial/embedded
+    /// trees. Below it, retain bounded evidence as
+    /// `REPEATED_COMPONENT_ONLY` instead of treating the branches as clones.
     pub min_similarity: f64,
-    /// Hard ceiling on candidate pairs examined and persisted. Distinct
-    /// candidates beyond it are counted in `pairs_skipped`.
+    /// Hard ceiling on distinct candidate pairs retained, examined as
+    /// relations and persisted. Generation stops at the first new candidate
+    /// beyond this budget.
     pub max_pairs: usize,
 }
 
@@ -989,8 +1249,12 @@ impl Default for TreeRelationOptions {
 pub struct TreeRelationSummary {
     pub partial_clones: u64,
     pub embedded: u64,
-    /// Candidate pairs left unexamined because `max_pairs` was reached.
-    pub pairs_skipped: u64,
+    /// Legitimate repeated-component and nested-self evidence.
+    pub repeated_components: u64,
+    /// True when generation encountered a new candidate beyond `max_pairs`.
+    /// The exact omitted count is deliberately unknown because proving it
+    /// would require enumerating the work this bound exists to prevent.
+    pub candidate_cap_reached: bool,
     /// Pass-through containers suppressed: ancestors whose subtree content is
     /// identical to a descendant folder's. Their relations would duplicate
     /// the descendant's, so only the deepest, most specific folder reports.
@@ -1050,44 +1314,156 @@ struct SubtreeContents {
     folder_id: String,
     contents: std::collections::HashSet<String>,
     bytes_by_content: HashMap<String, u64>,
+    /// Total file occurrences in the subtree, including repeated identities.
+    /// Distinct contents alone cannot tell a pure wrapper from `A/A-copy`.
+    occurrence_count: u64,
+    /// Multiplicity per identity. A complete self-nesting claim needs to
+    /// prove an additional copy of every descendant occurrence, not merely a
+    /// larger aggregate count caused by one repeated logo.
+    occurrences_by_content: HashMap<String, u64>,
 }
 
-/// Build the bounded candidate set in a stable order and report the number of
-/// distinct candidates omitted by the bound.
-///
-/// A pair can share several contents, so counting each rejected insertion
-/// overstates truncation. Materialising the distinct set first both removes
-/// that ambiguity and makes selection independent of `HashMap` randomisation.
+type StableFolderPair = (StableFolderKey, StableFolderKey);
+
+fn is_ancestor_pair(a: &StableFolderKey, b: &StableFolderKey) -> bool {
+    a.source_root_id == b.source_root_id
+        && (is_ancestor_of(&a.relative_path, &b.relative_path)
+            || is_ancestor_of(&b.relative_path, &a.relative_path))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CandidatePairs {
+    pairs: Vec<StableFolderPair>,
+    candidate_cap_reached: bool,
+    #[cfg(test)]
+    candidates_considered: usize,
+    #[cfg(test)]
+    peak_selected: usize,
+    #[cfg(test)]
+    exact_sets_canonicalized: usize,
+}
+
+struct CandidateAccumulator {
+    selected: BTreeSet<StableFolderPair>,
+    candidate_cap_reached: bool,
+    #[cfg(test)]
+    candidates_considered: usize,
+    #[cfg(test)]
+    peak_selected: usize,
+    #[cfg(test)]
+    exact_sets_canonicalized: usize,
+}
+
+impl CandidateAccumulator {
+    fn new() -> Self {
+        Self {
+            selected: BTreeSet::new(),
+            candidate_cap_reached: false,
+            #[cfg(test)]
+            candidates_considered: 0,
+            #[cfg(test)]
+            peak_selected: 0,
+            #[cfg(test)]
+            exact_sets_canonicalized: 0,
+        }
+    }
+
+    /// Return false exactly when `pair` is the first distinct candidate that
+    /// cannot fit. Duplicate evidence never consumes the budget.
+    fn consider(&mut self, pair: StableFolderPair, max_pairs: usize) -> bool {
+        #[cfg(test)]
+        {
+            self.candidates_considered += 1;
+        }
+        if self.selected.contains(&pair) {
+            return true;
+        }
+        if self.selected.len() >= max_pairs {
+            self.candidate_cap_reached = true;
+            return false;
+        }
+        self.selected.insert(pair);
+        #[cfg(test)]
+        {
+            self.peak_selected = self.peak_selected.max(self.selected.len());
+        }
+        true
+    }
+
+    fn finish(self) -> CandidatePairs {
+        CandidatePairs {
+            pairs: self.selected.into_iter().collect(),
+            candidate_cap_reached: self.candidate_cap_reached,
+            #[cfg(test)]
+            candidates_considered: self.candidates_considered,
+            #[cfg(test)]
+            peak_selected: self.peak_selected,
+            #[cfg(test)]
+            exact_sets_canonicalized: self.exact_sets_canonicalized,
+        }
+    }
+}
+
+/// Traverse content identities and their holders in stable order while
+/// retaining at most `max_pairs`. The traversal stops as soon as a distinct
+/// pair would exceed the budget; it never materialises the omitted tail.
+#[cfg(test)]
 fn limited_candidate_pairs(
     by_content: &HashMap<String, Vec<StableFolderKey>>,
     max_folders_per_content: usize,
     max_pairs: usize,
-) -> (Vec<(StableFolderKey, StableFolderKey)>, u64) {
-    let mut distinct: BTreeSet<(StableFolderKey, StableFolderKey)> = BTreeSet::new();
-    for holders in by_content.values() {
-        if holders.len() > max_folders_per_content {
+) -> CandidatePairs {
+    let mut accumulator = CandidateAccumulator::new();
+    add_content_candidates(
+        by_content,
+        max_folders_per_content,
+        max_pairs,
+        |_, _| true,
+        &mut accumulator,
+    );
+    accumulator.finish()
+}
+
+fn add_content_candidates(
+    by_content: &HashMap<String, Vec<StableFolderKey>>,
+    max_folders_per_content: usize,
+    max_pairs: usize,
+    include_pair: impl Fn(&StableFolderKey, &StableFolderKey) -> bool,
+    accumulator: &mut CandidateAccumulator,
+) -> bool {
+    let mut content_ids: Vec<_> = by_content.keys().collect();
+    content_ids.sort_unstable();
+    for content_id in content_ids {
+        let stored_holders = &by_content[content_id];
+        // Production builds this index from a set per folder, so holders are
+        // already unique. Check before cloning to avoid doubling the memory of
+        // an intentionally ignored ubiquitous component.
+        if stored_holders.len() > max_folders_per_content {
             continue;
         }
-        let mut holders = holders.clone();
+        let mut holders = stored_holders.clone();
         holders.sort_unstable();
         holders.dedup();
         for (index, a) in holders.iter().enumerate() {
             for b in holders.iter().skip(index + 1) {
-                distinct.insert((a.clone(), b.clone()));
+                if !include_pair(a, b) {
+                    continue;
+                }
+                if !accumulator.consider((a.clone(), b.clone()), max_pairs) {
+                    return false;
+                }
             }
         }
     }
-
-    let pairs_skipped = distinct.len().saturating_sub(max_pairs) as u64;
-    let selected = distinct.into_iter().take(max_pairs).collect();
-    (selected, pairs_skipped)
+    true
 }
 
+#[cfg(test)]
 fn limited_candidate_pairs_for_folders(
     folders: &HashMap<StableFolderKey, SubtreeContents>,
     max_folders_per_content: usize,
     max_pairs: usize,
-) -> (Vec<(StableFolderKey, StableFolderKey)>, u64) {
+) -> CandidatePairs {
     let mut by_content: HashMap<String, Vec<StableFolderKey>> = HashMap::new();
     for (key, folder) in folders {
         for content in &folder.contents {
@@ -1100,9 +1476,131 @@ fn limited_candidate_pairs_for_folders(
     limited_candidate_pairs(&by_content, max_folders_per_content, max_pairs)
 }
 
-/// Compute pairwise `PARTIAL_TREE_CLONE` / `TREE_EMBEDDED` relations between
-/// the complete folders of a snapshot (§19.3) and persist them together with
-/// the evidence of what each side holds uniquely (§19.4).
+fn proven_nested_repetition(
+    folders: &HashMap<StableFolderKey, SubtreeContents>,
+    a: &StableFolderKey,
+    b: &StableFolderKey,
+) -> bool {
+    if a.source_root_id != b.source_root_id {
+        return false;
+    }
+    let (ancestor_key, descendant_key) = if is_ancestor_of(&a.relative_path, &b.relative_path) {
+        (a, b)
+    } else if is_ancestor_of(&b.relative_path, &a.relative_path) {
+        (b, a)
+    } else {
+        return false;
+    };
+    let (ancestor, descendant) = (&folders[ancestor_key], &folders[descendant_key]);
+    ancestor.contents.len() == descendant.contents.len()
+        && descendant
+            .occurrences_by_content
+            .iter()
+            .all(|(content_id, descendant_count)| {
+                descendant_count.checked_mul(2).is_some_and(|required| {
+                    ancestor
+                        .occurrences_by_content
+                        .get(content_id)
+                        .is_some_and(|ancestor_count| *ancestor_count >= required)
+                })
+            })
+}
+
+/// Assign an exact equivalence class to every distinct content set. Canonical
+/// vectors are built once per folder, then discarded before the inverted
+/// index is built; pair filtering is O(1) even when two huge folders share
+/// millions of content identities. The vectors themselves are compared
+/// exactly, so no digest-collision assumption is introduced.
+fn exact_content_classes(
+    folders: &HashMap<StableFolderKey, SubtreeContents>,
+) -> HashMap<StableFolderKey, usize> {
+    let mut interned: HashMap<Vec<&str>, usize> = HashMap::new();
+    let mut by_folder = HashMap::with_capacity(folders.len());
+    let mut next_class = 0_usize;
+    let mut keys: Vec<_> = folders.keys().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let mut canonical: Vec<_> = folders[key].contents.iter().map(String::as_str).collect();
+        canonical.sort_unstable();
+        let class = *interned.entry(canonical).or_insert_with(|| {
+            let class = next_class;
+            next_class += 1;
+            class
+        });
+        by_folder.insert(key.clone(), class);
+    }
+    by_folder
+}
+
+/// Candidate pairs that may produce a persisted relation. Proven self-nested
+/// repetitions consume the budget first. Ordinary ancestor inclusions are
+/// filtered before `consider`, so they never consume the cap. Content pairs
+/// are then generated in stable content/holder order until the first new pair
+/// would exceed the global budget.
+fn limited_relation_candidate_pairs(
+    folders: &HashMap<StableFolderKey, SubtreeContents>,
+    max_folders_per_content: usize,
+    max_pairs: usize,
+) -> CandidatePairs {
+    let mut accumulator = CandidateAccumulator::new();
+    let mut descendant_keys: Vec<_> = folders.keys().collect();
+    descendant_keys.sort_unstable();
+    for descendant_key in descendant_keys {
+        for ancestor_path in ancestors_of(&descendant_key.relative_path)
+            .into_iter()
+            .skip(1)
+        {
+            let ancestor_key =
+                StableFolderKey::new(descendant_key.source_root_id.clone(), ancestor_path);
+            if !folders.contains_key(&ancestor_key)
+                || !proven_nested_repetition(folders, &ancestor_key, descendant_key)
+            {
+                continue;
+            }
+            debug_assert!(ancestor_key < *descendant_key);
+            if !accumulator.consider((ancestor_key, descendant_key.clone()), max_pairs) {
+                return accumulator.finish();
+            }
+        }
+    }
+
+    let mut by_content: HashMap<String, Vec<StableFolderKey>> = HashMap::new();
+    let exact_classes = exact_content_classes(folders);
+    #[cfg(test)]
+    {
+        accumulator.exact_sets_canonicalized = folders.len();
+    }
+    for (key, folder) in folders {
+        for content in &folder.contents {
+            by_content
+                .entry(content.clone())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    add_content_candidates(
+        &by_content,
+        max_folders_per_content,
+        max_pairs,
+        |a, b| {
+            if is_ancestor_pair(a, b) {
+                return false;
+            }
+            // A non-hierarchical pair with no content identity exclusive to
+            // either side fits none of this relation taxonomy (Merkle-exact
+            // subsets are reported separately in tree_clone_sets). Reject it
+            // before the budget so it cannot starve a later relation.
+            exact_classes[a] != exact_classes[b]
+        },
+        &mut accumulator,
+    );
+    accumulator.finish()
+}
+
+/// Compute pairwise `PARTIAL_TREE_CLONE`, `TREE_EMBEDDED`, and
+/// `REPEATED_COMPONENT_ONLY` relations between the complete folders of a
+/// snapshot (§19.3), and persist them with the evidence of what each side
+/// holds uniquely (§19.4).
 ///
 /// Evidence only: nothing here proposes consolidating anything. A pair with
 /// unique content on both sides is precisely a reason *not* to drop either
@@ -1152,6 +1650,8 @@ pub fn compute_tree_relations(
                 folder_id,
                 contents: std::collections::HashSet::new(),
                 bytes_by_content: HashMap::new(),
+                occurrence_count: 0,
+                occurrences_by_content: HashMap::new(),
             },
         );
     }
@@ -1191,62 +1691,74 @@ pub fn compute_tree_relations(
             if let Some(folder) = folders.get_mut(&key) {
                 folder.bytes_by_content.insert(content_id.clone(), size);
                 folder.contents.insert(content_id.clone());
+                folder.occurrence_count += 1;
+                *folder
+                    .occurrences_by_content
+                    .entry(content_id.clone())
+                    .or_default() += 1;
             }
         }
     }
     folders.retain(|_, f| f.contents.len() >= options.min_subtree_contents);
 
-    // A pass-through container — an ancestor whose subtree content set is
-    // identical to a descendant folder's (e.g. `Backup/` holding only
-    // `Backup/Expediente 77/`) — relates to exactly the same third folders
-    // as that descendant, duplicating every one of its relations. Report the
-    // deepest, most specific folder only. Within one root an ancestor's set
-    // always contains the descendant's, so equal cardinality means equal
-    // sets. Deterministic: driven by stable keys, not map order.
-    let pass_through: std::collections::HashSet<StableFolderKey> = folders
-        .keys()
-        .flat_map(|key| {
-            let descendant_len = folders[key].contents.len();
-            ancestors_of(&key.relative_path)
-                .into_iter()
-                .skip(1) // the chain starts at the folder itself
-                .map(|ancestor| StableFolderKey::new(key.source_root_id.clone(), ancestor))
-                .filter(|ancestor_key| {
-                    folders
-                        .get(ancestor_key)
-                        .is_some_and(|ancestor| ancestor.contents.len() == descendant_len)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Equal distinct-content sets are not sufficient to call an ancestor a
+    // pass-through wrapper. In `A/{f1,f2,A-copy/{f1,f2}}`, A and A-copy have
+    // the same set, but A has twice as many occurrences and is the evidence
+    // that the tree appears inside itself (§19.1). A true wrapper has the same
+    // total occurrence count as its descendant: since a descendant's
+    // occurrence multiset is contained in its ancestor's, equal totals prove
+    // there is no additional occurrence outside the descendant.
+    let mut pass_through: std::collections::HashSet<StableFolderKey> =
+        std::collections::HashSet::new();
+    for descendant_key in folders.keys() {
+        let descendant = &folders[descendant_key];
+        for ancestor_path in ancestors_of(&descendant_key.relative_path)
+            .into_iter()
+            .skip(1)
+        {
+            let ancestor_key =
+                StableFolderKey::new(descendant_key.source_root_id.clone(), ancestor_path);
+            let Some(ancestor) = folders.get(&ancestor_key) else {
+                continue;
+            };
+            // Within one root an ancestor's distinct set contains the
+            // descendant's, so equal cardinality proves set equality.
+            if ancestor.contents.len() != descendant.contents.len() {
+                continue;
+            }
+            if ancestor.occurrence_count == descendant.occurrence_count {
+                pass_through.insert(ancestor_key);
+            }
+        }
+    }
     let pass_through_suppressed = pass_through.len() as u64;
     folders.retain(|key, _| !pass_through.contains(key));
 
     // Inverted index content -> folders, so only folders that actually share
-    // something get paired.
-    let (candidates, pairs_skipped) = limited_candidate_pairs_for_folders(
+    // something get paired. Dedicated self-nesting evidence is merged before
+    // applying the same deterministic global cap.
+    let candidates = limited_relation_candidate_pairs(
         &folders,
         options.max_folders_per_content,
         options.max_pairs,
     );
 
     let mut relations: Vec<(df_domain::TreeRelation, Option<&'static str>)> = Vec::new();
-    for (a_key, b_key) in &candidates {
+    for (a_key, b_key) in &candidates.pairs {
         let (a, b) = (&folders[a_key], &folders[b_key]);
-        // Same root and one inside the other: trivially "shared", not a clone.
-        if a_key.source_root_id == b_key.source_root_id
-            && (is_ancestor_of(&a_key.relative_path, &b_key.relative_path)
-                || is_ancestor_of(&b_key.relative_path, &a_key.relative_path))
-        {
-            continue;
-        }
+        let nested_repetition = proven_nested_repetition(&folders, a_key, b_key);
+        debug_assert!(!is_ancestor_pair(a_key, b_key) || nested_repetition);
 
         let shared: Vec<&String> = a.contents.intersection(&b.contents).collect();
         let shared_files = shared.len() as u64;
         let unique_a = (a.contents.len() - shared.len()) as u64;
         let unique_b = (b.contents.len() - shared.len()) as u64;
-        // Exact clones are already reported as clone sets (migration 0006).
-        if unique_a == 0 && unique_b == 0 {
+        // A non-hierarchical pair with no exclusive content identity fits
+        // neither partial nor embedded relations. Merkle-exact cases are
+        // reported separately as clone sets; other equal-set cases are also
+        // outside this taxonomy. A nested repetition deliberately remains
+        // because per-content multiplicity proves a full additional copy.
+        if unique_a == 0 && unique_b == 0 && !nested_repetition {
             continue;
         }
         let union = shared_files + unique_a + unique_b;
@@ -1255,9 +1767,6 @@ pub fn compute_tree_relations(
         } else {
             shared_files as f64 / union as f64
         };
-        if similarity < options.min_similarity {
-            continue; // REPEATED_COMPONENT_ONLY territory: not reported
-        }
         let shared_bytes: u64 = shared
             .iter()
             .filter_map(|c| a.bytes_by_content.get(c.as_str()))
@@ -1267,10 +1776,15 @@ pub fn compute_tree_relations(
         // key, so A/B is independent of the per-snapshot folder UUIDs.
         debug_assert!(a_key < b_key);
         let (fa, fb, ua, ub) = (a, b, unique_a, unique_b);
-        let (relationship, contained) = match (ua, ub) {
-            (0, _) => (TreeRelationship::Embedded, Some("A")),
-            (_, 0) => (TreeRelationship::Embedded, Some("B")),
-            _ => (TreeRelationship::PartialClone, None),
+        let (relationship, contained) = if nested_repetition || similarity < options.min_similarity
+        {
+            (TreeRelationship::RepeatedComponentOnly, None)
+        } else {
+            match (ua, ub) {
+                (0, _) => (TreeRelationship::Embedded, Some("A")),
+                (_, 0) => (TreeRelationship::Embedded, Some("B")),
+                _ => (TreeRelationship::PartialClone, None),
+            }
         };
         relations.push((
             df_domain::TreeRelation {
@@ -1289,7 +1803,7 @@ pub fn compute_tree_relations(
     }
 
     let mut summary = TreeRelationSummary {
-        pairs_skipped,
+        candidate_cap_reached: candidates.candidate_cap_reached,
         pass_through_suppressed,
         ..Default::default()
     };
@@ -1304,6 +1818,7 @@ pub fn compute_tree_relations(
         match relation.relationship {
             TreeRelationship::PartialClone => summary.partial_clones += 1,
             TreeRelationship::Embedded => summary.embedded += 1,
+            TreeRelationship::RepeatedComponentOnly => summary.repeated_components += 1,
             _ => {}
         }
         tx.execute(
@@ -1333,7 +1848,8 @@ pub fn compute_tree_relations(
         "snapshot_id": snapshot,
         "partial_clones": summary.partial_clones,
         "embedded": summary.embedded,
-        "pairs_skipped": summary.pairs_skipped,
+        "repeated_components": summary.repeated_components,
+        "candidate_cap_reached": summary.candidate_cap_reached,
         "pass_through_suppressed": summary.pass_through_suppressed,
     });
     append_event(&tx, project_id, EVENT_STRUCTURE_ANALYZED, &payload, actor)?;
@@ -1393,7 +1909,8 @@ pub fn tree_relations(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<df_domai
 pub struct TreeRelationView {
     pub path_a: String,
     pub path_b: String,
-    /// `PARTIAL_TREE_CLONE` or `TREE_EMBEDDED`.
+    /// `PARTIAL_TREE_CLONE`, `TREE_EMBEDDED`, or
+    /// `REPEATED_COMPONENT_ONLY`.
     pub relationship: String,
     /// For `TREE_EMBEDDED`, which side is inside the other (`A` or `B`).
     pub contained: Option<String>,

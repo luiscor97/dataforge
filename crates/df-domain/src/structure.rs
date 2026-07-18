@@ -25,11 +25,10 @@ pub enum TreeRelationship {
     /// does not. Neither may be dropped for the other: this is exactly the
     /// case §19.4 warns about.
     PartialClone,
-    /// They share content, but so little that calling them related would be
-    /// misleading — typically a handful of common files (a logo, a template)
-    /// repeated across unrelated folders. Representable so the vocabulary is
-    /// stable; not emitted, since it is indistinguishable from coincidence
-    /// without the entity graph (§18.2).
+    /// Repeated content that must not be promoted to a clone: typically a
+    /// logo/template shared by unrelated folders, or a folder whose complete
+    /// content set appears again inside itself. Persisted as bounded evidence
+    /// so the repetition is explicit without authorising consolidation.
     RepeatedComponentOnly,
 }
 

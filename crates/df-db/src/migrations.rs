@@ -70,6 +70,26 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "structural_review",
         sql: include_str!("../migrations/0010_structural_review.sql"),
     },
+    Migration {
+        version: 11,
+        name: "derived_evidence_seal",
+        sql: include_str!("../migrations/0011_derived_evidence_seal.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "execution_partial_lease",
+        sql: include_str!("../migrations/0012_execution_partial_lease.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "content_similarity",
+        sql: include_str!("../migrations/0013_content_similarity.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "content_intelligence",
+        sql: include_str!("../migrations/0014_content_intelligence.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {
@@ -166,6 +186,229 @@ pub fn verify_applied(db: &Db) -> DfResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct DerivedSnapshotFixture {
+        snapshot_id: df_domain::SnapshotId,
+        review_item_id: String,
+    }
+
+    fn seed_derived_snapshot(
+        db: &Db,
+        project_id: df_domain::ProjectId,
+        source_root_id: df_domain::SourceRootId,
+        label: &str,
+    ) -> DerivedSnapshotFixture {
+        use df_domain::{
+            ContentId, DuplicateSetId, FolderId, OccurrenceId, SnapshotId, TreeCloneSetId,
+        };
+        use rusqlite::params;
+
+        let snapshot_id = SnapshotId::new();
+        let folder_a = FolderId::new();
+        let folder_b = FolderId::new();
+        let occurrence_a = OccurrenceId::new();
+        let occurrence_b = OccurrenceId::new();
+        let content_id = ContentId::new();
+        let duplicate_set_id = DuplicateSetId::new();
+        let clone_set_id = TreeCloneSetId::new();
+        let relation_id = format!("relation-{label}");
+        let anomaly_id = format!("anomaly-{label}");
+        let review_item_id = format!("review-{label}");
+        let content_sha = hex::encode(Sha256::digest(format!("content-{label}").as_bytes()));
+        let tree_signature = hex::encode(Sha256::digest(format!("tree-{label}").as_bytes()));
+
+        db.conn()
+            .execute(
+                "INSERT INTO snapshots (id, project_id, status, created_at)
+                 VALUES (?1, ?2, 'COMPLETE', 't')",
+                params![snapshot_id.to_string(), project_id.to_string()],
+            )
+            .unwrap();
+        for (folder, relative) in [(folder_a, "a"), (folder_b, "b")] {
+            db.conn()
+                .execute(
+                    "INSERT INTO folders
+                        (id, snapshot_id, source_root_id, relative_path,
+                         parent_relative_path, name, normalized_name, depth,
+                         status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, '', ?4, ?4, 1, 'OK', 't')",
+                    params![
+                        folder.to_string(),
+                        snapshot_id.to_string(),
+                        source_root_id.to_string(),
+                        relative,
+                    ],
+                )
+                .unwrap();
+        }
+        for (occurrence, parent, file_name) in [
+            (occurrence_a, "a", "document-a.txt"),
+            (occurrence_b, "b", "document-b.txt"),
+        ] {
+            let relative = format!("{parent}/{file_name}");
+            db.conn()
+                .execute(
+                    "INSERT INTO path_occurrences
+                        (id, snapshot_id, source_root_id, relative_path,
+                         parent_relative_path, file_name, normalized_name,
+                         extension, size_bytes, attributes, path_length, depth,
+                         fingerprint, scan_status, name_is_lossy, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 'txt', 1, 0,
+                             ?7, 2, 'v1:1:0', 'OK', 0, 't')",
+                    params![
+                        occurrence.to_string(),
+                        snapshot_id.to_string(),
+                        source_root_id.to_string(),
+                        relative,
+                        parent,
+                        file_name,
+                        relative.encode_utf16().count() as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO content_objects
+                    (id, size_bytes, sha256, blake3, first_seen_snapshot,
+                     hash_state, created_at)
+                 VALUES (?1, 1, ?2, ?2, ?3, 'HASHED', 't')",
+                params![content_id.to_string(), content_sha, snapshot_id.to_string(),],
+            )
+            .unwrap();
+        for occurrence in [occurrence_a, occurrence_b] {
+            db.conn()
+                .execute(
+                    "INSERT INTO occurrence_content
+                        (occurrence_id, content_id, created_at)
+                     VALUES (?1, ?2, 't')",
+                    params![occurrence.to_string(), content_id.to_string()],
+                )
+                .unwrap();
+        }
+
+        db.conn()
+            .execute(
+                "INSERT INTO duplicate_sets
+                    (id, snapshot_id, content_id, occurrence_count, size_bytes,
+                     created_at)
+                 VALUES (?1, ?2, ?3, 2, 1, 't')",
+                params![
+                    duplicate_set_id.to_string(),
+                    snapshot_id.to_string(),
+                    content_id.to_string(),
+                ],
+            )
+            .unwrap();
+        for (folder, relative) in [(folder_a, "a"), (folder_b, "b")] {
+            db.conn()
+                .execute(
+                    "INSERT INTO folder_signatures
+                        (folder_id, snapshot_id, source_root_id, relative_path,
+                         signature, is_complete, subtree_files, subtree_bytes,
+                         created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 1, 't')",
+                    params![
+                        folder.to_string(),
+                        snapshot_id.to_string(),
+                        source_root_id.to_string(),
+                        relative,
+                        tree_signature,
+                    ],
+                )
+                .unwrap();
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO tree_clone_sets
+                    (id, snapshot_id, signature, relationship, folder_count,
+                     subtree_files, subtree_bytes, created_at)
+                 VALUES (?1, ?2, ?3, 'EXACT_TREE_CLONE', 2, 1, 1, 't')",
+                params![
+                    clone_set_id.to_string(),
+                    snapshot_id.to_string(),
+                    tree_signature,
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO folder_contexts
+                    (folder_id, snapshot_id, relative_path, kind,
+                     is_protected_boundary, penalty, marker, created_at, reason)
+                 VALUES (?1, ?2, 'a', 'NEUTRAL', 0, 0, NULL, 't', 'test')",
+                params![folder_a.to_string(), snapshot_id.to_string()],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO tree_relations
+                    (id, snapshot_id, folder_a, folder_b, relationship,
+                     contained, shared_files, unique_a_files, unique_b_files,
+                     shared_bytes, similarity, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'PARTIAL_TREE_CLONE', NULL,
+                         1, 1, 1, 1, 0.5, 't')",
+                params![
+                    relation_id,
+                    snapshot_id.to_string(),
+                    folder_a.to_string(),
+                    folder_b.to_string(),
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO duplicate_representatives
+                    (duplicate_set_id, snapshot_id, occurrence_id, score,
+                     reason, created_at)
+                 VALUES (?1, ?2, ?3, 1, 'test', 't')",
+                params![
+                    duplicate_set_id.to_string(),
+                    snapshot_id.to_string(),
+                    occurrence_a.to_string(),
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO structural_anomalies
+                    (id, snapshot_id, analysis_version, occurrence_id, folder_a,
+                     folder_b, kind, severity, requires_review, summary,
+                     evidence_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'EXTREME_PATH',
+                         'WARNING', 1, 'test', '{}', 't')",
+                params![
+                    anomaly_id,
+                    snapshot_id.to_string(),
+                    crate::analysis::ANALYSIS_VERSION as i64,
+                    occurrence_a.to_string(),
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO review_items
+                    (id, snapshot_id, analysis_version, anomaly_id,
+                     rule_match_id, occurrence_id, recommended_action, risk,
+                     reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'COPY_REVIEW',
+                         'MEDIUM', 'test', 't')",
+                params![
+                    review_item_id,
+                    snapshot_id.to_string(),
+                    crate::analysis::ANALYSIS_VERSION as i64,
+                    anomaly_id,
+                    occurrence_a.to_string(),
+                ],
+            )
+            .unwrap();
+
+        DerivedSnapshotFixture {
+            snapshot_id,
+            review_item_id,
+        }
+    }
 
     #[test]
     fn migrations_are_idempotent() {
@@ -302,5 +545,131 @@ mod tests {
 
         let report = crate::integrity::check(&db).unwrap();
         assert!(report.is_ok(), "{:?}", report.problems);
+    }
+
+    #[test]
+    fn completed_analysis_seals_all_derived_evidence_but_not_new_snapshots_or_decisions() {
+        use df_domain::{Actor, ProfileRef, Project, SourceRoot};
+        use rusqlite::params;
+        use std::path::PathBuf;
+
+        let mut db = Db::open_in_memory().unwrap();
+        let project = Project::new(
+            "evidence-seal",
+            ProfileRef::default(),
+            PathBuf::from("D:/out"),
+            PathBuf::from("D:/audit"),
+            "test",
+        );
+        let source_root = SourceRoot::new(project.id, PathBuf::from("D:/in"));
+        let source_root_id = source_root.id;
+        crate::repository::create_project(&mut db, &project, &[source_root], Actor::Test).unwrap();
+
+        let sealed = seed_derived_snapshot(&db, project.id, source_root_id, "sealed");
+        crate::analysis::complete_analysis(
+            &mut db,
+            project.id,
+            sealed.snapshot_id,
+            "generic",
+            &serde_json::json!({ "fixture": "sealed" }),
+            Actor::Test,
+        )
+        .unwrap();
+
+        let tables = [
+            "duplicate_sets",
+            "folder_signatures",
+            "tree_clone_sets",
+            "folder_contexts",
+            "tree_relations",
+            "duplicate_representatives",
+        ];
+        for table in tables {
+            let insert = format!(
+                "INSERT INTO {table}
+                 SELECT * FROM {table} WHERE snapshot_id = ?1 LIMIT 1"
+            );
+            let error = db
+                .conn()
+                .execute(&insert, [sealed.snapshot_id.to_string()])
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("completed derived evidence is sealed: {table}")),
+                "{table} INSERT escaped the seal: {error}"
+            );
+
+            let update =
+                format!("UPDATE {table} SET created_at = created_at WHERE snapshot_id = ?1");
+            let error = db
+                .conn()
+                .execute(&update, [sealed.snapshot_id.to_string()])
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("completed derived evidence is sealed: {table}")),
+                "{table} UPDATE escaped the seal: {error}"
+            );
+
+            let delete = format!("DELETE FROM {table} WHERE snapshot_id = ?1");
+            let error = db
+                .conn()
+                .execute(&delete, [sealed.snapshot_id.to_string()])
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("completed derived evidence is sealed: {table}")),
+                "{table} DELETE escaped the seal: {error}"
+            );
+        }
+
+        // Human review is the intentional post-analysis append stream.
+        let inserted = db
+            .conn()
+            .execute(
+                "INSERT INTO review_decisions
+                    (id, review_item_id, sequence, decision, rationale, actor,
+                     created_at)
+                 VALUES ('post-completion-decision', ?1, 1, 'COPY_REVIEW',
+                         'human decision remains append-only', 'test', 't')",
+                params![sealed.review_item_id],
+            )
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        // A completion seals one snapshot, not the whole database. All six
+        // tables can still be populated and revised while a fresh snapshot is
+        // being analysed.
+        let open = seed_derived_snapshot(&db, project.id, source_root_id, "open");
+        for table in tables {
+            let update =
+                format!("UPDATE {table} SET created_at = created_at WHERE snapshot_id = ?1");
+            let changed = db
+                .conn()
+                .execute(&update, [open.snapshot_id.to_string()])
+                .unwrap();
+            assert!(
+                changed > 0,
+                "{table} must remain writable for a new snapshot"
+            );
+        }
+        for table in [
+            "duplicate_representatives",
+            "tree_relations",
+            "folder_contexts",
+            "tree_clone_sets",
+            "folder_signatures",
+            "duplicate_sets",
+        ] {
+            let delete = format!("DELETE FROM {table} WHERE snapshot_id = ?1");
+            let changed = db
+                .conn()
+                .execute(&delete, [open.snapshot_id.to_string()])
+                .unwrap();
+            assert!(changed > 0, "{table} must remain mutable before completion");
+        }
     }
 }

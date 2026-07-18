@@ -1,7 +1,8 @@
 # Modelo de amenazas del núcleo local
 
-Ámbito: fundación, pipeline seguro y cierre de Milestone 0.2 (objetivo
-`0.2.0`). La lista objetivo completa del producto está en RFC-0001 §37.
+Ámbito: fundación, pipeline seguro y evidencia estructural, binaria y
+documental hasta M0.4.
+La lista objetivo completa del producto está en RFC-0001 §37.
 
 > Junctions, symlinks, carreras TOCTOU, sustitución del origen, finalize y
 > manifiesto de ejecución se desarrollan en
@@ -31,6 +32,7 @@ modificar arbitrariamente proceso, base y salida a la vez.
 5. La evidencia estructural: relaciones, anomalías y marcador de completitud.
 6. El historial humano: cola, decisiones y justificaciones de revisión.
 7. El ledger append-only y la cadena de suministro del repositorio.
+8. Las representaciones documentales y sus artefactos Tantivy/Parquet.
 
 ## Amenazas y mitigaciones vigentes
 
@@ -47,7 +49,11 @@ modificar arbitrariamente proceso, base y salida a la vez.
 | Una regla declarativa adquiere capacidad destructiva o escapa por la ruta | Perfiles embebidos y validados; glob únicamente sobre nombre sin separadores; acciones cerradas a cuatro operaciones de copia; frontera protegida prevalece | Una regla puede clasificar de más o de menos; el efecto es una copia en otra categoría o revisión, no borrado |
 | Una anomalía ambigua se resuelve automáticamente perdiendo una copia | Hallazgos con evidencia canónica, `review_items` estables y decisiones append-only con justificación; pendientes generan `COPY_REVIEW`; reglas/revisión conservadoras prevalecen sobre deduplicación | El usuario puede tomar una decisión equivocada, pero queda registrada y sigue sin modificar el origen |
 | Las relaciones de árboles pierden contenido exclusivo | Solo ramas completas; contenidos exactos; recuentos exclusivos A/B persistidos; parciales y embebidas son evidencia/revisión, nunca permiso automático de consolidación | No se persiste la lista completa de rutas exclusivas y los límites pueden omitir pares |
-| Explosión cuadrática o selección no reproducible de pares | Índice invertido, mínimo de dos contenidos, exclusión de componentes en más de 32 carpetas, techo de 200 000 pares y orden/orientación por `(source_root_id, relative_path)`, no por UUID de carpeta (ADR-0027) | Los límites introducen falsos negativos deliberados |
+| Explosión cuadrática o selección no reproducible de pares | Índice invertido, mínimo de dos contenidos, exclusión de componentes en más de 32 carpetas (máximo 496 combinaciones por contenido restante); auto-injertos completos probados por multiplicidad de cada identidad; recorrido estable por contenido/holder; el `BTreeSet` nunca supera 200 000 pares distintos y corta ante el primer candidato nuevo que excede el techo (ADR-0027) | Los límites introducen falsos negativos; el roll-up y prepass de ancestros cuestan O(suma de profundidades) y pueden ser cuadráticos en un árbol adversarialmente profundo; un par puede reconsiderarse para muchos contenidos porque `max_pairs` no es presupuesto total de CPU; `candidate_cap_reached` no cuantifica la cola no generada |
+| PDF o SQL hostil agota/derriba el proceso principal | `lopdf` solo se enlaza en `df-extract-worker`; las consultas de clientes usan `df-query-worker`; ambos bajo Job Object de un proceso, memoria, deadline, salida acotada y kill/reap | Windows es el backend endurecido; sin garantía equivalente se falla cerrado. El binario sidecar forma parte de la distribución confiable |
+| ZIP/DOCX/EML expande datos o escapa rutas | Techos absolutos de entrada/texto/entrada comprimida y total/ratio/profundidad; preflight ZIP completo; rutas virtuales seguras; no materialización; CRC/tamaño verificados | Los límites visibles pueden dejar representaciones `LIMITED`; no se promete recuperar todo contenido hostil |
+| Un artefacto cambia entre hash y apertura | Leases de archivo/directorio retienen objeto y ancestros; hash desde handle; Tantivy/DataFusion reabren mientras la escritura, borrado y sustitución están bloqueados | Un administrador que controla proceso/filesystem queda fuera del modelo; POSIX aún no tiene backend equivalente en M0.4 |
+| Texto derivado o índice se presenta como fuente | SQLite conserva linaje contenido→representación→sujeto/segmento; índices y Parquet se registran solo tras run sellado y son reconstruibles; schemas versionados | Los extractores pueden perder semántica; el texto es evidencia derivada, nunca identidad ni autorización destructiva |
 | La UI aplica lógica privilegiada | CLI y desktop consumen `df-facade`; la UI presenta DTOs y no abre SQLite; capacidades Tauri y CSP acotadas | Un bug de presentación puede confundir, pero no salta las validaciones del motor |
 | Dependencia o bootstrap comprometidos | Lockfiles, `cargo audit`, `cargo deny`, fuentes/licencias acotadas, CI y prohibición de `irm | iex` | Riesgo normal de cadena de suministro; firma de releases y SBOM siguen pendientes |
 
@@ -62,6 +68,11 @@ modificar arbitrariamente proceso, base y salida a la vez.
   regeneración.
 - Regla inválida o acción fuera del conjunto seguro: perfil rechazado.
 - Contexto desconocido o protegido: copia conservada bajo cualquier política.
+- Worker PDF ausente, incompatible o excedido: representación `LIMITED`, sin
+  fallback in-process.
+- Worker SQL ausente, incompatible o excedido: consulta rechazada, sin
+  fallback a hilo.
+- Digest de configuración o artefacto incoherente: run/consulta rechazado.
 
 ## Riesgos aceptados y límites
 
@@ -76,4 +87,4 @@ modificar arbitrariamente proceso, base y salida a la vez.
   se validan y no pueden redirigir la base fuera del proyecto.
 - La seguridad equivalente en Linux/macOS, NAS/UNC plenamente validado,
   durabilidad ante fallo físico, sandboxing de plugins, firma de releases y
-  SBOM permanecen fuera del alcance de `0.2.0`.
+  SBOM permanecen fuera del alcance de M0.4.

@@ -1,4 +1,4 @@
--- Migration 0005 — folder context classification (Milestone 0.2).
+-- Migration 0007 — folder context classification (Milestone 0.2).
 --
 -- A deterministic first slice of the context graph (RFC-0001 §18): one row
 -- per folder tagging it as a generic low-value container, a protected

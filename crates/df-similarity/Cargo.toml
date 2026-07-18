@@ -1,0 +1,30 @@
+[package]
+name = "df-similarity"
+description = "Bounded, streaming content-defined chunking and similarity evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-error = { workspace = true }
+df-domain = { workspace = true }
+df-fs-safety = { workspace = true }
+df-db = { workspace = true }
+fastcdc = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+df-scan = { workspace = true }
+df-hash = { workspace = true }
+df-planner = { workspace = true }
+df-ledger = { workspace = true }

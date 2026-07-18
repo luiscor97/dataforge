@@ -36,6 +36,16 @@ ignore = [
     "RUSTSEC-2025-0081", # unic-char-property unmaintained (via tauri/urlpattern)
     "RUSTSEC-2025-0098", # unic-ucd-ident unmaintained (via tauri/urlpattern)
     "RUSTSEC-2025-0100", # unic-ucd-version unmaintained (via tauri/urlpattern)
+    # `paste` is a build-time proc macro pulled by Arrow/Parquet through
+    # DataFusion 54. It is unmaintained, not vulnerable, and is never linked
+    # into or invoked by the DataForge runtime. Remove when Arrow drops it.
+    # Review by: 2026-10-18.
+    "RUSTSEC-2024-0436",
+    # `ttf-parser` 0.25.1 is pulled by lopdf 0.42/pdf-extract 0.12. It is
+    # unmaintained but has no known vulnerability; PDFs remain strictly size
+    # bounded. Remove when lopdf changes font parser or the PDF backend moves.
+    # Review by: 2026-10-18.
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]

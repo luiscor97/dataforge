@@ -1,4 +1,4 @@
--- Migration 0006 — logical representative of each duplicate set (M0.2).
+-- Migration 0008 — logical representative of each duplicate set (M0.2).
 --
 -- RFC-0001 §15.5: within a set of exact duplicates, score every occurrence
 -- and record which one is the best *canonical* location. This is evidence,

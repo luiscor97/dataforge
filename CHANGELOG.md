@@ -5,6 +5,95 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.4 — Content Intelligence (implementación local)
+
+#### Añadido
+
+- Migración append-only `0014_content_intelligence.sql` y contratos tipados
+  para runs reanudables, representaciones documentales, sujetos/segmentos,
+  adjuntos, entradas ZIP virtuales, correo/hilos y registro inmutable de
+  artefactos Tantivy/Parquet. El SHA-256 del JSON de límites se recalcula y la
+  versión del extractor forma parte de toda identidad de reutilización.
+- `df-extract`: extracción determinista de TXT, HTML, DOCX, EML y ZIP, con
+  normalización Unicode, hashes y segmentación; límites absolutos de entrada,
+  texto, entradas, bytes, ratio y nesting; preflight ZIP, rutas virtuales
+  seguras, CRC/tamaño y cero materialización en disco.
+- `df-extract-worker`: único binario que enlaza `pdf-extract`/`lopdf`. PDF de
+  nivel superior, adjuntos EML y entradas ZIP viajan por un protocolo acotado
+  y se ejecutan en Windows bajo Job Object de un proceso, memoria, deadline y
+  kill-on-close. Ausencia, timeout o overflow producen evidencia explícita
+  `LIMITED`/`FAILED`, sin fallback in-process.
+- `df-search`: índice Tantivy reconstruible sobre texto, ruta, contexto,
+  correo y metadata; consultas y snippets acotados. Directorios, meta y
+  segmentos quedan arrendados contra sustitución durante hash y lectura; los
+  lockfiles mutables de Tantivy se tratan como estado operativo fuera del
+  digest.
+- `df-query` y `df-query-worker`: snapshot Parquet versionado sin texto
+  completo y SQL DataFusion read-only en proceso aislado. DDL/DML/statements,
+  spill y familias opcionales de funciones están desactivados; memoria,
+  tiempo, filas, celdas y salida tienen techos duros.
+- `df-process-safety`: sidecars explícitos absolutos, sin `PATH`/entorno ni
+  reparse points, con executable lease, Job Object y stdout/stdin acotados.
+- Fachada y CLI para `content extract|fail|build|search|query`, replay y
+  reutilización; códigos no exitosos para resultados limitados/fallidos.
+  Escritorio Tauri/React con los mismos cinco flujos, estados asíncronos,
+  resultados plain-text y tabla SQL accesible.
+- Pruebas de formatos/overflow/ZIP hostil, EML→PDF, ZIP→PDF, workers
+  timeout/protocolo/memoria, configuración dirigida por digest, integridad
+  check/use, consulta aislada, flujo E2E y estados UI.
+
+#### Límites
+
+- Windows es el único backend con aislamiento de proceso y leases fuertes.
+  PDF y SQL fallan cerrados en otras plataformas hasta M0.8.
+- Texto e índices son evidencia derivada reconstruible. No prueban significado,
+  no cambian un plan y no permiten ninguna acción destructiva.
+
+### Milestone 0.3 — Similarity and Versioning (implementación local)
+
+#### Añadido
+
+- Crate `df-similarity`: FastCDC v2020 streaming con perfil inicial
+  16/64/256 KiB, BLAKE3 por chunk, verificación SHA-256 completa y fingerprint
+  pre/post. El origen se abre solo en lectura y una fuente modificada revierte
+  toda la evidencia del contenido.
+- Migración `0013_content_similarity.sql`: runs configurables, chunks
+  normalizados, membresías ordenadas, firmas MinHash, bandas LSH, candidatos y
+  relaciones `LIKELY_VERSION`, `TRUNCATED_VARIANT`, `RECOMPOSED_CONTENT` y
+  `SIMILAR_CONTENT`. La evidencia global es append-only y cada run queda
+  sellado al completarse.
+- Generación de candidatos acotada mediante buckets LSH y fallback de chunks
+  poco frecuentes. Se sondea exactamente un par más que el límite para que
+  `candidate_cap_reached` signifique que existe una cola omitida, no solo que
+  el recuento coincide casualmente con el máximo.
+- Similitud exacta de multiconjuntos ponderada por bytes
+  (`shared_bytes / union_bytes`). MinHash solo localiza candidatos y su
+  estimación queda como evidencia secundaria; SHA-256 sigue siendo la única
+  identidad.
+- Reanudación por marcador de contenido y digest de configuración. Cambiar
+  umbrales crea otro run reproducible y reutiliza chunks/firmas cuando el
+  contrato de fragmentación no cambia. La reanudación verifica además todos
+  los campos persistidos contra la configuración dirigida por el digest.
+- Fachada, CLI (`similarity`, `report similarities`) y escritorio comparten el
+  mismo DTO y exponen algoritmo, configuración exacta y digest. La CLI permite
+  fijar umbral, mínimos de chunks/bytes y techo de candidatos; la vista muestra
+  los parámetros junto a las relaciones y advierte que nunca autorizan
+  borrado, consolidación ni una operación de plan.
+- Pruebas de variantes sintéticas, separación identidad/similitud, cancelación
+  y replay, cambio de umbral sin releer el origen, techo de candidatos,
+  transacciones por contenido, límites de offsets/tamaños, evidencia LSH
+  completa y sellado de runs. Benchmark manual de 256 MiB: working set
+  acotado a dos chunks máximos más 1 KiB de firma.
+
+#### Límites
+
+- M0.3 relaciona bytes y tiempo de filesystem; todavía no interpreta texto,
+  correo, contenedores ni formatos multimedia. Esas capacidades pertenecen a
+  M0.4/M0.5.
+- Los límites de buckets y candidatos aceptan falsos negativos y los hacen
+  visibles. Ninguna relación automática equivale a una versión histórica
+  confirmada ni cambia el plan.
+
 ### Milestone 0.2 — Structural Intelligence (objetivo 0.2.0)
 
 #### Añadido
@@ -38,12 +127,41 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   `STRUCTURAL_ANALYSIS_COMPLETED`. Los informes de duplicados, clones,
   relaciones, contextos, anomalías y revisión fallan cerrados hasta que el
   snapshot tenga marcador final y estado estable (ADR-0029).
+- La migración `0011_derived_evidence_seal.sql` sella por snapshot duplicados,
+  firmas, clones, contextos, relaciones y representantes tras ese marcador:
+  SQLite rechaza `INSERT`, `UPDATE` y `DELETE`, mientras un snapshot nuevo y
+  las decisiones humanas append-only permanecen operativos (ADR-0029).
+- La migración `0012_execution_partial_lease.sql` persiste token aleatorio e
+  identidad física de los parciales. La identidad se captura del handle
+  creado con `create_new`; solo `RUNNING` + token + identidad coincidente
+  permiten recuperación automática.
 - CLI: `report tree-relations`, `report anomalies`, `review list` y
   `review decide`; `project status` y la app de escritorio muestran un resumen
   estructural M0.2.
+- La multiplicidad distingue contenedores pasa-through de auto-injertos. Un
+  ancestro solo se suprime cuando su conjunto de contenidos **y su total de
+  apariciones** coinciden con los de la descendiente (como `Backup/` con un
+  único expediente dentro); se reporta la carpeta más profunda y el evento
+  registra `pass_through_suppressed`. Si el conjunto coincide pero el ancestro
+  acumula apariciones adicionales porque contiene otra copia completa, se
+  persiste como `REPEATED_COMPONENT_ONLY`, no como clon accionable
+  (ADR-0027 §4).
+- Generador de corpus sintético determinista `tools/df-corpus` y prueba de
+  escala del pipeline completo (`cargo test -p df-corpus --release --
+  --ignored scale`), cerrando los criterios 1 y 10 de M0.1: 100 000 archivos
+  de crear a verificar con veredicto `COMPLETED`, origen intacto y ledger
+  válido. El generador rechaza destinos no vacíos y crea archivos sin
+  reemplazo; la integridad del origen cubre rutas, tipos y SHA-256, no solo
+  recuento y tamaño (`docs/testing/corpus-and-scale.md`).
 
 #### Cambiado
 
+- Los temporales de copia se llaman ahora
+  `.dataforge-partial-<operation-id>-<lease-token>` y no repiten el nombre
+  original, de modo que incluso un componente NTFS de 255 unidades UTF-16
+  deja espacio para el protocolo atómico. Planner y executor comparten un sufijo de colisión
+  determinista y acotado: recorta el stem cuando hace falta y conserva la
+  extensión completa siempre que cabe.
 - La planificación acepta cinco políticas de duplicado. `REPORT_ONLY` sigue
   siendo la opción segura por defecto; las políticas de consolidación son
   opt-in, conservan todo contexto desconocido y nunca atraviesan una frontera
@@ -178,7 +296,7 @@ No añade funcionalidad de producto. Modelo de amenazas completo en
   `COPY_WITH_SUFFIX` para colisiones —, validación §26.5 y aprobación con
   serialización canónica + SHA-256 (§26.4).
 - `df-executor`: protocolo por archivo del §27.1 (fingerprint pre/post,
-  parcial `.n.dataforge-partial-<op>`, copia en streaming con doble hash,
+  parcial `.dataforge-partial-<op>-<lease>`, copia en streaming con doble hash,
   flush, comparación, rename atómico), colisiones §27.3, errores tipados
   §27.5, reanudación §27.4 y cancelación segura.
 - `df-verifier`: verificación independiente §28 — re-hash de cada destino,

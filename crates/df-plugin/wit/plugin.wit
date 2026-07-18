@@ -1,0 +1,15 @@
+package dataforge:plugin@0.1.0;
+
+/// DataForge's deliberately small, suggestion-only plugin ABI.
+///
+/// The host provides no imports in ABI 0.1: in particular, no WASI, files,
+/// sockets, environment, random source, or clocks. Inputs are immutable JSON
+/// snapshots filtered by the capabilities granted in the signed manifest.
+world plugin {
+    /// Return a bounded, informational description of the component.
+    export describe: func() -> string;
+
+    /// Analyze a bounded versioned JSON snapshot and return bounded JSON that
+    /// conforms to the host-owned closed findings schema.
+    export analyze: func(input: string) -> string;
+}

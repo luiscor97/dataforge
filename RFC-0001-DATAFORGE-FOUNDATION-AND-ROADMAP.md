@@ -1,3 +1,7 @@
+> **Documento histórico, no canónico.** Se conserva como instantánea de la
+> especificación original. Para implementar o revisar DataForge usa
+> [`docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md`](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
+
 # DataForge
 ## RFC-0001 — Documento fundacional, arquitectura y roadmap maestro
 

@@ -2,8 +2,9 @@
 
 ## Versiones soportadas
 
-DataForge está en fase de fundación (`0.0.x-dev`). No hay releases con
-soporte todavía; los informes de seguridad se aplican a `main`.
+DataForge está desarrollando la serie `0.2.x`, todavía documentada como
+`Unreleased`. No hay una release estable publicada; los informes de seguridad
+se evalúan contra `main` y, cuando corresponda, contra la versión afectada.
 
 ## Cómo reportar una vulnerabilidad
 
@@ -23,8 +24,9 @@ Compromisos:
 - evaluación inicial y plan en 30 días;
 - crédito en las notas de la corrección si lo deseas.
 
-Cuando el repositorio esté publicado en GitHub se habilitará además
-*GitHub Private Vulnerability Reporting* como canal preferente.
+El repositorio es público: no incluyas detalles sensibles, adjuntos ni PoC en
+issues, Discussions o pull requests. El correo anterior es el canal privado
+responsable documentado actualmente.
 
 ## Ámbito
 

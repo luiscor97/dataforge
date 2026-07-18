@@ -1,4 +1,4 @@
--- Migration 0004 — structural intelligence (Milestone 0.2).
+-- Migration 0006 — structural intelligence (Milestone 0.2).
 --
 -- Folder Merkle signatures (RFC-0001 §19.2) and the exact tree-clone sets
 -- derived from them (§19.3). Same conventions as earlier migrations: STRICT,

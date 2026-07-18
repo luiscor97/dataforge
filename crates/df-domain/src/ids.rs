@@ -106,6 +106,50 @@ typed_id!(
     /// Identifier of a tree-clone set (RFC-0001 §19).
     TreeCloneSetId
 );
+typed_id!(
+    /// Identifier of a normalized content-defined chunk (RFC-0001 §20).
+    ChunkId
+);
+typed_id!(
+    /// Identifier of one reproducible similarity analysis run (RFC-0001 §20).
+    SimilarityRunId
+);
+typed_id!(
+    /// Identifier of an evidence-backed relationship between two contents.
+    SimilarityRelationId
+);
+typed_id!(
+    /// Identifier of one reproducible document-extraction run (M0.4).
+    ExtractionRunId
+);
+typed_id!(
+    /// Identifier of one immutable physical document representation.
+    RepresentationId
+);
+typed_id!(
+    /// Identifier of a searchable physical or embedded text subject.
+    TextSubjectId
+);
+typed_id!(
+    /// Identifier of an attachment decoded from an EML message.
+    MailAttachmentId
+);
+typed_id!(
+    /// Identifier of a virtual entry inside an archive.
+    ArchiveEntryId
+);
+typed_id!(
+    /// Identifier of a reconstructed basic mail thread.
+    MailThreadId
+);
+typed_id!(
+    /// Identifier of a rebuildable Tantivy index artifact.
+    SearchIndexId
+);
+typed_id!(
+    /// Identifier of an analytical Parquet artifact.
+    AnalyticalSnapshotId
+);
 
 #[cfg(test)]
 mod tests {

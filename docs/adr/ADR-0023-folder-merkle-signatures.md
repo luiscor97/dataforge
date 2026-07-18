@@ -5,8 +5,8 @@
 **Relacionada con:** RFC-0001 §19, §18; ADR-0027
 
 **Revisada:** 2026-07-16 para reflejar que ADR-0027 amplió el análisis con
-`PARTIAL_TREE_CLONE` y `TREE_EMBEDDED`, sin cambiar la decisión de firmas ni
-clones exactos.
+relaciones acotadas; 2026-07-17 para documentar la identidad raw usada en las
+entradas Merkle y la materialización de `REPEATED_COMPONENT_ONLY`.
 
 ## Contexto
 
@@ -28,15 +28,21 @@ y más segura del §19.3.
 
    ```text
    folder_signature = BLAKE3( sorted( entry(child) for child in folder ) )
-   entry(file)   = "F\0" + normalized_name + "\0" + sha256
-   entry(folder) = "D\0" + normalized_name + "\0" + child_folder_signature
+   merkle_name   = "raw:" + hex(UTF16LE(raw_basename))
+                 | "display:" + normalized_name  # fallback legacy no-lossy
+   entry(file)   = "F\0" + merkle_name + "\0" + sha256
+   entry(folder) = "D\0" + merkle_name + "\0" + child_folder_signature
    ```
 
-   El separador es el byte NUL, ilegal en nombres de archivo en todos los
-   sistemas de archivos soportados, lo que hace la codificación
-   a prueba de inyección: no existe combinación de nombre y hash que pueda
-   fabricar una entrada falsa. Las entradas se ordenan antes de hashear, de
-   modo que la firma es independiente del orden de lectura del directorio.
+   Cuando existe `raw_relative_path`, solo su componente final participa y se
+   codifican exactamente sus unidades UTF-16LE; así dos nombres con distinto
+   raw no forman un clon falso aunque compartan representación visual. El
+   namespace `display:` se reserva para snapshots heredados sin raw y solo se
+   acepta si el nombre no es lossy. Los namespaces no pueden colisionar entre
+   sí. El separador es el byte NUL, ilegal en nombres de archivo en todos los
+   sistemas de archivos soportados, lo que hace la codificación a prueba de
+   inyección. Las entradas se ordenan antes de hashear, de modo que la firma es
+   independiente del orden de lectura del directorio.
 
 2. **BLAKE3 para la firma, SHA-256 como identidad de contenido de entrada.**
    La firma de carpeta usa BLAKE3, consistente con RFC-0001 §6:
@@ -48,8 +54,9 @@ y más segura del §19.3.
 
 3. **Regla de completitud (seguridad, §19.4).** La firma de una carpeta es
    válida (`is_complete = true`, `signature` no nulo) solo si todos sus
-   archivos descendientes tienen hash de contenido y ningún archivo o
-   subcarpeta del subárbol quedó en error o es un reparse point no seguido.
+   archivos descendientes tienen hash de contenido, todo nombre lossy conserva
+   identidad raw y ningún archivo o subcarpeta del subárbol quedó en error o es
+   un reparse point no seguido.
    Si falta una sola condición, la carpeta y todos sus ancestros quedan
    `is_complete = false` con `signature = NULL`. Solo carpetas completas
    participan en la detección de clones: una rama parcialmente escaneada o
@@ -58,10 +65,12 @@ y más segura del §19.3.
 
 4. **La firma resuelve `EXACT_TREE_CLONE`.** Dos o más carpetas completas y
    no vacías que comparten la misma firma forman un conjunto
-   `EXACT_TREE_CLONE`. Las relaciones parciales y embebidas no se deducen de
-   una firma igual: ADR-0027 las calcula después mediante conjuntos de
-   identidades exactas de contenido. `REPEATED_COMPONENT_ONLY` permanece en
-   el vocabulario, pero no se persiste sin evidencia adicional.
+   `EXACT_TREE_CLONE`. Las relaciones parciales, embebidas y de componente
+   repetido no se deducen de una firma igual: ADR-0027 las calcula después
+   mediante conjuntos de identidades exactas de contenido y, para los
+   auto-injertos, la multiplicidad de apariciones. `REPEATED_COMPONENT_ONLY`
+   se persiste solo con esa evidencia adicional y acotada; no se presenta como
+   un clon accionable.
 
 5. **Solo informe, sin proponer ni ejecutar nada.** La detección de clones
    de árbol es evidencia: lista los conjuntos y los bytes redundantes que
@@ -120,12 +129,11 @@ y más segura del §19.3.
   §14 en lugar de releer archivos, así que el coste adicional del análisis
   estructural es proporcional al número de carpetas y ocurrencias del
   snapshot, no a sus bytes.
-- ADR-0027 entrega `PARTIAL_TREE_CLONE` y `TREE_EMBEDDED`; no cambia el hecho
-  de que los conjuntos exactos y las relaciones son evidencia, no operaciones
-  de consolidación de una rama.
-- Deuda aceptada: no se materializa `REPEATED_COMPONENT_ONLY`, no se listan
-  las rutas exclusivas de cada relación parcial y las firmas de carpeta no
-  autorizan omitir árboles en el plan.
+- ADR-0027 entrega `PARTIAL_TREE_CLONE`, `TREE_EMBEDDED` y
+  `REPEATED_COMPONENT_ONLY`; no cambia el hecho de que los conjuntos exactos y
+  las relaciones son evidencia, no operaciones de consolidación de una rama.
+- Deuda aceptada: no se listan las rutas exclusivas de cada relación parcial y
+  las firmas de carpeta no autorizan omitir árboles en el plan.
 - Condición de revisión: cualquier consolidación futura de árboles deberá
   demostrar cobertura del contenido exclusivo y respeto de fronteras
   protegidas; no basta con reutilizar `tree_clone_sets`.

@@ -1773,6 +1773,13 @@ Carpetas completas pueden aparecer:
 - renombradas;
 - parcialmente mezcladas.
 
+Para distinguir un wrapper que solo envuelve a su única descendiente de una
+carpeta completa injertada dentro de sí misma, comparar también el total de
+apariciones por subárbol. Igual conjunto e igual total permite suprimir el
+wrapper; igual conjunto con apariciones adicionales en el ancestro materializa
+`REPEATED_COMPONENT_ONLY`. Esta excepción no habilita los pares
+ancestro/descendiente triviales restantes.
+
 ## 19.2. Firma Merkle
 
 ```text
@@ -2099,15 +2106,24 @@ emit event
 ## 27.2. Parcial
 
 ```text
-.<name>.dataforge-partial-<operation-id>
+.dataforge-partial-<operation-id>-<lease-token>
 ```
+
+El nombre temporal no incorpora el nombre del documento: un componente NTFS
+válido puede ocupar ya las 255 unidades UTF-16 y no dejar espacio para
+metadatos internos. Los dos UUID mantienen el componente por debajo del límite.
+El token se reserva antes de crear; la propiedad solo se persiste después de
+que `create_new` gane, usando la identidad física leída desde ese mismo handle.
+Un estado/token sin identidad nunca autoriza borrar una entrada preexistente.
 
 ## 27.3. Colisiones
 
 Si destino existe:
 
 - mismo hash: `SKIP_REPRESENTED`;
-- distinto hash: sufijo determinista;
+- distinto hash: sufijo determinista `~df-<8 hex SHA-256>` antes de la
+  extensión; si el componente agotaría 255 unidades UTF-16, se recorta solo el
+  stem de forma determinista y se conserva la extensión completa cuando cabe;
 - no sobrescribir.
 
 ## 27.4. Reanudación
@@ -3443,7 +3459,9 @@ dataforge project status
 ```text
 Estás trabajando en DataForge, un motor open source local-first de reconstrucción documental.
 
-Lee RFC-0001-DATAFORGE-FOUNDATION-AND-ROADMAP.md completo antes de modificar archivos.
+Este archivo de `docs/rfcs/` es la versión canónica. Las copias con nombre en
+mayúsculas situadas en la raíz son instantáneas históricas y no deben guiar
+cambios de implementación.
 
 Antes de implementar:
 - inspecciona el entorno;
