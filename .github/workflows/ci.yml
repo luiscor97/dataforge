@@ -34,6 +34,12 @@ jobs:
       - name: Tests
         run: cargo test
 
+      # df-corpus is not a default member (it is a dev tool), so its fast
+      # full-pipeline test needs an explicit invocation. The 100k scale run
+      # stays #[ignore]d and on-demand (docs/testing/corpus-and-scale.md).
+      - name: Corpus pipeline test
+        run: cargo test -p df-corpus
+
       - name: Build CLI
         run: cargo build -p dataforge-cli
 
@@ -61,11 +67,40 @@ jobs:
       - name: Typecheck
         run: pnpm --filter dataforge-desktop typecheck
 
+      - name: Accessible UI render tests
+        run: pnpm --filter dataforge-desktop test:ui
+
       - name: Build frontend
         run: pnpm --filter dataforge-desktop build
 
       - name: Check Tauri shell (MSVC)
         run: cargo check -p dataforge-desktop
+
+  hardening:
+    name: Filesystem hardening (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # These tests plant real junctions with `mklink /J` and deny read access
+      # with `icacls`. They skip loudly (never silently) when the environment
+      # forbids it, so a green run here is meaningful evidence.
+      - name: Filesystem safety boundary
+        run: cargo test -p df-fs-safety -- --nocapture
+
+      - name: Executor and verifier hardening (junctions, no-replace)
+        run: cargo test -p df-executor -p df-verifier -- --nocapture
+
+      - name: Tamper tests (manifest, inventory, marker)
+        run: cargo test -p df-db -p df-facade -p df-planner
+
+      - name: Migration compatibility (0.1 database opens under 0.1.1)
+        run: cargo test -p df-db a_v0_1_database_migrates_forward_and_keeps_its_data -- --nocapture
 
   supply-chain:
     name: Dependency audit

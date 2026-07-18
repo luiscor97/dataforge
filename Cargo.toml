@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/df-error",
     "crates/df-domain",
+    "crates/df-fs-safety",
+    "crates/df-process-safety",
     "crates/df-ledger",
     "crates/df-db",
     "crates/df-scan",
@@ -10,15 +12,28 @@ members = [
     "crates/df-planner",
     "crates/df-executor",
     "crates/df-verifier",
+    "crates/df-similarity",
+    "crates/df-extract",
+    "crates/df-search",
+    "crates/df-query",
+    "crates/df-media",
+    "crates/df-plugin",
+    "crates/df-ai",
     "crates/df-facade",
     "apps/cli",
     "apps/desktop/src-tauri",
+    "tools/df-corpus",
+    "tools/df-extract-worker",
+    "tools/df-query-worker",
+    "tools/df-media-worker",
 ]
 # The desktop shell is excluded from default builds because it needs the
 # platform webview toolchain; CI and `pnpm tauri build` cover it explicitly.
 default-members = [
     "crates/df-error",
     "crates/df-domain",
+    "crates/df-fs-safety",
+    "crates/df-process-safety",
     "crates/df-ledger",
     "crates/df-db",
     "crates/df-scan",
@@ -26,30 +41,49 @@ default-members = [
     "crates/df-planner",
     "crates/df-executor",
     "crates/df-verifier",
+    "crates/df-similarity",
+    "crates/df-extract",
+    "crates/df-search",
+    "crates/df-query",
+    "crates/df-media",
+    "crates/df-plugin",
+    "crates/df-ai",
     "crates/df-facade",
     "apps/cli",
+    "tools/df-extract-worker",
+    "tools/df-query-worker",
+    "tools/df-media-worker",
 ]
 
 [workspace.package]
-version = "0.0.1-dev"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/luiscor/dataforge"
+repository = "https://github.com/luiscor97/dataforge"
 authors = ["Luis Cordero / Luiscor IT Services"]
-rust-version = "1.82"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Internal crates
-df-error = { path = "crates/df-error" }
-df-domain = { path = "crates/df-domain" }
-df-ledger = { path = "crates/df-ledger" }
-df-db = { path = "crates/df-db" }
-df-scan = { path = "crates/df-scan" }
-df-hash = { path = "crates/df-hash" }
-df-planner = { path = "crates/df-planner" }
-df-executor = { path = "crates/df-executor" }
-df-verifier = { path = "crates/df-verifier" }
-df-facade = { path = "crates/df-facade" }
+df-error = { path = "crates/df-error", version = "0.2.0" }
+df-domain = { path = "crates/df-domain", version = "0.2.0" }
+df-fs-safety = { path = "crates/df-fs-safety", version = "0.2.0" }
+df-process-safety = { path = "crates/df-process-safety", version = "0.2.0" }
+df-ledger = { path = "crates/df-ledger", version = "0.2.0" }
+df-db = { path = "crates/df-db", version = "0.2.0" }
+df-scan = { path = "crates/df-scan", version = "0.2.0" }
+df-hash = { path = "crates/df-hash", version = "0.2.0" }
+df-planner = { path = "crates/df-planner", version = "0.2.0" }
+df-executor = { path = "crates/df-executor", version = "0.2.0" }
+df-verifier = { path = "crates/df-verifier", version = "0.2.0" }
+df-similarity = { path = "crates/df-similarity", version = "0.2.0" }
+df-extract = { path = "crates/df-extract", version = "0.2.0" }
+df-search = { path = "crates/df-search", version = "0.2.0" }
+df-query = { path = "crates/df-query", version = "0.2.0" }
+df-media = { path = "crates/df-media", version = "0.2.0" }
+df-plugin = { path = "crates/df-plugin", version = "0.2.0" }
+df-ai = { path = "crates/df-ai", version = "0.2.0" }
+df-facade = { path = "crates/df-facade", version = "0.2.0" }
 
 # External crates
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +97,34 @@ blake3 = "1"
 hex = "0.4"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+# Pinned to the FastCDC 2020 streaming API used by the persisted M0.3
+# algorithm contract. Changing it requires a new algorithm version.
+fastcdc = "=3.2.1"
+# M0.4's PDF and mail parsers require Rust 1.88 in practice. Their transitive
+# crates declare 1.85 but use language constructs first accepted by 1.88; the
+# workspace MSRV records the toolchain we actually compile-test. In particular,
+# pdf-extract
+# 0.12 is the first compatible line backed by lopdf >=0.42, which contains the
+# fix for RUSTSEC-2026-0187. Do not downgrade this dependency.
+zip = { version = "=8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+quick-xml = "=0.41.0"
+pdf-extract = "=0.12.0"
+html2text = "=0.17.1"
+mail-parser = { version = "=0.11.5", features = ["full_encoding"] }
+encoding_rs = "=0.8.35"
+unicode-normalization = "=0.1.25"
+tantivy = { version = "=0.26.1", default-features = false, features = ["mmap"] }
+datafusion = { version = "=54.0.0", default-features = false, features = ["parquet", "recursive_protection", "sql"] }
+arrow-array = "=58.3.0"
+arrow-schema = "=58.3.0"
+parquet = { version = "=58.3.0", default-features = false, features = ["arrow", "zstd"] }
+tokio = { version = "1", features = ["rt", "time"] }
+# M0.7 BYOK: API keys live in the OS credential store (Windows Credential
+# Manager), never in SQLite, config files or the ledger.
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+# Minimal blocking HTTPS client for the cloud transports at the facade edge;
+# df-ai itself never links any network code.
+ureq = { version = "=3.1.2", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

@@ -8,12 +8,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use df_domain::{
-    Actor, ApprovalState, ContentId, DuplicateSetId, ExecutionState, FindingId, OccurrenceId,
-    OperationErrorCode, OperationId, OperationType, Plan, PlanId, PlanOperation, PlanStatus,
-    ProjectId, RiskLevel, SnapshotId, VerificationRunId,
+    Actor, ApprovalState, ContentId, DuplicateSetId, ExecutionState, FindingId, ManifestEntry,
+    OccurrenceId, OperationErrorCode, OperationId, OperationType, Plan, PlanId, PlanOperation,
+    PlanStatus, Project, ProjectId, ProjectState, RiskLevel, SnapshotId, SourceRootId,
+    VerificationRunId,
 };
 use df_error::{DfError, DfResult};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::repository::{append_event, parse_stored_timestamp, to_stored_timestamp};
 use crate::{db_err, Db};
@@ -38,6 +39,92 @@ pub fn emit_event(
     append_event(&tx, project_id, event_type, payload, actor)?;
     tx.commit().map_err(db_err)?;
     Ok(())
+}
+
+/// Close one execution run atomically: execution milestone, project state and
+/// state-change ledger entry commit together.
+///
+/// A build before this transaction could crash after the execution milestone
+/// but before changing the project state. When resuming such an `EXECUTING`
+/// project without attempting more work, `reuse_interrupted_milestone` allows
+/// reusing that milestone iff it is the latest event and names this plan.
+/// Callers must keep this false after any operation attempt so a new PAUSED
+/// run is always represented by a distinct event.
+pub fn finish_execution(
+    db: &mut Db,
+    plan_id: PlanId,
+    event_type: &str,
+    payload: &serde_json::Value,
+    next_state: ProjectState,
+    reuse_interrupted_milestone: bool,
+    actor: Actor,
+) -> DfResult<Project> {
+    if !matches!(
+        event_type,
+        EVENT_EXECUTION_COMPLETED | EVENT_EXECUTION_PAUSED
+    ) {
+        return Err(DfError::Validation(format!(
+            "invalid execution terminal event `{event_type}`"
+        )));
+    }
+    let mut project = crate::repository::load_project(db)?;
+    let from = project.state;
+    project.transition_to(next_state)?;
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+
+    let latest: Option<(String, String)> = if reuse_interrupted_milestone {
+        tx.query_row(
+            "SELECT event_type, payload_json FROM audit_events
+             WHERE project_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            [project.id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?
+    } else {
+        None
+    };
+    let plan_id_text = plan_id.to_string();
+    let reuses_interrupted_milestone = latest.is_some_and(|(kind, json)| {
+        kind == event_type
+            && serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("plan_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(plan_id_text.as_str())
+    });
+    if !reuses_interrupted_milestone {
+        append_event(&tx, project.id, event_type, payload, actor)?;
+    }
+
+    tx.execute(
+        "UPDATE projects SET state = ?1, updated_at = ?2 WHERE id = ?3",
+        params![
+            project.state.as_str(),
+            to_stored_timestamp(project.updated_at),
+            project.id.to_string(),
+        ],
+    )
+    .map_err(db_err)?;
+    let state_payload = serde_json::json!({
+        "project_id": project.id.to_string(),
+        "from": from.as_str(),
+        "to": project.state.as_str(),
+    });
+    append_event(
+        &tx,
+        project.id,
+        crate::repository::EVENT_STATE_CHANGED,
+        &state_payload,
+        actor,
+    )?;
+    tx.commit().map_err(db_err)?;
+    Ok(project)
 }
 
 /// Materialise the exact duplicate sets of a snapshot (RFC-0001 §15.1) and
@@ -104,6 +191,10 @@ pub struct PlanningOccurrence {
     pub occurrence_id: OccurrenceId,
     pub source_root_id: df_domain::SourceRootId,
     pub relative_path: String,
+    /// Exact path captured by the scanner. The display path is suitable for
+    /// reports, but this value is what lets the planner derive a stable,
+    /// portable destination for names Win32 cannot safely create.
+    pub raw_relative_path: Option<df_domain::RawPath>,
     pub file_name: String,
     pub size_bytes: u64,
     pub scan_status: df_domain::ScanEntryStatus,
@@ -121,7 +212,8 @@ pub fn planning_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Pl
         .conn()
         .prepare(
             "SELECT o.id, o.source_root_id, o.relative_path, o.file_name,
-                    o.size_bytes, o.scan_status, j.status, j.error, c.id, c.sha256
+                    o.size_bytes, o.scan_status, j.status, j.error, c.id, c.sha256,
+                    o.raw_relative_path
              FROM path_occurrences o
              LEFT JOIN hash_jobs j ON j.occurrence_id = o.id
              LEFT JOIN occurrence_content oc ON oc.occurrence_id = o.id
@@ -143,16 +235,32 @@ pub fn planning_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Pl
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (id, root, relative, name, size, scan, hash_status, hash_error, content, sha) =
-                raw.map_err(db_err)?;
+            let (
+                id,
+                root,
+                relative,
+                name,
+                size,
+                scan,
+                hash_status,
+                hash_error,
+                content,
+                sha,
+                raw_relative_path,
+            ) = raw.map_err(db_err)?;
             Ok(PlanningOccurrence {
                 occurrence_id: OccurrenceId::from_str(&id)?,
                 source_root_id: df_domain::SourceRootId::from_str(&root)?,
                 relative_path: relative,
+                raw_relative_path: raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 file_name: name,
                 size_bytes: size as u64,
                 scan_status: df_domain::ScanEntryStatus::parse(&scan)?,
@@ -395,9 +503,14 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
 
 /// Freeze a plan (§26.4): store the canonical hash, approve its operations
 /// and emit `PLAN_APPROVED` — one tx.
+/// Approve a plan: freeze its execution manifest, record the canonical hash
+/// and flip the statuses — all in one transaction, so a plan can never be
+/// APPROVED without the manifest that defines what "approved" means
+/// (ADR-0018).
 pub fn approve_plan(
     db: &mut Db,
     plan: &Plan,
+    manifest_entries: &[ManifestEntry],
     serialized_sha256: &str,
     actor: Actor,
 ) -> DfResult<()> {
@@ -408,6 +521,7 @@ pub fn approve_plan(
         )));
     }
     let tx = db.conn_mut().transaction().map_err(db_err)?;
+    insert_manifest(&tx, manifest_entries)?;
     tx.execute(
         "UPDATE plan_operations SET approval = 'APPROVED', updated_at = ?1
          WHERE plan_id = ?2 AND approval = 'PENDING'",
@@ -435,16 +549,241 @@ pub fn approve_plan(
     Ok(())
 }
 
+/// Gather, from the live inventory, everything the manifest must freeze.
+///
+/// This is the **only** place the live tables are read as an execution
+/// contract, and it happens exactly once: at approval. From that moment the
+/// manifest is the contract and these tables are just evidence (ADR-0018).
+///
+/// `source_root_identity` is left `None` here — df-db does not touch the
+/// filesystem; the planner fills it in before hashing.
+pub fn build_manifest_entries(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT p.id, p.sequence, p.operation_type, p.idempotency_key,
+                    p.destination_relative_path, o.source_root_id, r.absolute_path,
+                    o.relative_path, o.fingerprint, o.size_bytes, c.sha256, c.blake3,
+                    o.raw_relative_path
+             FROM plan_operations p
+             LEFT JOIN path_occurrences o ON o.id = p.source_occurrence
+             LEFT JOIN source_roots r ON r.id = o.source_root_id
+             LEFT JOIN content_objects c ON c.id = p.content_id
+             WHERE p.plan_id = ?1
+             ORDER BY p.sequence",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<DfResult<ManifestEntry>> = stmt
+        .query_map([plan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<Vec<u8>>>(12)?,
+            ))
+        })
+        .map_err(db_err)?
+        .map(|raw| {
+            let (
+                operation_id,
+                sequence,
+                operation_type,
+                idempotency_key,
+                destination,
+                source_root_id,
+                root_path,
+                relative,
+                fingerprint,
+                size,
+                sha256,
+                blake3,
+                raw_relative,
+            ) = raw.map_err(db_err)?;
+            Ok(ManifestEntry {
+                operation_id: OperationId::from_str(&operation_id)?,
+                plan_id,
+                sequence: sequence as u64,
+                operation_type: OperationType::parse(&operation_type)?,
+                idempotency_key,
+                source_root_id: source_root_id
+                    .as_deref()
+                    .map(SourceRootId::from_str)
+                    .transpose()?,
+                source_root_identity: None,
+                source_root_path_snapshot: root_path,
+                source_relative_path_exact: relative,
+                source_raw_relative_path: raw_relative
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
+                source_fingerprint: fingerprint,
+                expected_size_bytes: size.map(|n| n as u64),
+                expected_sha256: sha256,
+                expected_blake3: blake3,
+                destination_relative_path: destination,
+            })
+        })
+        .collect();
+    rows.into_iter().collect()
+}
+
+/// Freeze the execution manifest of a plan (ADR-0018).
+///
+/// Written once, inside the approval transaction; the table's triggers reject
+/// any later UPDATE or DELETE, so from here on the contract is fixed.
+pub fn insert_manifest(tx: &Transaction<'_>, entries: &[ManifestEntry]) -> DfResult<()> {
+    let now = to_stored_timestamp(chrono::Utc::now());
+    for entry in entries {
+        tx.execute(
+            "INSERT INTO execution_manifest
+                (operation_id, plan_id, sequence, operation_type, idempotency_key,
+                 source_root_id, source_root_identity, source_root_path_snapshot,
+                 source_relative_path_exact, source_fingerprint,
+                 expected_size_bytes, expected_sha256, expected_blake3,
+                 destination_relative_path, source_raw_relative_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                entry.operation_id.to_string(),
+                entry.plan_id.to_string(),
+                entry.sequence as i64,
+                entry.operation_type.as_str(),
+                entry.idempotency_key,
+                entry.source_root_id.map(|id| id.to_string()),
+                entry.source_root_identity,
+                entry.source_root_path_snapshot,
+                entry.source_relative_path_exact,
+                entry.source_fingerprint,
+                entry.expected_size_bytes.map(|n| n as i64),
+                entry.expected_sha256,
+                entry.expected_blake3,
+                entry.destination_relative_path,
+                entry.source_raw_relative_path.as_ref().map(|r| r.to_blob()),
+                now,
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+/// Read the frozen manifest of a plan, in sequence order.
+///
+/// This is what the verifier re-hashes and what `report` exports: the
+/// authoritative record of what was approved.
+pub fn manifest(db: &Db, plan_id: PlanId) -> DfResult<Vec<ManifestEntry>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT operation_id, plan_id, sequence, operation_type, idempotency_key,
+                    source_root_id, source_root_identity, source_root_path_snapshot,
+                    source_relative_path_exact, source_fingerprint,
+                    expected_size_bytes, expected_sha256, expected_blake3,
+                    destination_relative_path, source_raw_relative_path
+             FROM execution_manifest WHERE plan_id = ?1 ORDER BY sequence",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<DfResult<ManifestEntry>> = stmt
+        .query_map([plan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<Vec<u8>>>(14)?,
+            ))
+        })
+        .map_err(db_err)?
+        .map(|raw| {
+            let (
+                operation_id,
+                plan_id,
+                sequence,
+                operation_type,
+                idempotency_key,
+                source_root_id,
+                source_root_identity,
+                source_root_path_snapshot,
+                source_relative_path_exact,
+                source_fingerprint,
+                expected_size_bytes,
+                expected_sha256,
+                expected_blake3,
+                destination_relative_path,
+                source_raw_relative_path,
+            ) = raw.map_err(db_err)?;
+            Ok(ManifestEntry {
+                operation_id: OperationId::from_str(&operation_id)?,
+                plan_id: PlanId::from_str(&plan_id)?,
+                sequence: sequence as u64,
+                operation_type: OperationType::parse(&operation_type)?,
+                idempotency_key,
+                source_root_id: source_root_id
+                    .as_deref()
+                    .map(SourceRootId::from_str)
+                    .transpose()?,
+                source_root_identity,
+                source_root_path_snapshot,
+                source_relative_path_exact,
+                source_raw_relative_path: source_raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
+                source_fingerprint,
+                expected_size_bytes: expected_size_bytes.map(|n| n as u64),
+                expected_sha256,
+                expected_blake3,
+                destination_relative_path,
+            })
+        })
+        .collect();
+    rows.into_iter().collect()
+}
+
 /// Everything the executor needs to run one operation.
 #[derive(Debug, Clone)]
 pub struct ExecutableOperation {
     pub operation_id: OperationId,
     pub sequence: u64,
     pub operation_type: OperationType,
+    /// Progress state observed when this execution batch was loaded.
+    pub previous_execution_state: ExecutionState,
+    /// Random ownership token committed together with `RUNNING` before the
+    /// previous attempt could create a partial. `RUNNING` without this token
+    /// is never sufficient authority to remove a filesystem entry.
+    pub previous_partial_lease_token: Option<String>,
+    /// Physical identity captured from the partial's newly-created handle and
+    /// persisted only after `create_new` succeeded. Without it, no retry may
+    /// reclaim anything, even when the token and state match.
+    pub previous_partial_lease_identity: Option<String>,
     pub destination_relative_path: String,
     /// Source file, for copies: absolute root + relative path.
     pub source_root_path: Option<PathBuf>,
+    /// Physical root identity frozen at approval. Execution rechecks it for
+    /// every copy so a source-root swap after the run preflight is detected.
+    pub source_root_identity: Option<String>,
+    /// Display form; never used to open anything (ADR-0020).
     pub source_relative_path: Option<String>,
+    /// The exact bytes to reopen the source with.
+    pub source_raw_relative_path: Option<df_domain::RawPath>,
     /// Fingerprint captured at scan time (§27.1 "validate source fingerprint").
     pub source_fingerprint: Option<String>,
     pub size_bytes: u64,
@@ -455,8 +794,17 @@ pub struct ExecutableOperation {
 
 /// Approved, executable operations not yet in a terminal state.
 ///
-/// `RUNNING` rows are included: they belong to a run that died mid-copy and
-/// are safe to retry (the executor overwrites its own partial file).
+/// `RUNNING` rows are included so a run killed mid-copy can be resumed. Only
+/// a `RUNNING` row carrying its random partial lease token authorizes secure
+/// reclamation of that exact regular file; state alone is not ownership.
+///
+/// **Reads only the frozen manifest** (ADR-0018). It deliberately does not
+/// join `path_occurrences`, `source_roots` or `content_objects`: those are
+/// live, mutable evidence, and resolving execution material from them is what
+/// let a post-approval edit change the executed bytes without moving the plan
+/// hash (threat T5). `plan_operations` is still joined, but only for the
+/// mutable *progress* columns (approval, execution_state) — never for what to
+/// read or expect.
 pub fn executable_operations(
     db: &Db,
     plan_id: PlanId,
@@ -465,20 +813,22 @@ pub fn executable_operations(
     let mut stmt = db
         .conn()
         .prepare(
-            "SELECT p.id, p.sequence, p.operation_type, p.destination_relative_path,
-                    r.absolute_path, o.relative_path, o.fingerprint, o.size_bytes,
-                    c.sha256, c.blake3
-             FROM plan_operations p
-             LEFT JOIN path_occurrences o ON o.id = p.source_occurrence
-             LEFT JOIN source_roots r ON r.id = o.source_root_id
-             LEFT JOIN content_objects c ON c.id = p.content_id
-             WHERE p.plan_id = ?1
+            "SELECT m.operation_id, m.sequence, m.operation_type,
+                    m.destination_relative_path, m.source_root_path_snapshot,
+                    m.source_relative_path_exact, m.source_fingerprint,
+                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
+                    m.source_raw_relative_path, m.source_root_identity,
+                    p.execution_state, p.partial_lease_token,
+                    p.partial_lease_identity
+             FROM execution_manifest m
+             JOIN plan_operations p ON p.id = m.operation_id
+             WHERE m.plan_id = ?1
                AND p.approval = 'APPROVED'
-               AND p.operation_type IN
+               AND m.operation_type IN
                    ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                    'COPY_WITH_SUFFIX', 'CREATE_DIRECTORY')
+                    'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')
                AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
-             ORDER BY p.sequence
+             ORDER BY m.sequence
              LIMIT ?2",
         )
         .map_err(db_err)?;
@@ -495,12 +845,32 @@ pub fn executable_operations(
                 row.get::<_, Option<i64>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (id, sequence, op_type, destination, root, relative, fingerprint, size, sha, blake) =
-                raw.map_err(db_err)?;
+            let (
+                id,
+                sequence,
+                op_type,
+                destination,
+                root,
+                relative,
+                fingerprint,
+                size,
+                sha,
+                blake,
+                raw_relative,
+                source_root_identity,
+                previous_execution_state,
+                previous_partial_lease_token,
+                previous_partial_lease_identity,
+            ) = raw.map_err(db_err)?;
             let destination = destination.ok_or_else(|| {
                 DfError::Database(format!("executable operation {id} has no destination"))
             })?;
@@ -508,9 +878,17 @@ pub fn executable_operations(
                 operation_id: OperationId::from_str(&id)?,
                 sequence: sequence as u64,
                 operation_type: OperationType::parse(&op_type)?,
+                previous_execution_state: ExecutionState::parse(&previous_execution_state)?,
+                previous_partial_lease_token,
+                previous_partial_lease_identity,
                 destination_relative_path: destination,
                 source_root_path: root.map(PathBuf::from),
+                source_root_identity,
                 source_relative_path: relative,
+                source_raw_relative_path: raw_relative
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 source_fingerprint: fingerprint,
                 size_bytes: size.unwrap_or(0) as u64,
                 expected_sha256: sha,
@@ -521,12 +899,16 @@ pub fn executable_operations(
     rows.into_iter().collect()
 }
 
-/// Mark an operation `RUNNING` before touching the filesystem, so a crash
-/// leaves a retryable trace (§27.4).
+/// Mark a non-copy operation `RUNNING` before touching the filesystem, so a
+/// crash leaves a retryable trace (§27.4). Any stale partial token is cleared:
+/// state alone is not an ownership proof.
 pub fn mark_operation_running(db: &Db, operation_id: OperationId) -> DfResult<()> {
-    db.conn()
+    let changed = db
+        .conn()
         .execute(
-            "UPDATE plan_operations SET execution_state = 'RUNNING', updated_at = ?1
+            "UPDATE plan_operations
+             SET execution_state = 'RUNNING', partial_lease_token = NULL,
+                 partial_lease_identity = NULL, updated_at = ?1
              WHERE id = ?2",
             params![
                 to_stored_timestamp(chrono::Utc::now()),
@@ -534,6 +916,79 @@ pub fn mark_operation_running(db: &Db, operation_id: OperationId) -> DfResult<()
             ],
         )
         .map_err(db_err)?;
+    if changed != 1 {
+        return Err(DfError::Database(format!(
+            "operation {operation_id} does not exist"
+        )));
+    }
+    Ok(())
+}
+
+/// Atomically mark a copy `RUNNING` and reserve an unpredictable partial name.
+///
+/// The update is committed by SQLite before this function returns, and thus
+/// before the executor creates the file. A later retry may reclaim only the
+/// exact token returned here; a pre-existing deterministic-looking squatter
+/// never becomes owned merely because the operation changed to `RUNNING`.
+pub fn lease_copy_operation(db: &Db, operation_id: OperationId) -> DfResult<String> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let changed = db
+        .conn()
+        .execute(
+            "UPDATE plan_operations
+             SET execution_state = 'RUNNING', partial_lease_token = ?1,
+                 partial_lease_identity = NULL, updated_at = ?2
+             WHERE id = ?3
+               AND operation_type IN
+                   ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
+                    'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT')",
+            params![
+                token,
+                to_stored_timestamp(chrono::Utc::now()),
+                operation_id.to_string(),
+            ],
+        )
+        .map_err(db_err)?;
+    if changed != 1 {
+        return Err(DfError::Database(format!(
+            "copy operation {operation_id} does not exist"
+        )));
+    }
+    Ok(token)
+}
+
+/// Persist the physical ownership claim captured from the handle returned by
+/// `create_new`. This cannot turn a pre-existing collision into an owned file:
+/// callers invoke it only after creation succeeded, and the compare-and-set
+/// requires the same RUNNING token reserved for this attempt.
+pub fn claim_copy_partial(
+    db: &Db,
+    operation_id: OperationId,
+    token: &str,
+    physical_identity: &str,
+) -> DfResult<()> {
+    let changed = db
+        .conn()
+        .execute(
+            "UPDATE plan_operations
+             SET partial_lease_identity = ?1, updated_at = ?2
+             WHERE id = ?3
+               AND execution_state = 'RUNNING'
+               AND partial_lease_token = ?4
+               AND partial_lease_identity IS NULL",
+            params![
+                physical_identity,
+                to_stored_timestamp(chrono::Utc::now()),
+                operation_id.to_string(),
+                token,
+            ],
+        )
+        .map_err(db_err)?;
+    if changed != 1 {
+        return Err(DfError::Database(format!(
+            "partial lease for operation {operation_id} changed before ownership could be claimed"
+        )));
+    }
     Ok(())
 }
 
@@ -551,6 +1006,9 @@ pub struct OperationOutcome {
     pub sha256: Option<String>,
     pub blake3: Option<String>,
     pub started_at: df_domain::Timestamp,
+    /// Keep a physically claimed partial durable for the next recovery pass.
+    /// This is only valid with `RUNNING`, after cleanup failed transiently.
+    pub retain_partial_lease: bool,
 }
 
 /// Persist the outcome of one attempt: journal row + state change — one tx.
@@ -559,6 +1017,11 @@ pub fn record_operation_outcome(
     operation_id: OperationId,
     outcome: &OperationOutcome,
 ) -> DfResult<()> {
+    if outcome.retain_partial_lease && outcome.execution_state != ExecutionState::Running {
+        return Err(DfError::Validation(
+            "a retained partial lease requires RUNNING execution state".to_string(),
+        ));
+    }
     let tx = db.conn_mut().transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO operation_results
@@ -580,15 +1043,38 @@ pub fn record_operation_outcome(
         ],
     )
     .map_err(db_err)?;
-    tx.execute(
-        "UPDATE plan_operations SET execution_state = ?1, updated_at = ?2 WHERE id = ?3",
-        params![
-            outcome.execution_state.as_str(),
-            to_stored_timestamp(chrono::Utc::now()),
-            operation_id.to_string(),
-        ],
-    )
-    .map_err(db_err)?;
+    let changed = if outcome.retain_partial_lease {
+        tx.execute(
+            "UPDATE plan_operations
+             SET execution_state = 'RUNNING', updated_at = ?1
+             WHERE id = ?2
+               AND partial_lease_token IS NOT NULL
+               AND partial_lease_identity IS NOT NULL",
+            params![
+                to_stored_timestamp(chrono::Utc::now()),
+                operation_id.to_string(),
+            ],
+        )
+        .map_err(db_err)?
+    } else {
+        tx.execute(
+            "UPDATE plan_operations
+             SET execution_state = ?1, partial_lease_token = NULL,
+                 partial_lease_identity = NULL, updated_at = ?2
+             WHERE id = ?3",
+            params![
+                outcome.execution_state.as_str(),
+                to_stored_timestamp(chrono::Utc::now()),
+                operation_id.to_string(),
+            ],
+        )
+        .map_err(db_err)?
+    };
+    if changed != 1 {
+        return Err(DfError::Database(format!(
+            "operation {operation_id} cannot record its outcome/lease state"
+        )));
+    }
     tx.commit().map_err(db_err)?;
     Ok(())
 }
@@ -614,7 +1100,7 @@ pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
                 COUNT(*),
                 COUNT(*) FILTER (WHERE operation_type IN
                     ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                     'COPY_WITH_SUFFIX', 'CREATE_DIRECTORY')),
+                     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')),
                 COUNT(*) FILTER (WHERE execution_state = 'PENDING'),
                 COUNT(*) FILTER (WHERE execution_state = 'RUNNING'),
                 COUNT(*) FILTER (WHERE execution_state = 'COMPLETED'),
@@ -845,7 +1331,10 @@ mod tests {
         assert_eq!(loaded.status, PlanStatus::Ready);
         assert_eq!(list_operations(&db, plan.id).unwrap().len(), 1);
 
-        approve_plan(&mut db, &loaded, &"a".repeat(64), Actor::Test).unwrap();
+        // Approving now freezes the manifest in the same transaction, so the
+        // entries travel with the approval (ADR-0018).
+        let entries = build_manifest_entries(&db, plan.id).unwrap();
+        approve_plan(&mut db, &loaded, &entries, &"a".repeat(64), Actor::Test).unwrap();
         let approved = current_plan(&db, plan.project_id).unwrap().unwrap();
         assert_eq!(approved.status, PlanStatus::Approved);
         assert!(approved.approved_at.is_some());
@@ -878,6 +1367,92 @@ mod tests {
     }
 
     #[test]
+    fn partial_lease_schema_enforces_running_copy_and_canonical_identity() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, directory_ops) = project_with_plan(&mut db);
+        let copy_id = OperationId::new();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, 2, 'COPY_ACTIVE', 'origen/x.txt', 1.0,
+                         'LOW', 'APPROVED', 'PENDING', ?3, 'test', ?4, ?4)",
+                params![
+                    copy_id.to_string(),
+                    plan.id.to_string(),
+                    "1".repeat(64),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+
+        assert!(
+            db.conn()
+                .execute(
+                    "UPDATE plan_operations SET partial_lease_token = ?1 WHERE id = ?2",
+                    params![token, copy_id.to_string()],
+                )
+                .is_err(),
+            "PENDING cannot carry a lease"
+        );
+        db.conn()
+            .execute(
+                "UPDATE plan_operations
+                 SET execution_state = 'RUNNING', partial_lease_token = ?1
+                 WHERE id = ?2",
+                params![token, copy_id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            db.conn()
+                .execute(
+                    "UPDATE plan_operations SET partial_lease_token = ?1 WHERE id = ?2",
+                    params![token.to_uppercase(), copy_id.to_string()],
+                )
+                .is_err(),
+            "UUID lease must be canonical lowercase"
+        );
+        assert!(
+            db.conn()
+                .execute(
+                    "UPDATE plan_operations SET partial_lease_identity = ?1 WHERE id = ?2",
+                    params!["0000000000000001:0000000000000000", copy_id.to_string()],
+                )
+                .is_err(),
+            "zero is not a physical file identity"
+        );
+        db.conn()
+            .execute(
+                "UPDATE plan_operations SET partial_lease_identity = ?1 WHERE id = ?2",
+                params!["0000000000000001:0000000000000002", copy_id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            db.conn()
+                .execute(
+                    "UPDATE plan_operations SET execution_state = 'COMPLETED' WHERE id = ?1",
+                    [copy_id.to_string()],
+                )
+                .is_err(),
+            "terminal state cannot retain a lease"
+        );
+        assert!(
+            db.conn()
+                .execute(
+                    "UPDATE plan_operations
+                 SET execution_state = 'RUNNING', partial_lease_token = ?1
+                 WHERE id = ?2",
+                    params![token, directory_ops[0].id.to_string()],
+                )
+                .is_err(),
+            "CREATE_DIRECTORY never owns a partial"
+        );
+    }
+
+    #[test]
     fn operation_results_are_append_only() {
         let mut db = Db::open_in_memory().unwrap();
         let (plan, ops) = project_with_plan(&mut db);
@@ -891,6 +1466,7 @@ mod tests {
             sha256: None,
             blake3: None,
             started_at: chrono::Utc::now(),
+            retain_partial_lease: false,
         };
         record_operation_outcome(&mut db, ops[0].id, &outcome).unwrap();
         assert!(db
@@ -903,5 +1479,80 @@ mod tests {
             .is_err());
         let progress = plan_progress(&db, plan.id).unwrap();
         assert_eq!(progress.completed, 1);
+    }
+
+    #[test]
+    fn outcome_journal_and_partial_lease_clear_are_atomic() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+        let copy_id = OperationId::new();
+        let token = uuid::Uuid::new_v4().to_string();
+        let identity = "0000000000000001:0000000000000002";
+        let now = to_stored_timestamp(chrono::Utc::now());
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason,
+                     partial_lease_token, partial_lease_identity,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, 2, 'COPY_ACTIVE', 'origen/x.txt', 1.0,
+                         'LOW', 'APPROVED', 'RUNNING', ?3, 'atomicity test',
+                         ?4, ?5, ?6, ?6)",
+                params![
+                    copy_id.to_string(),
+                    plan.id.to_string(),
+                    "2".repeat(64),
+                    token,
+                    identity,
+                    now,
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER test_refuse_lease_clear
+                 BEFORE UPDATE OF partial_lease_token ON plan_operations
+                 WHEN NEW.partial_lease_token IS NULL
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated crash while closing outcome');
+                 END;",
+            )
+            .unwrap();
+
+        let outcome = OperationOutcome {
+            execution_state: ExecutionState::Completed,
+            outcome: "COPIED".to_string(),
+            error_code: None,
+            detail: None,
+            final_relative_path: Some("origen".to_string()),
+            bytes_copied: 0,
+            sha256: None,
+            blake3: None,
+            started_at: chrono::Utc::now(),
+            retain_partial_lease: false,
+        };
+        assert!(record_operation_outcome(&mut db, copy_id, &outcome).is_err());
+
+        let result_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM operation_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let (state, stored_token, stored_identity): (String, Option<String>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT execution_state, partial_lease_token, partial_lease_identity
+                 FROM plan_operations WHERE id = ?1",
+                [copy_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(result_count, 0, "journal insert must roll back too");
+        assert_eq!(state, "RUNNING");
+        assert_eq!(stored_token.as_deref(), Some(token.as_str()));
+        assert_eq!(stored_identity.as_deref(), Some(identity));
     }
 }

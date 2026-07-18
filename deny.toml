@@ -10,9 +10,55 @@ targets = [
 [advisories]
 yanked = "deny"
 
+# Specific, documented exceptions with a retirement condition (encargo §5).
+#
+# The `unic-*` family is flagged `unmaintained` (RUSTSEC-2025-0075/0080/0081/
+# 0098/0100). They are NOT vulnerabilities: the advisory says the crates are no
+# longer maintained and points to `icu_properties` as the replacement.
+#
+# They are not ours to remove: they arrive transitively through
+#   unic-* -> unic-ucd-ident -> urlpattern -> tauri-utils -> tauri
+# so the only fixes available to us would be to drop Tauri or to vendor a patch
+# of a dependency five levels down, both of which are worse than the exposure.
+# The crates parse Unicode identifier properties for URL patterns; nothing in
+# DataForge feeds them untrusted input (the desktop shell only loads its own
+# bundled frontend).
+#
+# RETIREMENT CONDITION: remove each ignore as soon as a Tauri release drops
+# `urlpattern`'s dependency on `unic-*` (tracked upstream in
+# https://github.com/rustsec/advisory-db/issues/2414). Re-check on every Tauri
+# bump; if a real vulnerability is ever filed against these crates, this
+# exception is void and the desktop shell must be pinned or dropped instead.
+# Review by: 2026-10-15.
+ignore = [
+    "RUSTSEC-2025-0075", # unic-char-range unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0080", # unic-common unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0081", # unic-char-property unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0098", # unic-ucd-ident unmaintained (via tauri/urlpattern)
+    "RUSTSEC-2025-0100", # unic-ucd-version unmaintained (via tauri/urlpattern)
+    # `paste` is a build-time proc macro pulled by Arrow/Parquet through
+    # DataFusion 54. It is unmaintained, not vulnerable, and is never linked
+    # into or invoked by the DataForge runtime. Remove when Arrow drops it.
+    # Review by: 2026-10-18.
+    "RUSTSEC-2024-0436",
+    # `ttf-parser` 0.25.1 is pulled by lopdf 0.42/pdf-extract 0.12. It is
+    # unmaintained but has no known vulnerability; PDFs remain strictly size
+    # bounded. Remove when lopdf changes font parser or the PDF backend moves.
+    # Review by: 2026-10-18.
+    "RUSTSEC-2026-0192",
+    # `rustls-pemfile` is archived (thin wrapper over the same PEM code now
+    # living in rustls-pki-types); pulled by ureq 3.1 for the M0.7 cloud
+    # transports. Not vulnerable. Remove when ureq depends on the pki-types
+    # PEM API directly. Review by: 2026-10-18.
+    "RUSTSEC-2025-0134",
+]
+
 [licenses]
 allow = [
     "MIT",
+    # MIT No Attribution: OSI approved, strictly more permissive than MIT.
+    # Required by borrow-or-share (fluent-uri -> jsonschema).
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",

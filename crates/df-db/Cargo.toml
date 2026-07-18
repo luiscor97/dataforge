@@ -8,6 +8,11 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# Exposes the raw connection so security tests in other crates can simulate
+# offline tampering. Never enabled by a production build.
+test-support = []
+
 [dependencies]
 df-error = { workspace = true }
 df-domain = { workspace = true }
@@ -16,9 +21,11 @@ rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+blake3 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+df-ledger = { workspace = true }
 tempfile = { workspace = true }

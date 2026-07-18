@@ -1,0 +1,85 @@
+{
+  "schema": "dataforge.profile",
+  "schema_version": "1.1.0",
+  "id": "generic",
+  "name": "Genérico",
+  "description": "Perfil conservador por defecto. Reconoce contenedores de bajo valor comunes (descargas, escritorio, copias de seguridad, temporales) para puntuar el representante lógico de un conjunto de duplicados, pero NO declara ninguna frontera protegida: sin conocimiento del dominio no hay forma de saber qué carpeta es un límite que no debe disolverse. Un perfil sin marcadores protegidos es el más seguro posible frente a la deduplicación (RFC-0001 §25.4).",
+  "inherits": null,
+  "generic_markers": [
+    { "name": "descargas", "penalty": 50 },
+    { "name": "downloads", "penalty": 50 },
+    { "name": "escritorio", "penalty": 45 },
+    { "name": "desktop", "penalty": 45 },
+    { "name": "backup", "penalty": 40 },
+    { "name": "backups", "penalty": 40 },
+    { "name": "copia de seguridad", "penalty": 40 },
+    { "name": "copias de seguridad", "penalty": 40 },
+    { "name": "respaldo", "penalty": 40 },
+    { "name": "respaldos", "penalty": 40 },
+    { "name": "recuperado", "penalty": 35 },
+    { "name": "recuperados", "penalty": 35 },
+    { "name": "recovered", "penalty": 35 },
+    { "name": "recovery", "penalty": 35 },
+    { "name": "temp", "penalty": 30 },
+    { "name": "tmp", "penalty": 30 },
+    { "name": "temporal", "penalty": 30 },
+    { "name": "temporales", "penalty": 30 },
+    { "name": "temporary", "penalty": 30 },
+    { "name": "copia", "penalty": 30 },
+    { "name": "copias", "penalty": 30 },
+    { "name": "copy", "penalty": 30 },
+    { "name": "nueva carpeta", "penalty": 30 },
+    { "name": "new folder", "penalty": 30 }
+  ],
+  "protected_markers": [],
+  "rules": [
+    {
+      "id": "temporary.office-lock",
+      "version": 1,
+      "match": { "file_name_glob": "~$*" },
+      "classification": { "category": "temporary", "confidence": 1.0 },
+      "action": "COPY_TEMPORARY",
+      "risk": "LOW"
+    },
+    {
+      "id": "temporary.tmp-extension",
+      "version": 1,
+      "match": { "file_name_glob": "*.tmp" },
+      "classification": { "category": "temporary", "confidence": 0.98 },
+      "action": "COPY_TEMPORARY",
+      "risk": "LOW"
+    },
+    {
+      "id": "temporary.partial-download",
+      "version": 1,
+      "match": { "file_name_glob": "*.part" },
+      "classification": { "category": "temporary", "confidence": 0.9 },
+      "action": "COPY_TEMPORARY",
+      "risk": "LOW"
+    },
+    {
+      "id": "review.backup-extension",
+      "version": 1,
+      "match": { "file_name_glob": "*.bak" },
+      "classification": { "category": "backup", "confidence": 0.8 },
+      "action": "COPY_REVIEW",
+      "risk": "MEDIUM"
+    },
+    {
+      "id": "separate.windows-thumbnail-cache",
+      "version": 1,
+      "match": { "file_name_glob": "thumbs.db" },
+      "classification": { "category": "system_metadata", "confidence": 1.0 },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.macos-metadata",
+      "version": 1,
+      "match": { "file_name_glob": ".ds_store" },
+      "classification": { "category": "system_metadata", "confidence": 1.0 },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    }
+  ]
+}

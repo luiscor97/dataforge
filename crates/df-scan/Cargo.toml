@@ -11,10 +11,13 @@ rust-version.workspace = true
 [dependencies]
 df-error = { workspace = true }
 df-domain = { workspace = true }
+df-fs-safety = { workspace = true }
 df-db = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 df-ledger = { workspace = true }

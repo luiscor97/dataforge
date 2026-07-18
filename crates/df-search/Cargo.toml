@@ -1,0 +1,23 @@
+[package]
+name = "df-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-domain.workspace = true
+df-db.workspace = true
+df-error.workspace = true
+df-fs-safety.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+tantivy.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -10,7 +10,7 @@
 //! - every phase change goes through the project state machine and lands in
 //!   the audit ledger.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,6 +22,7 @@ use df_domain::{
 };
 use df_error::{DfError, DfResult};
 use serde::Serialize;
+use sha2::Digest;
 
 /// Tuning knobs of one scan (RFC-0001 §13.3).
 #[derive(Debug, Clone)]
@@ -82,6 +83,10 @@ pub fn validate_project(db: &mut Db, actor: Actor) -> DfResult<()> {
     }
     for root in &roots {
         let path = &root.absolute_path;
+        // `read_dir` follows the starting directory. Reject a junction root
+        // before the walker can cross it, then prove it is physically separate
+        // from every configured write root.
+        df_fs_safety::ensure_root_is_not_reparse(path)?;
         if !path.is_dir() {
             return Err(DfError::Validation(format!(
                 "source root `{}` does not exist or is not a directory",
@@ -90,6 +95,8 @@ pub fn validate_project(db: &mut Db, actor: Actor) -> DfResult<()> {
         }
         // Readability probe: listing the root must work.
         std::fs::read_dir(path).map_err(|e| DfError::io(path.clone(), e))?;
+        df_fs_safety::ensure_physical_roots_disjoint(path, &project.output_root)?;
+        df_fs_safety::ensure_physical_roots_disjoint(path, &project.audit_root)?;
     }
     for (i, a) in roots.iter().enumerate() {
         for b in roots.iter().skip(i + 1) {
@@ -100,6 +107,7 @@ pub fn validate_project(db: &mut Db, actor: Actor) -> DfResult<()> {
                     b.absolute_path.display()
                 )));
             }
+            df_fs_safety::ensure_physical_roots_disjoint(&a.absolute_path, &b.absolute_path)?;
         }
     }
 
@@ -198,6 +206,9 @@ enum WalkVerdict {
 /// popped, so the row's status reflects whether reading it worked.
 struct QueuedDir {
     relative_path: String,
+    /// Authoritative path used to reopen the directory. The display path is
+    /// only a fallback for legacy/exceptional entries where capture failed.
+    raw_relative_path: Option<df_domain::RawPath>,
     parent_relative_path: Option<String>,
     name: String,
     depth: u32,
@@ -244,6 +255,7 @@ impl Walker<'_> {
         let mut queue: VecDeque<QueuedDir> = VecDeque::new();
         queue.push_back(QueuedDir {
             relative_path: String::new(),
+            raw_relative_path: Some(df_domain::RawPath::from_os_str(std::ffi::OsStr::new(""))),
             parent_relative_path: None,
             name: root_name,
             depth: 0,
@@ -254,7 +266,11 @@ impl Walker<'_> {
                 self.flush()?;
                 return Ok(WalkVerdict::Cancelled);
             }
-            let dir_abs = compose_path(&root.absolute_path, &dir.relative_path);
+            let dir_abs = dir
+                .raw_relative_path
+                .as_ref()
+                .map(|raw| root.absolute_path.join(PathBuf::from(raw.to_os_string())))
+                .unwrap_or_else(|| compose_path(&root.absolute_path, &dir.relative_path));
             let entries = match std::fs::read_dir(&dir_abs) {
                 Ok(entries) => entries,
                 Err(error) => {
@@ -267,6 +283,19 @@ impl Walker<'_> {
             self.counters.folders += 1;
             self.push_folder(root, &dir, ScanEntryStatus::Ok, None);
 
+            let entries: Vec<_> = entries.collect();
+            let entry_names: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| entry.as_ref().ok())
+                .map(|entry| {
+                    let os_name = entry.file_name();
+                    let raw = df_domain::RawPath::from_os_str(&os_name);
+                    let lossy = os_name.to_str().is_none();
+                    (raw, os_name.to_string_lossy().into_owned(), lossy)
+                })
+                .collect();
+            let relative_components = collision_safe_entry_components(&entry_names);
+
             for entry in entries {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -277,7 +306,14 @@ impl Walker<'_> {
                         continue;
                     }
                 };
-                self.process_entry(root, &dir, &entry, &mut queue);
+                let raw_name = df_domain::RawPath::from_os_str(&entry.file_name());
+                let relative_component =
+                    relative_components.get(&raw_name).cloned().ok_or_else(|| {
+                        DfError::Database(
+                            "scanner lost a deterministic entry-name mapping".to_string(),
+                        )
+                    })?;
+                self.process_entry(root, &dir, &entry, relative_component, &mut queue);
                 self.flush_if_full()?;
             }
         }
@@ -289,12 +325,18 @@ impl Walker<'_> {
         root: &SourceRoot,
         dir: &QueuedDir,
         entry: &std::fs::DirEntry,
+        relative_component: String,
         queue: &mut VecDeque<QueuedDir>,
     ) {
         let raw_name = entry.file_name();
         let name_is_lossy = raw_name.to_str().is_none();
         let name = raw_name.to_string_lossy().into_owned();
-        let rel = join_relative(&dir.relative_path, &name);
+        let rel = join_relative(&dir.relative_path, &relative_component);
+        let raw_relative_path = entry
+            .path()
+            .strip_prefix(&root.absolute_path)
+            .ok()
+            .map(|path| df_domain::RawPath::from_os_str(path.as_os_str()));
         let child_depth = dir.depth + 1;
 
         let metadata = match entry.metadata() {
@@ -304,6 +346,7 @@ impl Walker<'_> {
                 self.push_occurrence(
                     root,
                     rel,
+                    raw_relative_path,
                     &dir.relative_path,
                     name,
                     None,
@@ -325,6 +368,7 @@ impl Walker<'_> {
                     snapshot_id: self.snapshot_id,
                     source_root_id: root.id,
                     relative_path: rel,
+                    raw_relative_path,
                     parent_relative_path: Some(dir.relative_path.clone()),
                     normalized_name: name.to_lowercase(),
                     name,
@@ -336,6 +380,7 @@ impl Walker<'_> {
                 self.push_occurrence(
                     root,
                     rel,
+                    raw_relative_path,
                     &dir.relative_path,
                     name,
                     Some(&metadata),
@@ -351,6 +396,7 @@ impl Walker<'_> {
         if metadata.is_dir() {
             queue.push_back(QueuedDir {
                 relative_path: rel,
+                raw_relative_path,
                 parent_relative_path: Some(dir.relative_path.clone()),
                 name,
                 depth: child_depth,
@@ -361,6 +407,7 @@ impl Walker<'_> {
             self.push_occurrence(
                 root,
                 rel,
+                raw_relative_path,
                 &dir.relative_path,
                 name,
                 Some(&metadata),
@@ -384,6 +431,7 @@ impl Walker<'_> {
             snapshot_id: self.snapshot_id,
             source_root_id: root.id,
             relative_path: dir.relative_path.clone(),
+            raw_relative_path: dir.raw_relative_path.clone(),
             parent_relative_path: dir.parent_relative_path.clone(),
             name: dir.name.clone(),
             normalized_name: dir.name.to_lowercase(),
@@ -398,6 +446,7 @@ impl Walker<'_> {
         &mut self,
         root: &SourceRoot,
         relative_path: String,
+        raw_relative_path: Option<df_domain::RawPath>,
         parent: &str,
         name: String,
         metadata: Option<&std::fs::Metadata>,
@@ -409,12 +458,25 @@ impl Walker<'_> {
         let size_bytes = metadata.map(|m| m.len()).unwrap_or(0);
         let created_at_fs = metadata.and_then(|m| m.created().ok()).map(to_timestamp);
         let modified_at_fs = metadata.and_then(|m| m.modified().ok()).map(to_timestamp);
-        let fingerprint = FileFingerprint {
-            size_bytes,
-            modified_at_fs,
-        }
-        .token();
-        let absolute = compose_path(&root.absolute_path, &relative_path);
+        // v2 fingerprint with physical identity when the filesystem offers
+        // one (ADR-0019). A stat failure degrades to size+mtime rather than
+        // aborting the scan: a partial record beats no record.
+        let absolute = raw_relative_path
+            .as_ref()
+            .map(|raw| root.absolute_path.join(PathBuf::from(raw.to_os_string())))
+            .unwrap_or_else(|| compose_path(&root.absolute_path, &relative_path));
+        let fingerprint = df_fs_safety::capture_fingerprint(&absolute)
+            .map(|fp| fp.token())
+            .unwrap_or_else(|_| {
+                FileFingerprint::V2(df_domain::FingerprintV2 {
+                    size_bytes,
+                    modified_at_ms: modified_at_fs.map(|t: Timestamp| t.timestamp_millis()),
+                    change_time_ms: None,
+                    attributes: 0,
+                    identity: None,
+                })
+                .token()
+            });
         let extension = Path::new(&name)
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase());
@@ -424,6 +486,7 @@ impl Walker<'_> {
             snapshot_id: self.snapshot_id,
             source_root_id: root.id,
             relative_path,
+            raw_relative_path,
             parent_relative_path: parent.to_string(),
             normalized_name: name.to_lowercase(),
             file_name: name,
@@ -447,6 +510,7 @@ impl Walker<'_> {
         self.push_occurrence(
             root,
             join_relative(&dir.relative_path, "<unreadable>"),
+            None,
             &dir.relative_path,
             "<unreadable>".to_string(),
             None,
@@ -465,6 +529,76 @@ fn join_relative(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}{}{name}", std::path::MAIN_SEPARATOR)
     }
+}
+
+/// A Windows-safe, collision-resistant display component for an exact raw
+/// name that cannot be represented as Unicode. Kept below 240 UTF-16 units so
+/// the planner can validate it before execution. The 128-bit raw-name digest
+/// distinguishes names that share the same U+FFFD rendering.
+fn collision_safe_lossy_component(display: &str, raw_name: &df_domain::RawPath) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(raw_name.to_blob()));
+    let tag = &digest[..32];
+    let (stem, extension) = display
+        .rfind('.')
+        .filter(|index| *index > 0)
+        .map(|index| (&display[..index], Some(&display[index + 1..])))
+        .unwrap_or((display, None));
+    let take_utf16 = |text: &str, limit: usize| {
+        let mut units = 0usize;
+        text.chars()
+            .take_while(|character| {
+                let next = units + character.len_utf16();
+                if next <= limit {
+                    units = next;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect::<String>()
+    };
+    let stem = take_utf16(stem, 140);
+    let extension = extension.map(|value| take_utf16(value, 32));
+    match extension.as_deref().filter(|value| !value.is_empty()) {
+        Some(extension) => format!("{stem}~df-raw-{tag}.{extension}"),
+        None => format!("{stem}~df-raw-{tag}"),
+    }
+}
+
+/// Resolve the synthetic display keys for all siblings as one deterministic
+/// set. A valid Unicode filename is always kept verbatim; if it happens to be
+/// equal to a lossy name's hash rendering, the lossy key receives a numbered
+/// suffix. This closes the UNIQUE(relative_path) collision without ever using
+/// display text to reopen the source.
+fn collision_safe_entry_components(
+    names: &[(df_domain::RawPath, String, bool)],
+) -> HashMap<df_domain::RawPath, String> {
+    let mut mapped = HashMap::new();
+    let mut occupied = HashSet::new();
+    for (raw, display, lossy) in names {
+        if !lossy {
+            occupied.insert(display.clone());
+            mapped.insert(raw.clone(), display.clone());
+        }
+    }
+
+    let mut lossy: Vec<_> = names.iter().filter(|(_, _, is_lossy)| *is_lossy).collect();
+    lossy.sort_by_key(|(raw, _, _)| raw.to_blob());
+    for (raw, display, _) in lossy {
+        let base = collision_safe_lossy_component(display, raw);
+        let mut candidate = base.clone();
+        let mut ordinal = 1_u64;
+        while !occupied.insert(candidate.clone()) {
+            let suffix = format!("~{ordinal}");
+            candidate = match base.rfind('.').filter(|index| *index > 0) {
+                Some(index) => format!("{}{}{}", &base[..index], suffix, &base[index..]),
+                None => format!("{base}{suffix}"),
+            };
+            ordinal += 1;
+        }
+        mapped.insert(raw.clone(), candidate);
+    }
+    mapped
 }
 
 /// Absolute path of an entry, extended-length prefixed on Windows when it
@@ -552,7 +686,7 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use df_db::inventory::{inventory_summary, list_occurrences};
+    use df_db::inventory::{inventory_summary, list_folders, list_occurrences};
     use df_domain::ProfileRef;
 
     use super::*;
@@ -585,8 +719,68 @@ mod tests {
         (db, origin)
     }
 
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success()) && link.exists()
+    }
+
     fn snapshot_of(outcome: &ScanOutcome) -> SnapshotId {
         outcome.snapshot_id.parse().unwrap()
+    }
+
+    fn raw_path_from_units(units: &[u16]) -> df_domain::RawPath {
+        let blob: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        df_domain::RawPath::from_blob(&blob).unwrap()
+    }
+
+    #[test]
+    fn lossy_display_components_keep_distinct_raw_names_distinct() {
+        let first = raw_path_from_units(&[
+            b'a' as u16,
+            0xD800,
+            b'b' as u16,
+            b'.' as u16,
+            b't' as u16,
+            b'x' as u16,
+            b't' as u16,
+        ]);
+        let second = raw_path_from_units(&[
+            b'a' as u16,
+            0xD801,
+            b'b' as u16,
+            b'.' as u16,
+            b't' as u16,
+            b'x' as u16,
+            b't' as u16,
+        ]);
+        assert!(first.is_lossy());
+        assert!(second.is_lossy());
+        assert_eq!(first.display(), second.display());
+
+        let first_key = collision_safe_lossy_component(&first.display(), &first);
+        let second_key = collision_safe_lossy_component(&second.display(), &second);
+        assert_ne!(first_key, second_key);
+        assert!(first_key.ends_with(".txt"));
+        assert!(second_key.ends_with(".txt"));
+        assert!(first_key.encode_utf16().count() < 240);
+        assert!(second_key.encode_utf16().count() < 240);
+
+        let literal = df_domain::RawPath::from_os_str(std::ffi::OsStr::new(&first_key));
+        let mapped = collision_safe_entry_components(&[
+            (first.clone(), first.display(), true),
+            (second.clone(), second.display(), true),
+            (literal.clone(), first_key.clone(), false),
+        ]);
+        assert_eq!(mapped.get(&literal), Some(&first_key));
+        assert_ne!(mapped.get(&first), Some(&first_key));
+        assert_eq!(mapped.values().collect::<HashSet<_>>().len(), 3);
     }
 
     #[test]
@@ -612,6 +806,42 @@ mod tests {
         assert_eq!(summary.bytes, outcome.bytes);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn validation_rejects_a_source_root_junction_before_walking_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("datos");
+        let source_alias = tmp.path().join("alias");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("origen.txt"), b"source bytes").unwrap();
+        if !make_junction(&source_alias, &output) {
+            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            return;
+        }
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = df_domain::Project::new(
+            "Alias source",
+            ProfileRef::default(),
+            output.clone(),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, source_alias)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+
+        let error = validate_project(&mut db, Actor::Test).unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(message) if message.contains("reparse point") || message.contains("overlap physically")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            repository::load_project(&db).unwrap().state,
+            ProjectState::Validating
+        );
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+    }
+
     #[test]
     fn scan_records_unicode_names_extensions_and_fingerprints() {
         let tmp = tempfile::tempdir().unwrap();
@@ -628,9 +858,39 @@ mod tests {
         assert_eq!(acta.size_bytes, 3);
         assert_eq!(acta.depth, 3);
         assert!(!acta.name_is_lossy);
-        assert!(acta.fingerprint.starts_with("v1:3:"));
+        // The scanner now records a v2 fingerprint (ADR-0019): it parses, its
+        // size matches, and on a real NTFS volume it carries the physical
+        // identity that makes a same-size same-mtime swap detectable.
+        let fingerprint = FileFingerprint::parse(&acta.fingerprint).expect("fingerprint parses");
+        assert!(matches!(fingerprint, FileFingerprint::V2(_)));
+        assert_eq!(fingerprint.size_bytes(), 3);
+        #[cfg(windows)]
+        assert_eq!(
+            fingerprint.guarantee(),
+            df_domain::FingerprintGuarantee::Physical,
+            "a local NTFS file must yield a physical identity"
+        );
         assert!(acta.modified_at_fs.is_some());
         assert!(acta.path_length > 0);
+
+        let folders = list_folders(&db, snapshot_of(&outcome)).unwrap();
+        assert!(
+            folders
+                .iter()
+                .all(|folder| folder.raw_relative_path.is_some()),
+            "new scans must persist an exact path for every folder, including the root"
+        );
+        let year = folders
+            .iter()
+            .find(|folder| folder.relative_path.ends_with("2020"))
+            .expect("nested folder inventoried");
+        assert_eq!(
+            year.raw_relative_path
+                .as_ref()
+                .expect("raw folder path")
+                .to_os_string(),
+            PathBuf::from("casos").join("2020").into_os_string()
+        );
     }
 
     #[test]

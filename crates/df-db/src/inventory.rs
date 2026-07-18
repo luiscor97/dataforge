@@ -93,8 +93,9 @@ fn insert_folder(tx: &Transaction<'_>, folder: &FolderRecord) -> DfResult<()> {
     tx.execute(
         "INSERT INTO folders
             (id, snapshot_id, source_root_id, relative_path, parent_relative_path,
-             name, normalized_name, depth, status, error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             name, normalized_name, depth, status, error, raw_relative_path,
+             created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             folder.id.to_string(),
             folder.snapshot_id.to_string(),
@@ -106,6 +107,7 @@ fn insert_folder(tx: &Transaction<'_>, folder: &FolderRecord) -> DfResult<()> {
             folder.depth as i64,
             folder.status.as_str(),
             folder.error,
+            folder.raw_relative_path.as_ref().map(|r| r.to_blob()),
             to_stored_timestamp(chrono::Utc::now()),
         ],
     )
@@ -119,9 +121,9 @@ fn insert_occurrence(tx: &Transaction<'_>, occ: &PathOccurrence) -> DfResult<()>
             (id, snapshot_id, source_root_id, relative_path, parent_relative_path,
              file_name, normalized_name, extension, size_bytes, created_at_fs,
              modified_at_fs, attributes, path_length, depth, fingerprint,
-             scan_status, error, name_is_lossy, created_at)
+             scan_status, error, name_is_lossy, raw_relative_path, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             occ.id.to_string(),
             occ.snapshot_id.to_string(),
@@ -141,6 +143,7 @@ fn insert_occurrence(tx: &Transaction<'_>, occ: &PathOccurrence) -> DfResult<()>
             occ.scan_status.as_str(),
             occ.error,
             occ.name_is_lossy as i64,
+            occ.raw_relative_path.as_ref().map(|r| r.to_blob()),
             to_stored_timestamp(chrono::Utc::now()),
         ],
     )
@@ -353,7 +356,8 @@ pub fn list_folders(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<FolderReco
         .conn()
         .prepare(
             "SELECT id, snapshot_id, source_root_id, relative_path,
-                    parent_relative_path, name, normalized_name, depth, status, error
+                    parent_relative_path, name, normalized_name, depth, status,
+                    error, raw_relative_path
              FROM folders
              WHERE snapshot_id = ?1
              ORDER BY depth, relative_path",
@@ -372,17 +376,33 @@ pub fn list_folders(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<FolderReco
                 row.get::<_, i64>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (id, snapshot, root, relative, parent, name, normalized, depth, status, error) =
-                raw.map_err(db_err)?;
+            let (
+                id,
+                snapshot,
+                root,
+                relative,
+                parent,
+                name,
+                normalized,
+                depth,
+                status,
+                error,
+                raw_relative_path,
+            ) = raw.map_err(db_err)?;
             Ok(FolderRecord {
                 id: df_domain::FolderId::from_str(&id)?,
                 snapshot_id: SnapshotId::from_str(&snapshot)?,
                 source_root_id: SourceRootId::from_str(&root)?,
                 relative_path: relative,
+                raw_relative_path: raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 parent_relative_path: parent,
                 name,
                 normalized_name: normalized,
@@ -404,7 +424,7 @@ pub fn list_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<PathOc
                     parent_relative_path, file_name, normalized_name, extension,
                     size_bytes, created_at_fs, modified_at_fs, attributes,
                     path_length, depth, fingerprint, scan_status, error,
-                    name_is_lossy
+                    name_is_lossy, raw_relative_path
              FROM path_occurrences
              WHERE snapshot_id = ?1
              ORDER BY relative_path",
@@ -431,6 +451,7 @@ pub fn list_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<PathOc
                 row.get::<_, String>(15)?,
                 row.get::<_, Option<String>>(16)?,
                 row.get::<_, i64>(17)?,
+                row.get::<_, Option<Vec<u8>>>(18)?,
             ))
         })
         .map_err(db_err)?
@@ -454,12 +475,17 @@ pub fn list_occurrences(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<PathOc
                 scan_status,
                 error,
                 name_is_lossy,
+                raw_relative_path,
             ) = raw.map_err(db_err)?;
             Ok(PathOccurrence {
                 id: OccurrenceId::from_str(&id)?,
                 snapshot_id: SnapshotId::from_str(&snapshot)?,
                 source_root_id: SourceRootId::from_str(&root)?,
                 relative_path,
+                raw_relative_path: raw_relative_path
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 parent_relative_path,
                 file_name,
                 normalized_name,
@@ -553,6 +579,9 @@ pub struct PendingHashJob {
     pub snapshot_id: SnapshotId,
     /// Absolute path of the source root that contains the file.
     pub root_path: PathBuf,
+    /// Exact path captured by the scanner. This is authoritative whenever it
+    /// exists; `relative_path` below is display/legacy evidence only.
+    pub raw_relative_path: Option<df_domain::RawPath>,
     pub relative_path: String,
     pub size_bytes: u64,
     /// Fingerprint captured at scan time (RFC-0001 §14.5 pre-check).
@@ -569,7 +598,7 @@ pub fn pending_hash_jobs(
         .conn()
         .prepare(
             "SELECT j.id, j.occurrence_id, o.relative_path, o.size_bytes,
-                    o.fingerprint, r.absolute_path
+                    o.fingerprint, r.absolute_path, o.raw_relative_path
              FROM hash_jobs j
              JOIN path_occurrences o ON o.id = j.occurrence_id
              JOIN source_roots r ON r.id = o.source_root_id
@@ -587,16 +616,22 @@ pub fn pending_hash_jobs(
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
             ))
         })
         .map_err(db_err)?
         .map(|raw| {
-            let (job, occurrence, relative, size, fingerprint, root) = raw.map_err(db_err)?;
+            let (job, occurrence, relative, size, fingerprint, root, raw_relative) =
+                raw.map_err(db_err)?;
             Ok(PendingHashJob {
                 job_id: HashJobId::from_str(&job)?,
                 occurrence_id: OccurrenceId::from_str(&occurrence)?,
                 snapshot_id,
                 root_path: PathBuf::from(root),
+                raw_relative_path: raw_relative
+                    .as_deref()
+                    .map(df_domain::RawPath::from_blob)
+                    .transpose()?,
                 relative_path: relative,
                 size_bytes: size as u64,
                 fingerprint,
@@ -606,21 +641,62 @@ pub fn pending_hash_jobs(
     rows.into_iter().collect()
 }
 
-/// Record a successful hash: bind the occurrence to its (possibly already
-/// known) content object and close the job — one tx.
-pub fn record_hash_success(
-    db: &mut Db,
+/// Outcome of hashing one queued job, computed before touching the
+/// database.
+#[derive(Debug)]
+pub enum HashJobOutcome {
+    /// Both digests computed with the fingerprint stable around the read.
+    Hashed { sha256: String, blake3: String },
+    /// The job closes without digests: `FAILED` or `SOURCE_CHANGED`.
+    Closed { state: HashState, error: String },
+}
+
+/// One queued job together with its computed outcome.
+#[derive(Debug)]
+pub struct HashJobResult<'a> {
+    pub job: &'a PendingHashJob,
+    pub outcome: HashJobOutcome,
+}
+
+/// Persist a batch of hash results — one transaction for the whole batch.
+///
+/// Per-file commits are what made large runs crawl, and the queue makes
+/// them unnecessary: results not yet committed simply stay `PENDING` and
+/// are recomputed on resume (RFC-0001 §14, rule 13). Job failures are data,
+/// not errors; a batch aborts only on infrastructure failures, including a
+/// stored-content size conflict, which signals a corrupted inventory rather
+/// than a bad file.
+pub fn record_hash_results(db: &mut Db, results: &[HashJobResult<'_>]) -> DfResult<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for result in results {
+        match &result.outcome {
+            HashJobOutcome::Hashed { sha256, blake3 } => {
+                apply_hash_success(&tx, result.job, sha256, blake3)?;
+            }
+            HashJobOutcome::Closed { state, error } => {
+                apply_hash_closure(&tx, result.job.job_id, *state, error)?;
+            }
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Bind one occurrence to its (possibly already known) content object and
+/// close the job inside the batch transaction.
+fn apply_hash_success(
+    tx: &Transaction<'_>,
     job: &PendingHashJob,
     sha256: &str,
     blake3: &str,
 ) -> DfResult<ContentId> {
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
     let existing: Option<(String, i64)> = tx
-        .query_row(
-            "SELECT id, size_bytes FROM content_objects WHERE sha256 = ?1",
-            [sha256],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .prepare_cached("SELECT id, size_bytes FROM content_objects WHERE sha256 = ?1")
+        .map_err(db_err)?
+        .query_row([sha256], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()
         .map_err(db_err)?;
 
@@ -645,53 +721,54 @@ pub fn record_hash_success(
                 first_seen_snapshot: job.snapshot_id,
                 hash_state: HashState::Hashed,
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO content_objects
                     (id, size_bytes, sha256, blake3, mime_type,
                      first_seen_snapshot, hash_state, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    content.id.to_string(),
-                    content.size_bytes as i64,
-                    content.sha256,
-                    content.blake3,
-                    content.mime_type,
-                    content.first_seen_snapshot.to_string(),
-                    content.hash_state.as_str(),
-                    to_stored_timestamp(chrono::Utc::now()),
-                ],
             )
+            .map_err(db_err)?
+            .execute(params![
+                content.id.to_string(),
+                content.size_bytes as i64,
+                content.sha256,
+                content.blake3,
+                content.mime_type,
+                content.first_seen_snapshot.to_string(),
+                content.hash_state.as_str(),
+                to_stored_timestamp(chrono::Utc::now()),
+            ])
             .map_err(db_err)?;
             content.id
         }
     };
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO occurrence_content (occurrence_id, content_id, created_at)
          VALUES (?1, ?2, ?3)",
-        params![
-            job.occurrence_id.to_string(),
-            content_id.to_string(),
-            to_stored_timestamp(chrono::Utc::now()),
-        ],
     )
+    .map_err(db_err)?
+    .execute(params![
+        job.occurrence_id.to_string(),
+        content_id.to_string(),
+        to_stored_timestamp(chrono::Utc::now()),
+    ])
     .map_err(db_err)?;
-    tx.execute(
-        "UPDATE hash_jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        params![
+    tx.prepare_cached("UPDATE hash_jobs SET status = ?1, updated_at = ?2 WHERE id = ?3")
+        .map_err(db_err)?
+        .execute(params![
             HashState::Hashed.as_str(),
             to_stored_timestamp(chrono::Utc::now()),
             job.job_id.to_string(),
-        ],
-    )
-    .map_err(db_err)?;
-    tx.commit().map_err(db_err)?;
+        ])
+        .map_err(db_err)?;
     Ok(content_id)
 }
 
-/// Close a job as `FAILED` or `SOURCE_CHANGED` with its error text.
-pub fn record_hash_failure(
-    db: &mut Db,
+/// Close a job as `FAILED` or `SOURCE_CHANGED` inside the batch
+/// transaction.
+fn apply_hash_closure(
+    tx: &Transaction<'_>,
     job_id: HashJobId,
     state: HashState,
     error: &str,
@@ -701,17 +778,17 @@ pub fn record_hash_failure(
             "hash failures must be FAILED or SOURCE_CHANGED".to_string(),
         ));
     }
-    db.conn()
-        .execute(
-            "UPDATE hash_jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
-            params![
-                state.as_str(),
-                error,
-                to_stored_timestamp(chrono::Utc::now()),
-                job_id.to_string(),
-            ],
-        )
-        .map_err(db_err)?;
+    tx.prepare_cached(
+        "UPDATE hash_jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+    )
+    .map_err(db_err)?
+    .execute(params![
+        state.as_str(),
+        error,
+        to_stored_timestamp(chrono::Utc::now()),
+        job_id.to_string(),
+    ])
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -744,6 +821,13 @@ pub struct DuplicateSet {
     pub size_bytes: u64,
     /// Absolute paths of every occurrence, reconstructed root + relative.
     pub occurrences: Vec<String>,
+    /// Absolute path of the logical representative — the best canonical
+    /// location of this content (RFC-0001 §15.5), or `None` when the snapshot
+    /// has not been analysed yet. Naming a representative never implies that
+    /// the other occurrences are dispensable (§15.5, rule 8).
+    pub representative: Option<String>,
+    /// Why that occurrence was chosen (§5.3 explainable-by-design).
+    pub representative_reason: Option<String>,
 }
 
 /// Exact duplicate sets of a snapshot, largest waste first.
@@ -796,8 +880,61 @@ pub fn exact_duplicates(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Duplic
                 sha256,
                 size_bytes: size as u64,
                 occurrences: vec![absolute],
+                representative: None,
+                representative_reason: None,
             }),
         }
     }
+    attach_representatives(db, snapshot_id, &mut sets)?;
     Ok(sets)
+}
+
+/// Fill in the logical representative of each set from the rows recorded by
+/// `dedup::score_duplicate_representatives` (RFC-0001 §15.5). Sets analysed
+/// before that step existed simply keep `None`.
+fn attach_representatives(
+    db: &Db,
+    snapshot_id: SnapshotId,
+    sets: &mut [DuplicateSet],
+) -> DfResult<()> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT c.sha256, r.absolute_path, o.relative_path, dr.reason
+             FROM duplicate_representatives dr
+             JOIN duplicate_sets ds ON ds.id = dr.duplicate_set_id
+             JOIN content_objects c ON c.id = ds.content_id
+             JOIN path_occurrences o ON o.id = dr.occurrence_id
+             JOIN source_roots r ON r.id = o.source_root_id
+             WHERE dr.snapshot_id = ?1 AND c.sha256 IS NOT NULL",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            let sha256: String = row.get(0)?;
+            let root: String = row.get(1)?;
+            let relative: String = row.get(2)?;
+            let reason: String = row.get(3)?;
+            let absolute = if relative.is_empty() {
+                root
+            } else {
+                format!("{root}{}{relative}", std::path::MAIN_SEPARATOR)
+            };
+            Ok((sha256, absolute, reason))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let by_sha: std::collections::HashMap<String, (String, String)> = rows
+        .into_iter()
+        .map(|(sha, path, reason)| (sha, (path, reason)))
+        .collect();
+    for set in sets.iter_mut() {
+        if let Some((path, reason)) = by_sha.get(&set.sha256) {
+            set.representative = Some(path.clone());
+            set.representative_reason = Some(reason.clone());
+        }
+    }
+    Ok(())
 }

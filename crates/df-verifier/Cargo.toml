@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 df-error = { workspace = true }
 df-domain = { workspace = true }
+df-fs-safety = { workspace = true }
 df-db = { workspace = true }
 df-planner = { workspace = true }
 sha2 = { workspace = true }
@@ -19,8 +20,10 @@ chrono = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+df-db = { workspace = true, features = ["test-support"] }
 df-scan = { workspace = true }
 df-hash = { workspace = true }
 df-executor = { workspace = true }
 df-ledger = { workspace = true }
 tempfile = { workspace = true }
+uuid = { workspace = true }

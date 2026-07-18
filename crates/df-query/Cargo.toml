@@ -1,0 +1,29 @@
+[package]
+name = "df-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+df-domain.workspace = true
+df-db.workspace = true
+df-error.workspace = true
+df-fs-safety.workspace = true
+df-process-safety.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+datafusion.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+chrono.workspace = true

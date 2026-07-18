@@ -1,0 +1,18 @@
+[package]
+name = "df-media-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+df-media.workspace = true
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+
+[dev-dependencies]
+df-domain.workspace = true
+df-facade.workspace = true
+tempfile.workspace = true

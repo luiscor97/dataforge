@@ -1,0 +1,18 @@
+[package]
+name = "df-corpus"
+description = "Deterministic synthetic corpus generator and full-pipeline scale test (RFC-0001 §40, M0.1 acceptance criteria 1 and 10)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+
+[dev-dependencies]
+df-facade = { workspace = true }
+df-domain = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }

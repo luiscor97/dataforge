@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 df-error = { workspace = true }
 df-domain = { workspace = true }
+df-fs-safety = { workspace = true }
 df-db = { workspace = true }
 df-ledger = { workspace = true }
 df-scan = { workspace = true }
@@ -18,8 +19,24 @@ df-hash = { workspace = true }
 df-planner = { workspace = true }
 df-executor = { workspace = true }
 df-verifier = { workspace = true }
+df-media = { workspace = true }
+df-plugin = { workspace = true }
+df-ai = { workspace = true }
+df-process-safety = { workspace = true }
+keyring = { workspace = true }
+ureq = { workspace = true }
+df-similarity = { workspace = true }
+df-extract = { workspace = true }
+df-search = { workspace = true }
+df-query = { workspace = true }
 serde = { workspace = true }
+uuid = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
+df-db = { workspace = true, features = ["test-support"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
 tempfile = { workspace = true }
