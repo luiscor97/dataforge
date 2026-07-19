@@ -2145,46 +2145,75 @@ mod tests {
             _ => panic!("plan approve returns an approve outcome"),
         }
 
-        let execute = run(&Cli::parse_from(["dataforge", "execute", "--path", path]))
-            .expect("execute succeeds");
-        match &execute {
-            Output::Execute(outcome) => {
-                assert_eq!(outcome.state, "EXECUTED");
-                assert_eq!(verdict_exit_code(&execute), 0);
+        // Write safety is Windows-only in this version: on POSIX, execution
+        // must refuse explicitly (fail closed) with the approved plan and a
+        // valid ledger left intact — that refusal is the pinned behavior.
+        // The Windows half continues through copy and verification.
+        #[cfg(not(windows))]
+        {
+            let refused = run(&Cli::parse_from(["dataforge", "execute", "--path", path]))
+                .expect_err("execute must refuse without platform write safety");
+            assert!(
+                refused.to_string().contains("refusing to execute"),
+                "unexpected refusal: {refused}"
+            );
+            let audit = run(&Cli::parse_from([
+                "dataforge",
+                "audit",
+                "verify",
+                "--path",
+                path,
+            ]))
+            .expect("audit succeeds after the refusal");
+            match &audit {
+                Output::Audit(report) => assert!(report.ledger_ok),
+                _ => panic!("audit returns an audit report"),
             }
-            _ => panic!("execute returns an execute outcome"),
         }
 
-        let verify = run(&Cli::parse_from(["dataforge", "verify", "--path", path]))
-            .expect("verify succeeds");
-        match &verify {
-            Output::Verify(outcome) => {
-                assert_eq!(outcome.verdict, "COMPLETED", "{:?}", outcome.findings);
-                assert_eq!(verdict_exit_code(&verify), 0);
+        #[cfg(windows)]
+        {
+            let execute = run(&Cli::parse_from(["dataforge", "execute", "--path", path]))
+                .expect("execute succeeds");
+            match &execute {
+                Output::Execute(outcome) => {
+                    assert_eq!(outcome.state, "EXECUTED");
+                    assert_eq!(verdict_exit_code(&execute), 0);
+                }
+                _ => panic!("execute returns an execute outcome"),
             }
-            _ => panic!("verify returns a verify outcome"),
-        }
 
-        // The verified copy landed in the output root.
-        assert_eq!(
-            std::fs::read(tmp.path().join("salida").join("origen").join("x.txt")).unwrap(),
-            b"dup"
-        );
-
-        let audit = run(&Cli::parse_from([
-            "dataforge",
-            "audit",
-            "verify",
-            "--path",
-            path,
-        ]))
-        .expect("audit succeeds");
-        match &audit {
-            Output::Audit(report) => {
-                assert!(report.ledger_ok);
-                assert_eq!(verdict_exit_code(&audit), 0);
+            let verify = run(&Cli::parse_from(["dataforge", "verify", "--path", path]))
+                .expect("verify succeeds");
+            match &verify {
+                Output::Verify(outcome) => {
+                    assert_eq!(outcome.verdict, "COMPLETED", "{:?}", outcome.findings);
+                    assert_eq!(verdict_exit_code(&verify), 0);
+                }
+                _ => panic!("verify returns a verify outcome"),
             }
-            _ => panic!("audit returns an audit report"),
+
+            // The verified copy landed in the output root.
+            assert_eq!(
+                std::fs::read(tmp.path().join("salida").join("origen").join("x.txt")).unwrap(),
+                b"dup"
+            );
+
+            let audit = run(&Cli::parse_from([
+                "dataforge",
+                "audit",
+                "verify",
+                "--path",
+                path,
+            ]))
+            .expect("audit succeeds");
+            match &audit {
+                Output::Audit(report) => {
+                    assert!(report.ledger_ok);
+                    assert_eq!(verdict_exit_code(&audit), 0);
+                }
+                _ => panic!("audit returns an audit report"),
+            }
         }
     }
 
