@@ -133,10 +133,17 @@ pub fn scan_project(
     match project.state {
         ProjectState::Created | ProjectState::Validating => validate_project(db, actor)?,
         ProjectState::Ready | ProjectState::ScanPaused => {}
+        // M0.8: incremental rescans start a fresh snapshot from any stable
+        // checkpoint without a plan in flight (ADR-0035).
+        ProjectState::Hashed
+        | ProjectState::Analyzed
+        | ProjectState::Completed
+        | ProjectState::CompletedWithWarnings => {}
         other => {
             return Err(DfError::Validation(format!(
                 "cannot scan a project in state {other} \
-                 (expected CREATED, VALIDATING, READY or SCAN_PAUSED)"
+                 (expected CREATED, VALIDATING, READY, SCAN_PAUSED or a \
+                 stable checkpoint: HASHED, ANALYZED, COMPLETED)"
             )));
         }
     }

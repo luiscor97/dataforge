@@ -9,6 +9,16 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 #### Añadido
 
+- Snapshots incrementales (ADR-0035, migración 0019): los estados
+  completados pasan a ser puntos de control reabribles hacia un nuevo
+  escaneo (un plan en vuelo sigue bloqueando el rescan), y `hash
+  --incremental` transporta bindings de contenido del snapshot anterior
+  solo cuando el fingerprint v2 es byte-idéntico con todos los campos
+  presentes; v1 o campos `none` van siempre al hash completo. Cada binding
+  reusado registra su snapshot de procedencia y el evento `HASH_COMPLETED`
+  cuenta `reused_from_previous_snapshot`. Modo completo por defecto
+  (§14.4).
+
 - Evidencia de 1M+ entradas (`docs/testing/m0.8-scale-1m.md`): pipeline
   completo sobre 1.000.000 de archivos (4,26 GB) — escaneo y hash sin un
   solo fallo, 160.147 conjuntos duplicados, y **1.093.705 operaciones

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOutcome;
-pub use df_hash::HashOutcome;
+pub use df_hash::{HashOptions, HashOutcome};
 mod ai_transport;
 mod secrets;
 
@@ -948,10 +948,21 @@ pub fn scan_project(project_dir: &Path, actor: Actor) -> DfResult<ScanOutcome> {
 /// Hash every scanned occurrence of the latest snapshot (RFC-0001 §12.3,
 /// §14). Ends in `HASHED`; safe to re-run after an interruption.
 pub fn hash_project(project_dir: &Path, actor: Actor) -> DfResult<HashOutcome> {
+    hash_project_with_options(project_dir, actor, &df_hash::HashOptions::default())
+}
+
+/// `incremental: true` carries content bindings forward from the previous
+/// snapshot when the v2 fingerprint is byte-identical (ADR-0035); every
+/// reused binding records its provenance and full mode stays the default.
+pub fn hash_project_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &df_hash::HashOptions,
+) -> DfResult<HashOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_hash::hash_project(&mut db, actor, &df_hash::HashOptions::default(), None)
+    df_hash::hash_project(&mut db, actor, options, None)
 }
 
 /// Analyse the hashed snapshot: materialise exact duplicate sets (§15).

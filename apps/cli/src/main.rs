@@ -56,6 +56,11 @@ enum Command {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Carry content identity forward from the previous snapshot when
+        /// the physical fingerprint is byte-identical (ADR-0035). Full
+        /// mode remains the default and the evidential recommendation.
+        #[arg(long)]
+        incremental: bool,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -593,7 +598,15 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Output::Status),
         },
         Command::Scan { path } => df_facade::scan_project(path, Actor::Cli).map(Output::Scan),
-        Command::Hash { path } => df_facade::hash_project(path, Actor::Cli).map(Output::Hash),
+        Command::Hash { path, incremental } => df_facade::hash_project_with_options(
+            path,
+            Actor::Cli,
+            &df_facade::HashOptions {
+                incremental: *incremental,
+                ..df_facade::HashOptions::default()
+            },
+        )
+        .map(Output::Hash),
         Command::Analyze { path } => {
             df_facade::analyze_project(path, Actor::Cli).map(Output::Analyze)
         }
@@ -1014,6 +1027,12 @@ fn print_scan(outcome: &ScanOutcome) {
 fn print_hash(outcome: &HashOutcome) {
     println!("Snapshot        : {}", outcome.snapshot_id);
     println!("Hashed          : {}", outcome.hashed);
+    if outcome.reused > 0 {
+        println!(
+            "Reused          : {} binding(s) carried from the previous snapshot",
+            outcome.reused
+        );
+    }
     println!("Failed          : {}", outcome.failed);
     println!("Source changed  : {}", outcome.source_changed);
     println!("Pending         : {}", outcome.pending);

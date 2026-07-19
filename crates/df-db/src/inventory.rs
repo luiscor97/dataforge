@@ -641,6 +641,73 @@ pub fn pending_hash_jobs(
     rows.into_iter().collect()
 }
 
+/// Carry content bindings forward from the previous complete snapshot for
+/// every occurrence whose v2 fingerprint is byte-identical with all fields
+/// present (size, mtime, ctime, attributes, volume and file id) — the
+/// strongest identity available without reading bytes (ADR-0019). Weaker
+/// tokens (v1, or any `none` field) never qualify. Closes the matching
+/// hash jobs and returns how many bindings were reused; one transaction.
+pub fn reuse_previous_hash_bindings(
+    db: &mut Db,
+    project_id: ProjectId,
+    snapshot_id: SnapshotId,
+) -> DfResult<u64> {
+    let previous: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT id FROM snapshots
+             WHERE project_id = ?1 AND status = 'COMPLETE' AND id <> ?2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![project_id.to_string(), snapshot_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some(previous) = previous else {
+        return Ok(0);
+    };
+
+    let now = to_stored_timestamp(chrono::Utc::now());
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    let reused = tx
+        .execute(
+            "INSERT INTO occurrence_content
+                (occurrence_id, content_id, created_at, reused_from_snapshot)
+             SELECT o_new.id, oc_prev.content_id, ?3, ?2
+             FROM path_occurrences o_new
+             JOIN path_occurrences o_prev
+               ON o_prev.snapshot_id = ?2
+              AND o_prev.source_root_id = o_new.source_root_id
+              AND o_prev.relative_path = o_new.relative_path
+             JOIN occurrence_content oc_prev ON oc_prev.occurrence_id = o_prev.id
+             JOIN content_objects c
+               ON c.id = oc_prev.content_id
+              AND c.hash_state = 'HASHED' AND c.sha256 IS NOT NULL
+             WHERE o_new.snapshot_id = ?1
+               AND o_new.scan_status = 'OK'
+               AND o_new.fingerprint = o_prev.fingerprint
+               AND o_new.fingerprint LIKE 'v2:%'
+               AND o_new.fingerprint NOT LIKE '%none%'
+               AND NOT EXISTS (
+                   SELECT 1 FROM occurrence_content x WHERE x.occurrence_id = o_new.id
+               )",
+            params![snapshot_id.to_string(), previous, now],
+        )
+        .map_err(db_err)?;
+    tx.execute(
+        "UPDATE hash_jobs SET status = 'HASHED', updated_at = ?2
+         WHERE snapshot_id = ?1 AND status = 'PENDING'
+           AND occurrence_id IN (
+               SELECT occurrence_id FROM occurrence_content
+               WHERE reused_from_snapshot IS NOT NULL
+           )",
+        params![snapshot_id.to_string(), now],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(reused as u64)
+}
+
 /// Outcome of hashing one queued job, computed before touching the
 /// database.
 #[derive(Debug)]
@@ -799,6 +866,7 @@ pub fn record_hash_outcome(
     snapshot_id: SnapshotId,
     event_type: &str,
     summary: &InventorySummary,
+    reused: u64,
     actor: Actor,
 ) -> DfResult<()> {
     let payload = serde_json::json!({
@@ -807,6 +875,7 @@ pub fn record_hash_outcome(
         "failed": summary.hash_failed,
         "source_changed": summary.hash_source_changed,
         "pending": summary.hash_pending,
+        "reused_from_previous_snapshot": reused,
     });
     let tx = db.conn_mut().transaction().map_err(db_err)?;
     append_event(&tx, project_id, event_type, &payload, actor)?;
