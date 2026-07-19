@@ -12,6 +12,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # M0.8 (experimental): POSIX compilation and platform-neutral suite.
+  # Allowed to fail while Linux/macOS write-safety guarantees mature; the
+  # result is visible evidence, never a silent gap and never a gate.
+  rust-linux-experimental:
+    name: Rust on Linux (experimental M0.8)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --exclude dataforge-desktop --all-targets -- -D warnings
+
+      - name: Tests (platform-neutral subset)
+        run: cargo test --workspace --exclude dataforge-desktop
+
   rust:
     name: Rust (fmt, clippy, tests, build)
     runs-on: windows-latest
