@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual runs on any branch: lets the experimental Linux job iterate
+  # without opening a pull request per fix.
+  workflow_dispatch:
 
 permissions:
   contents: read
