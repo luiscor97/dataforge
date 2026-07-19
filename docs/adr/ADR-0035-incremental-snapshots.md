@@ -26,7 +26,9 @@ uso central del producto — eso convierte cada revisión en horas.
    el fingerprint v2 es **byte-idéntico y con todos los campos presentes**
    (tamaño, mtime, ctime, atributos, volumen y file id — ADR-0019). Un
    token v1, o cualquier campo `none` (filesystems sin identidad física,
-   típico NAS), nunca reusa: esos archivos van al hash completo. ctime y
+   típico NAS), nunca reusa: esos archivos van al hash completo. En
+   POSIX la captura actual no aporta identidad física completa, así
+   que `--incremental` allí es hoy un no-op probado (reused = 0). ctime y
    file id hacen que fabricar un fingerprint idéntico tras editar un
    archivo sea impracticable en NTFS.
 

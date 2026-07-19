@@ -390,6 +390,8 @@ mod tests {
         assert_eq!(outcome.pending, 0);
     }
 
+    // Windows: NTFS provides every v2 field, so identity carries.
+    #[cfg(windows)]
     #[test]
     fn incremental_rescan_reuses_unchanged_bindings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -424,6 +426,7 @@ mod tests {
         assert_eq!(sets[0].occurrences.len(), 2);
     }
 
+    #[cfg(windows)]
     #[test]
     fn incremental_rescan_rehashes_a_changed_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -452,6 +455,30 @@ mod tests {
         let snapshot_id = outcome.snapshot_id.parse().unwrap();
         let sets = exact_duplicates(&db, snapshot_id).unwrap();
         assert_eq!(sets.len(), 1, "the a/b duplicate pair persists");
+    }
+
+    /// POSIX: the captured fingerprint lacks full physical identity
+    /// (no NTFS attributes), so incremental reuse must refuse and take
+    /// the full-hash path — the conservative rule of ADR-0035, pinned.
+    #[cfg(not(windows))]
+    #[test]
+    fn incremental_reuse_refuses_without_full_physical_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        let outcome = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                incremental: true,
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.reused, 0, "weaker identity must never carry");
     }
 
     #[test]
