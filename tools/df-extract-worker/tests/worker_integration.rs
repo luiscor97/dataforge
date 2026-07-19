@@ -1,3 +1,7 @@
+// The isolated-worker cases are Windows-only (Job Object); their helpers
+// and imports would be dead code on POSIX, matching media_integration.rs.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 #[cfg(windows)]
