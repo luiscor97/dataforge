@@ -2969,6 +2969,7 @@ mod tests {
         assert_analysis_reports_unavailable(&req.project_dir);
     }
 
+    #[cfg(windows)] // drives execution, which is Windows-only for now
     #[test]
     fn full_pipeline_reaches_completed_through_the_facade() {
         let tmp = tempfile::tempdir().unwrap();

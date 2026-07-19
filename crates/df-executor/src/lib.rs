@@ -967,7 +967,10 @@ fn extend_long_path(path: PathBuf) -> PathBuf {
     path
 }
 
-#[cfg(test)]
+// The adversarial suite exercises the execution protocol end to end, and
+// execution refuses fail-closed off Windows until POSIX write safety
+// exists (that refusal is pinned by the CLI and corpus POSIX tests).
+#[cfg(all(test, windows))]
 mod tests {
     use df_domain::{ProfileRef, Project, SourceRoot};
     use df_hash::{hash_project, HashOptions};

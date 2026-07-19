@@ -2075,6 +2075,7 @@ mod tests {
     /// Scenario: a grafted copy of a working folder that ALSO carries one file
     /// the original never had. Consolidating the branch must never take that
     /// file with it.
+    #[cfg(windows)] // drives execution, which is Windows-only for now
     #[test]
     fn unique_content_in_a_cloned_branch_is_never_consolidated_away() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2227,6 +2228,7 @@ mod tests {
     /// present in another, the relation is TREE_EMBEDDED. It remains a review
     /// finding rather than permission to discard either branch, and a pending
     /// review must preserve every byte through planning and execution.
+    #[cfg(windows)] // drives execution, which is Windows-only for now
     #[test]
     fn an_embedded_tree_is_reviewed_and_preserved_end_to_end() {
         let tmp = tempfile::tempdir().unwrap();
