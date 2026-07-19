@@ -8,11 +8,16 @@
 #![deny(unsafe_code)]
 
 use std::ffi::OsString;
+#[cfg(windows)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::{Command, Stdio};
+#[cfg(windows)]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use df_fs_safety::{metadata_is_reparse, SafeOutputRoot, SafeRelativePath};
 use thiserror::Error;
@@ -23,6 +28,7 @@ const MIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_STDIN_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_STDOUT_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(windows)]
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Error)]
