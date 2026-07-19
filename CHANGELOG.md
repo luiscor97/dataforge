@@ -5,6 +5,28 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.8 — Cross-platform and Scale (parcial)
+
+#### Añadido
+
+- Evidencia de 1M+ entradas (`docs/testing/m0.8-scale-1m.md`): pipeline
+  completo sobre 1.000.000 de archivos (4,26 GB) — escaneo y hash sin un
+  solo fallo, 160.147 conjuntos duplicados, y **1.093.705 operaciones
+  ejecutadas al primer intento con 0 reintentos y verificación
+  independiente `COMPLETED`**. Memoria acotada (~250 MB) durante todo el
+  run. La re-huella final del origen quedó interrumpida por un reinicio de
+  la máquina y se sustituyó por una comprobación post-hoc exacta de
+  recuento, carpetas y bytes, con el límite documentado.
+- Job de CI `Rust on Linux (experimental M0.8)` en ubuntu con
+  `continue-on-error`: clippy estricto y suite neutral de plataforma como
+  evidencia visible sin bloquear la puerta mientras maduran las garantías
+  de escritura POSIX.
+
+#### Pendiente del hito
+
+- NAS endurecido, snapshots incrementales, cache y daemon experimental;
+  garantías de escritura segura reales en Linux/macOS.
+
 ### Milestone 0.7 — Assisted Intelligence (implementación local)
 
 #### Añadido
