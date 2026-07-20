@@ -560,6 +560,9 @@ fn file_sha256_handle(file: &fs::File, path: &Path) -> DfResult<String> {
 }
 
 #[cfg(test)]
+// The leased-SQL scenario is Windows-only; its helper and imports
+// would be dead code on POSIX.
+#[cfg_attr(not(windows), allow(dead_code, unused_imports))]
 mod tests {
     use super::*;
     use df_domain::{
