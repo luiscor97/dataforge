@@ -641,6 +641,10 @@ mod tests {
         assert_eq!(extension("README"), None);
     }
 
+    // Windows-only: consuming a registered artifact takes a strong
+    // identity lease, and analytical SQL fails closed off Windows
+    // until M0.8 provides an equivalent (ADR-0031).
+    #[cfg(windows)]
     #[test]
     fn sql_is_read_only_bounded_and_integrity_checked() {
         let temp = tempfile::tempdir().unwrap();
