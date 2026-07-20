@@ -134,6 +134,9 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+// On POSIX the isolated PDF worker never runs (extraction fails closed
+// until M0.8), so these variants are only constructed on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PdfWorkerOutcome {
     Text(String),

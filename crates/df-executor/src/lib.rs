@@ -41,11 +41,17 @@ pub struct ExecuteOptions {
     pub copy_buffer_bytes: usize,
     /// Operations fetched from the plan per round trip.
     pub operation_batch: u32,
+    /// Explicit acknowledgment that the destination filesystem offers only
+    /// degraded identity guarantees — network shares, FAT variants or
+    /// unclassifiable volumes (ADR-0036). Without it, execution towards
+    /// such a destination refuses fail-closed.
+    pub allow_degraded_destination: bool,
 }
 
 impl Default for ExecuteOptions {
     fn default() -> Self {
         Self {
+            allow_degraded_destination: false,
             copy_buffer_bytes: 1024 * 1024,
             operation_batch: 256,
         }
@@ -112,6 +118,18 @@ pub fn execute_plan(
     // out instead of executing unprotected (ADR-0017).
     let output_root = project.output_root.clone();
     let safe_root = SafeOutputRoot::validate(&output_root)?;
+    // ADR-0036: writing without physical identity (network shares, FAT
+    // variants, unclassifiable volumes) weakens substitution detection and
+    // finalize guarantees. Allowed only as an explicit, audited per-run
+    // decision — and checked after platform safety, so POSIX keeps its
+    // canonical refusal.
+    let destination_filesystem = df_fs_safety::classify_filesystem(&output_root);
+    if !destination_filesystem.has_physical_identity() && !options.allow_degraded_destination {
+        return Err(DfError::Validation(format!(
+            "the output root filesystem ({}) offers only degraded identity              guarantees; re-run with --allow-degraded-destination to              acknowledge and proceed (ADR-0036)",
+            destination_filesystem.as_str()
+        )));
+    }
     // Creating a previously absent output root changes the filesystem view;
     // repeat the proof before entering EXECUTING or running an operation.
     validate_source_output_boundary(&source_roots, safe_root.path())?;
@@ -967,7 +985,10 @@ fn extend_long_path(path: PathBuf) -> PathBuf {
     path
 }
 
-#[cfg(test)]
+// The adversarial suite exercises the execution protocol end to end, and
+// execution refuses fail-closed off Windows until POSIX write safety
+// exists (that refusal is pinned by the CLI and corpus POSIX tests).
+#[cfg(all(test, windows))]
 mod tests {
     use df_domain::{ProfileRef, Project, SourceRoot};
     use df_hash::{hash_project, HashOptions};

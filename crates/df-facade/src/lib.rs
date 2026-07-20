@@ -32,8 +32,9 @@ use serde::{Deserialize, Serialize};
 
 pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
 pub use df_domain::RuleAction;
+pub use df_executor::ExecuteOptions;
 pub use df_executor::ExecuteOutcome;
-pub use df_hash::HashOutcome;
+pub use df_hash::{HashOptions, HashOutcome};
 mod ai_transport;
 mod secrets;
 
@@ -948,10 +949,21 @@ pub fn scan_project(project_dir: &Path, actor: Actor) -> DfResult<ScanOutcome> {
 /// Hash every scanned occurrence of the latest snapshot (RFC-0001 §12.3,
 /// §14). Ends in `HASHED`; safe to re-run after an interruption.
 pub fn hash_project(project_dir: &Path, actor: Actor) -> DfResult<HashOutcome> {
+    hash_project_with_options(project_dir, actor, &df_hash::HashOptions::default())
+}
+
+/// `incremental: true` carries content bindings forward from the previous
+/// snapshot when the v2 fingerprint is byte-identical (ADR-0035); every
+/// reused binding records its provenance and full mode stays the default.
+pub fn hash_project_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &df_hash::HashOptions,
+) -> DfResult<HashOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_hash::hash_project(&mut db, actor, &df_hash::HashOptions::default(), None)
+    df_hash::hash_project(&mut db, actor, options, None)
 }
 
 /// Analyse the hashed snapshot: materialise exact duplicate sets (§15).
@@ -2108,15 +2120,20 @@ pub fn approve_plan(project_dir: &Path, actor: Actor) -> DfResult<ApproveOutcome
 /// Execute the approved plan (§27). Resumable; ends in `EXECUTED` or
 /// `EXECUTION_PAUSED` when work remains.
 pub fn execute_plan(project_dir: &Path, actor: Actor) -> DfResult<ExecuteOutcome> {
+    execute_plan_with_options(project_dir, actor, &df_executor::ExecuteOptions::default())
+}
+
+/// `allow_degraded_destination` acknowledges writing to a filesystem
+/// without physical identity guarantees (ADR-0036); refused otherwise.
+pub fn execute_plan_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &df_executor::ExecuteOptions,
+) -> DfResult<ExecuteOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_executor::execute_plan(
-        &mut db,
-        actor,
-        &df_executor::ExecuteOptions::default(),
-        None,
-    )
+    df_executor::execute_plan(&mut db, actor, options, None)
 }
 
 /// Verify the executed plan from primary evidence (§28). Ends in
@@ -2958,6 +2975,7 @@ mod tests {
         assert_analysis_reports_unavailable(&req.project_dir);
     }
 
+    #[cfg(windows)] // drives execution, which is Windows-only for now
     #[test]
     fn full_pipeline_reaches_completed_through_the_facade() {
         let tmp = tempfile::tempdir().unwrap();

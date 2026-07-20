@@ -1,3 +1,8 @@
+//! Windows-only: this scenario drives planning through execution,
+//! and execution refuses fail-closed off Windows until POSIX write
+//! safety exists (the refusal is pinned by the CLI/corpus tests).
+#![cfg(windows)]
+
 use std::collections::HashMap;
 
 use df_db::{analysis, context, inventory, plans, repository, Db};

@@ -97,6 +97,10 @@ pub fn validate_project(db: &mut Db, actor: Actor) -> DfResult<()> {
         std::fs::read_dir(path).map_err(|e| DfError::io(path.clone(), e))?;
         df_fs_safety::ensure_physical_roots_disjoint(path, &project.output_root)?;
         df_fs_safety::ensure_physical_roots_disjoint(path, &project.audit_root)?;
+        // Real filesystem classification (ADR-0036): recorded so status and
+        // reports can show which identity guarantees each root offers.
+        let kind = df_fs_safety::classify_filesystem(path);
+        repository::update_source_root_filesystem(db, root.id, kind)?;
     }
     for (i, a) in roots.iter().enumerate() {
         for b in roots.iter().skip(i + 1) {
@@ -133,10 +137,17 @@ pub fn scan_project(
     match project.state {
         ProjectState::Created | ProjectState::Validating => validate_project(db, actor)?,
         ProjectState::Ready | ProjectState::ScanPaused => {}
+        // M0.8: incremental rescans start a fresh snapshot from any stable
+        // checkpoint without a plan in flight (ADR-0035).
+        ProjectState::Hashed
+        | ProjectState::Analyzed
+        | ProjectState::Completed
+        | ProjectState::CompletedWithWarnings => {}
         other => {
             return Err(DfError::Validation(format!(
                 "cannot scan a project in state {other} \
-                 (expected CREATED, VALIDATING, READY or SCAN_PAUSED)"
+                 (expected CREATED, VALIDATING, READY, SCAN_PAUSED or a \
+                 stable checkpoint: HASHED, ANALYZED, COMPLETED)"
             )));
         }
     }

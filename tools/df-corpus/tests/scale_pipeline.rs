@@ -11,6 +11,11 @@
 //!   cargo test -p df-corpus --release -- --ignored scale --nocapture
 //!   ```
 
+// The full-pipeline drives are Windows-only until POSIX write safety
+// exists; their helpers would be dead code there (see the POSIX
+// fail-closed test below).
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
@@ -282,7 +287,57 @@ fn origin_fingerprint_covers_paths_and_same_length_contents() {
     assert_ne!(original, tree_fingerprint(&root));
 }
 
+/// POSIX: write safety is Windows-only in this version, so the pipeline
+/// works up to approval and then execution refuses fail-closed with the
+/// ledger intact — pinned here exactly like the CLI test.
+#[cfg(not(windows))]
+#[test]
+fn a_small_corpus_stops_closed_at_execution() {
+    use df_facade::CreateProjectRequest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let origin = base.join("origen");
+    generate(
+        &origin,
+        &CorpusSpec {
+            files: 50,
+            ..CorpusSpec::default()
+        },
+    )
+    .expect("corpus generation");
+
+    let project_dir = base.join("proyecto");
+    df_facade::create_project(
+        &CreateProjectRequest {
+            name: "Corpus POSIX".to_string(),
+            project_dir: project_dir.clone(),
+            output_root: base.join("salida"),
+            audit_root: None,
+            source_roots: vec![origin],
+            profile: Some("generic".to_string()),
+        },
+        Actor::Test,
+    )
+    .expect("create");
+    df_facade::scan_project(&project_dir, Actor::Test).expect("scan");
+    df_facade::hash_project(&project_dir, Actor::Test).expect("hash");
+    df_facade::analyze_project(&project_dir, Actor::Test).expect("analyze");
+    df_facade::create_plan(&project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+    df_facade::approve_plan(&project_dir, Actor::Test).expect("approve");
+
+    let refused = df_facade::execute_plan(&project_dir, Actor::Test)
+        .expect_err("execute must refuse without platform write safety");
+    assert!(
+        refused.to_string().contains("refusing to execute"),
+        "unexpected refusal: {refused}"
+    );
+    let audit = df_facade::verify_audit(&project_dir).expect("audit");
+    assert!(audit.ledger_ok, "the refusal leaves the ledger intact");
+}
+
 /// CI-sized end-to-end drive: fast, but through every phase.
+#[cfg(windows)]
 #[test]
 fn a_small_corpus_survives_the_full_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
@@ -299,6 +354,7 @@ fn a_small_corpus_survives_the_full_pipeline() {
 /// ```powershell
 /// cargo test -p df-corpus --release -- --ignored scale --nocapture
 /// ```
+#[cfg(windows)]
 #[test]
 #[ignore = "scale run: minutes of IO; execute explicitly with --ignored"]
 fn scale_full_pipeline() {

@@ -56,6 +56,11 @@ enum Command {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Carry content identity forward from the previous snapshot when
+        /// the physical fingerprint is byte-identical (ADR-0035). Full
+        /// mode remains the default and the evidential recommendation.
+        #[arg(long)]
+        incremental: bool,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -123,6 +128,10 @@ enum Command {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Acknowledge a destination filesystem without physical identity
+        /// guarantees (network shares, FAT variants) — ADR-0036.
+        #[arg(long)]
+        allow_degraded_destination: bool,
     },
     /// Verify the executed plan from primary evidence.
     Verify {
@@ -593,7 +602,15 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Output::Status),
         },
         Command::Scan { path } => df_facade::scan_project(path, Actor::Cli).map(Output::Scan),
-        Command::Hash { path } => df_facade::hash_project(path, Actor::Cli).map(Output::Hash),
+        Command::Hash { path, incremental } => df_facade::hash_project_with_options(
+            path,
+            Actor::Cli,
+            &df_facade::HashOptions {
+                incremental: *incremental,
+                ..df_facade::HashOptions::default()
+            },
+        )
+        .map(Output::Hash),
         Command::Analyze { path } => {
             df_facade::analyze_project(path, Actor::Cli).map(Output::Analyze)
         }
@@ -867,7 +884,18 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 df_facade::approve_plan(path, Actor::Cli).map(Output::Approve)
             }
         },
-        Command::Execute { path } => df_facade::execute_plan(path, Actor::Cli).map(Output::Execute),
+        Command::Execute {
+            path,
+            allow_degraded_destination,
+        } => df_facade::execute_plan_with_options(
+            path,
+            Actor::Cli,
+            &df_facade::ExecuteOptions {
+                allow_degraded_destination: *allow_degraded_destination,
+                ..df_facade::ExecuteOptions::default()
+            },
+        )
+        .map(Output::Execute),
         Command::Verify { path } => {
             df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
         }
@@ -1014,6 +1042,12 @@ fn print_scan(outcome: &ScanOutcome) {
 fn print_hash(outcome: &HashOutcome) {
     println!("Snapshot        : {}", outcome.snapshot_id);
     println!("Hashed          : {}", outcome.hashed);
+    if outcome.reused > 0 {
+        println!(
+            "Reused          : {} binding(s) carried from the previous snapshot",
+            outcome.reused
+        );
+    }
     println!("Failed          : {}", outcome.failed);
     println!("Source changed  : {}", outcome.source_changed);
     println!("Pending         : {}", outcome.pending);
@@ -2126,46 +2160,75 @@ mod tests {
             _ => panic!("plan approve returns an approve outcome"),
         }
 
-        let execute = run(&Cli::parse_from(["dataforge", "execute", "--path", path]))
-            .expect("execute succeeds");
-        match &execute {
-            Output::Execute(outcome) => {
-                assert_eq!(outcome.state, "EXECUTED");
-                assert_eq!(verdict_exit_code(&execute), 0);
+        // Write safety is Windows-only in this version: on POSIX, execution
+        // must refuse explicitly (fail closed) with the approved plan and a
+        // valid ledger left intact — that refusal is the pinned behavior.
+        // The Windows half continues through copy and verification.
+        #[cfg(not(windows))]
+        {
+            let refused = run(&Cli::parse_from(["dataforge", "execute", "--path", path]))
+                .expect_err("execute must refuse without platform write safety");
+            assert!(
+                refused.to_string().contains("refusing to execute"),
+                "unexpected refusal: {refused}"
+            );
+            let audit = run(&Cli::parse_from([
+                "dataforge",
+                "audit",
+                "verify",
+                "--path",
+                path,
+            ]))
+            .expect("audit succeeds after the refusal");
+            match &audit {
+                Output::Audit(report) => assert!(report.ledger_ok),
+                _ => panic!("audit returns an audit report"),
             }
-            _ => panic!("execute returns an execute outcome"),
         }
 
-        let verify = run(&Cli::parse_from(["dataforge", "verify", "--path", path]))
-            .expect("verify succeeds");
-        match &verify {
-            Output::Verify(outcome) => {
-                assert_eq!(outcome.verdict, "COMPLETED", "{:?}", outcome.findings);
-                assert_eq!(verdict_exit_code(&verify), 0);
+        #[cfg(windows)]
+        {
+            let execute = run(&Cli::parse_from(["dataforge", "execute", "--path", path]))
+                .expect("execute succeeds");
+            match &execute {
+                Output::Execute(outcome) => {
+                    assert_eq!(outcome.state, "EXECUTED");
+                    assert_eq!(verdict_exit_code(&execute), 0);
+                }
+                _ => panic!("execute returns an execute outcome"),
             }
-            _ => panic!("verify returns a verify outcome"),
-        }
 
-        // The verified copy landed in the output root.
-        assert_eq!(
-            std::fs::read(tmp.path().join("salida").join("origen").join("x.txt")).unwrap(),
-            b"dup"
-        );
-
-        let audit = run(&Cli::parse_from([
-            "dataforge",
-            "audit",
-            "verify",
-            "--path",
-            path,
-        ]))
-        .expect("audit succeeds");
-        match &audit {
-            Output::Audit(report) => {
-                assert!(report.ledger_ok);
-                assert_eq!(verdict_exit_code(&audit), 0);
+            let verify = run(&Cli::parse_from(["dataforge", "verify", "--path", path]))
+                .expect("verify succeeds");
+            match &verify {
+                Output::Verify(outcome) => {
+                    assert_eq!(outcome.verdict, "COMPLETED", "{:?}", outcome.findings);
+                    assert_eq!(verdict_exit_code(&verify), 0);
+                }
+                _ => panic!("verify returns a verify outcome"),
             }
-            _ => panic!("audit returns an audit report"),
+
+            // The verified copy landed in the output root.
+            assert_eq!(
+                std::fs::read(tmp.path().join("salida").join("origen").join("x.txt")).unwrap(),
+                b"dup"
+            );
+
+            let audit = run(&Cli::parse_from([
+                "dataforge",
+                "audit",
+                "verify",
+                "--path",
+                path,
+            ]))
+            .expect("audit succeeds");
+            match &audit {
+                Output::Audit(report) => {
+                    assert!(report.ledger_ok);
+                    assert_eq!(verdict_exit_code(&audit), 0);
+                }
+                _ => panic!("audit returns an audit report"),
+            }
         }
     }
 

@@ -104,6 +104,15 @@ impl ProjectState {
                 | (ExecutionPaused, Executing | Failed)
                 | (Executed, Verifying)
                 | (Verifying, Completed | CompletedWithWarnings | Failed)
+                // M0.8 incremental rescans: a new snapshot may start from
+                // any stable checkpoint without a plan in flight. States
+                // between PlanReady and Executed are deliberately excluded —
+                // an approved plan pins its snapshot until executed and
+                // verified.
+                | (Hashed, Scanning)
+                | (Analyzed, Scanning)
+                | (Completed, Scanning)
+                | (CompletedWithWarnings, Scanning)
         )
     }
 
@@ -239,13 +248,39 @@ mod tests {
 
     #[test]
     fn terminal_states_have_no_outbound_transitions() {
-        for state in [Completed, CompletedWithWarnings, Failed, Archived] {
+        // Since M0.8, COMPLETED states are stable checkpoints, not tombs: a
+        // finished project may start the next cycle (ADR-0035). FAILED and
+        // ARCHIVED remain truly terminal.
+        for state in [Failed, Archived] {
             for next in ALL_STATES {
                 assert!(
                     !state.can_transition_to(next),
                     "{state} → {next} must be forbidden"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn completed_states_only_reopen_into_a_new_scan() {
+        for state in [Completed, CompletedWithWarnings] {
+            for next in ALL_STATES {
+                assert_eq!(
+                    state.can_transition_to(next),
+                    next == Scanning,
+                    "{state} → {next}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_in_flight_pins_the_project_against_rescans() {
+        for state in [PlanReady, PlanReview, PlanApproved, Executing, Executed] {
+            assert!(
+                !state.can_transition_to(Scanning),
+                "{state} → SCANNING must stay forbidden while a plan is in flight"
+            );
         }
     }
 }

@@ -31,6 +31,12 @@ pub struct HashOptions {
     pub read_buffer_bytes: usize,
     /// Pending jobs fetched from the queue per round trip.
     pub job_batch: u32,
+    /// Carry content bindings forward from the previous complete snapshot
+    /// when the v2 fingerprint is byte-identical with every field present
+    /// (RFC-0001 §14.4 fast path; ADR-0035). Off by default: full mode is
+    /// the recommendation for evidential profiles, so reuse is an explicit
+    /// per-run decision, and every reused binding records its provenance.
+    pub incremental: bool,
 }
 
 impl Default for HashOptions {
@@ -38,6 +44,7 @@ impl Default for HashOptions {
         Self {
             read_buffer_bytes: 1024 * 1024,
             job_batch: 256,
+            incremental: false,
         }
     }
 }
@@ -47,6 +54,9 @@ impl Default for HashOptions {
 pub struct HashOutcome {
     pub snapshot_id: String,
     pub hashed: u64,
+    /// Bindings carried forward from the previous snapshot (subset of
+    /// `hashed`); zero unless the run was explicitly incremental.
+    pub reused: u64,
     pub failed: u64,
     pub source_changed: u64,
     pub pending: u64,
@@ -85,6 +95,11 @@ pub fn hash_project(
 
     repository::update_project_state(db, ProjectState::Hashing, actor)?;
     inventory::enqueue_hash_jobs(db, snapshot.id, actor)?;
+    let reused = if options.incremental {
+        inventory::reuse_previous_hash_bindings(db, project.id, snapshot.id)?
+    } else {
+        0
+    };
 
     // One read buffer for the whole run, and one transaction per batch:
     // per-file commits are what made large runs crawl, and the persistent
@@ -120,12 +135,21 @@ pub fn hash_project(
     } else {
         (inventory::EVENT_HASH_COMPLETED, ProjectState::Hashed)
     };
-    inventory::record_hash_outcome(db, project.id, snapshot.id, event_type, &summary, actor)?;
+    inventory::record_hash_outcome(
+        db,
+        project.id,
+        snapshot.id,
+        event_type,
+        &summary,
+        reused,
+        actor,
+    )?;
     let project = repository::update_project_state(db, next_state, actor)?;
 
     Ok(HashOutcome {
         snapshot_id: snapshot.id.to_string(),
         hashed: summary.hash_done,
+        reused,
         failed: summary.hash_failed,
         source_changed: summary.hash_source_changed,
         pending: summary.hash_pending,
@@ -364,6 +388,109 @@ mod tests {
         assert_eq!(outcome.state, "HASHED");
         assert_eq!(outcome.hashed, 3);
         assert_eq!(outcome.pending, 0);
+    }
+
+    // Windows: NTFS provides every v2 field, so identity carries.
+    #[cfg(windows)]
+    #[test]
+    fn incremental_rescan_reuses_unchanged_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        // Nothing changed on disk: a rescan plus incremental hash must
+        // carry every binding forward without reading a byte of content.
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        let outcome = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                incremental: true,
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(
+            outcome.reused, 3,
+            "identical v2 fingerprints carry identity"
+        );
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.state, "HASHED");
+
+        // Duplicate resolution works identically through reused bindings.
+        let snapshot_id = outcome.snapshot_id.parse().unwrap();
+        let sets = exact_duplicates(&db, snapshot_id).unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].occurrences.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn incremental_rescan_rehashes_a_changed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, origin) = scanned_project(tmp.path());
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        // Change one file's bytes (and size, hence fingerprint).
+        std::fs::write(origin.join("c.txt"), b"contenido distinto y mas largo").unwrap();
+
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        let outcome = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                incremental: true,
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.reused, 2, "only unchanged files reuse identity");
+        assert_eq!(outcome.failed, 0);
+
+        // The changed file's new content hash is real, not carried over.
+        let snapshot_id = outcome.snapshot_id.parse().unwrap();
+        let sets = exact_duplicates(&db, snapshot_id).unwrap();
+        assert_eq!(sets.len(), 1, "the a/b duplicate pair persists");
+    }
+
+    /// POSIX: the captured fingerprint lacks full physical identity
+    /// (no NTFS attributes), so incremental reuse must refuse and take
+    /// the full-hash path — the conservative rule of ADR-0035, pinned.
+    #[cfg(not(windows))]
+    #[test]
+    fn incremental_reuse_refuses_without_full_physical_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        let outcome = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                incremental: true,
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.reused, 0, "weaker identity must never carry");
+    }
+
+    #[test]
+    fn full_mode_is_the_default_and_never_reuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        let outcome = hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.reused, 0, "reuse is an explicit per-run decision");
     }
 
     #[test]

@@ -560,6 +560,9 @@ fn file_sha256_handle(file: &fs::File, path: &Path) -> DfResult<String> {
 }
 
 #[cfg(test)]
+// The leased-SQL scenario is Windows-only; its helper and imports
+// would be dead code on POSIX.
+#[cfg_attr(not(windows), allow(dead_code, unused_imports))]
 mod tests {
     use super::*;
     use df_domain::{
@@ -641,6 +644,10 @@ mod tests {
         assert_eq!(extension("README"), None);
     }
 
+    // Windows-only: consuming a registered artifact takes a strong
+    // identity lease, and analytical SQL fails closed off Windows
+    // until M0.8 provides an equivalent (ADR-0031).
+    #[cfg(windows)]
     #[test]
     fn sql_is_read_only_bounded_and_integrity_checked() {
         let temp = tempfile::tempdir().unwrap();

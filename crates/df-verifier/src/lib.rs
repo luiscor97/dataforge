@@ -469,7 +469,9 @@ fn hash_file(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
     Ok(hex::encode(sha.finalize()))
 }
 
-#[cfg(test)]
+// Verification exercises executed outputs, and execution refuses
+// fail-closed off Windows until POSIX write safety exists.
+#[cfg(all(test, windows))]
 mod tests {
     use df_domain::{ProfileRef, Project, SourceRoot};
     use df_executor::{execute_plan, ExecuteOptions};

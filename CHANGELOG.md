@@ -9,6 +9,24 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 #### Añadido
 
+- NAS endurecido (ADR-0036): clasificación real del filesystem en la
+  validación (`UNC`/`DRIVE_REMOTE` → `NETWORK`; nombre de volumen para
+  NTFS/ReFS/FAT32/exFAT), persistida por root y visible en el estado. El
+  executor rechaza destinos sin identidad física (red, FAT, desconocidos)
+  salvo reconocimiento explícito `--allow-degraded-destination` por
+  ejecución; los orígenes degradados no se bloquean — sus garantías por
+  archivo ya se degradan de forma visible (ADR-0019/0035).
+
+- Snapshots incrementales (ADR-0035, migración 0019): los estados
+  completados pasan a ser puntos de control reabribles hacia un nuevo
+  escaneo (un plan en vuelo sigue bloqueando el rescan), y `hash
+  --incremental` transporta bindings de contenido del snapshot anterior
+  solo cuando el fingerprint v2 es byte-idéntico con todos los campos
+  presentes; v1 o campos `none` van siempre al hash completo. Cada binding
+  reusado registra su snapshot de procedencia y el evento `HASH_COMPLETED`
+  cuenta `reused_from_previous_snapshot`. Modo completo por defecto
+  (§14.4).
+
 - Evidencia de 1M+ entradas (`docs/testing/m0.8-scale-1m.md`): pipeline
   completo sobre 1.000.000 de archivos (4,26 GB) — escaneo y hash sin un
   solo fallo, 160.147 conjuntos duplicados, y **1.093.705 operaciones
@@ -18,14 +36,16 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   la máquina y se sustituyó por una comprobación post-hoc exacta de
   recuento, carpetas y bytes, con el límite documentado.
 - Job de CI `Rust on Linux (experimental M0.8)` en ubuntu con
-  `continue-on-error`: clippy estricto y suite neutral de plataforma como
-  evidencia visible sin bloquear la puerta mientras maduran las garantías
-  de escritura POSIX.
+  `continue-on-error` — **en verde**: el workspace completo compila, pasa
+  clippy estricto y la suite neutral de plataforma en Linux. La iteración
+  fijó 11 fronteras Windows-first como comportamiento probado: gating de
+  compilación en workers y suites, rechazo fail-closed de ejecución y SQL
+  con lease, y reuso incremental como no-op sin identidad física.
 
 #### Pendiente del hito
 
-- NAS endurecido, snapshots incrementales, cache y daemon experimental;
-  garantías de escritura segura reales en Linux/macOS.
+- Cache y daemon experimental; garantías de escritura segura reales en
+  Linux/macOS.
 
 ### Milestone 0.7 — Assisted Intelligence (implementación local)
 
