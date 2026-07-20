@@ -106,18 +106,6 @@ pub fn execute_plan(
         )));
     }
 
-    // ADR-0036: writing without physical identity (network shares, FAT
-    // variants, unclassifiable volumes) weakens substitution detection and
-    // finalize guarantees. It is allowed only as an explicit, audited
-    // per-run decision.
-    let destination_filesystem = df_fs_safety::classify_filesystem(&project.output_root);
-    if !destination_filesystem.has_physical_identity() && !options.allow_degraded_destination {
-        return Err(DfError::Validation(format!(
-            "the output root filesystem ({}) offers only degraded identity              guarantees; re-run with --allow-degraded-destination to              acknowledge and proceed (ADR-0036)",
-            destination_filesystem.as_str()
-        )));
-    }
-
     // Validate both the currently registered roots and the paths frozen in the
     // immutable manifest. The latter are what copy operations will actually
     // open, while the former also cover empty roots represented only by
@@ -130,6 +118,18 @@ pub fn execute_plan(
     // out instead of executing unprotected (ADR-0017).
     let output_root = project.output_root.clone();
     let safe_root = SafeOutputRoot::validate(&output_root)?;
+    // ADR-0036: writing without physical identity (network shares, FAT
+    // variants, unclassifiable volumes) weakens substitution detection and
+    // finalize guarantees. Allowed only as an explicit, audited per-run
+    // decision — and checked after platform safety, so POSIX keeps its
+    // canonical refusal.
+    let destination_filesystem = df_fs_safety::classify_filesystem(&output_root);
+    if !destination_filesystem.has_physical_identity() && !options.allow_degraded_destination {
+        return Err(DfError::Validation(format!(
+            "the output root filesystem ({}) offers only degraded identity              guarantees; re-run with --allow-degraded-destination to              acknowledge and proceed (ADR-0036)",
+            destination_filesystem.as_str()
+        )));
+    }
     // Creating a previously absent output root changes the filesystem view;
     // repeat the proof before entering EXECUTING or running an operation.
     validate_source_output_boundary(&source_roots, safe_root.path())?;
