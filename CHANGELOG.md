@@ -36,9 +36,11 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   la máquina y se sustituyó por una comprobación post-hoc exacta de
   recuento, carpetas y bytes, con el límite documentado.
 - Job de CI `Rust on Linux (experimental M0.8)` en ubuntu con
-  `continue-on-error`: clippy estricto y suite neutral de plataforma como
-  evidencia visible sin bloquear la puerta mientras maduran las garantías
-  de escritura POSIX.
+  `continue-on-error` — **en verde**: el workspace completo compila, pasa
+  clippy estricto y la suite neutral de plataforma en Linux. La iteración
+  fijó 11 fronteras Windows-first como comportamiento probado: gating de
+  compilación en workers y suites, rechazo fail-closed de ejecución y SQL
+  con lease, y reuso incremental como no-op sin identidad física.
 
 #### Pendiente del hito
 
