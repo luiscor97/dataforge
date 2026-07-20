@@ -23,8 +23,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{context::ContextKind, RuleDefinition};
 
-const SCHEMA: &str = "dataforge.profile";
-const SCHEMA_VERSION: &str = "1.1.0";
+/// The declarative-profile schema identifier and version. Frozen for 1.0
+/// (M0.9): changing either requires a new version and an ADR, never an
+/// in-place edit.
+pub const PROFILE_SCHEMA: &str = "dataforge.profile";
+pub const PROFILE_SCHEMA_VERSION: &str = "1.1.0";
+const SCHEMA: &str = PROFILE_SCHEMA;
+const SCHEMA_VERSION: &str = PROFILE_SCHEMA_VERSION;
 
 /// The conservative default used when a project does not select a profile.
 pub const DEFAULT_PROFILE_ID: &str = "generic";

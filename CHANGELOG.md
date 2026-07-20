@@ -5,6 +5,17 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.9 — Stabilization (en progreso)
+
+#### Añadido
+
+- Contratos congelados (ADR-0037): el test `df-facade::frozen_contracts`
+  fija en un único lugar toda versión de schema, algoritmo y ABI, más el
+  número y orden de las 19 migraciones, y falla si algo cambia. Congelar
+  es subir versión + ADR, nunca editar in place. Se exponen como públicos
+  los identificadores de contrato `PROFILE_SCHEMA`/`PROFILE_SCHEMA_VERSION`
+  y `REQUEST_SCHEMA_VERSION`.
+
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
 #### Añadido
