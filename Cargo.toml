@@ -99,7 +99,7 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 # Pinned to the FastCDC 2020 streaming API used by the persisted M0.3
 # algorithm contract. Changing it requires a new algorithm version.
-fastcdc = "=3.2.1"
+fastcdc = "=4.0.1"
 # M0.4's PDF and mail parsers require Rust 1.88 in practice. Their transitive
 # crates declare 1.85 but use language constructs first accepted by 1.88; the
 # workspace MSRV records the toolchain we actually compile-test. In particular,
