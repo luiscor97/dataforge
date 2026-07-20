@@ -237,6 +237,23 @@ pub fn load_project(db: &Db) -> DfResult<Project> {
 }
 
 /// Load the source roots of a project.
+/// Persist the filesystem classification captured during validation
+/// (ADR-0036). The column is operational metadata of the root, not
+/// snapshot evidence, so re-validation may refresh it.
+pub fn update_source_root_filesystem(
+    db: &mut Db,
+    root_id: df_domain::SourceRootId,
+    kind: df_domain::FileSystemKind,
+) -> DfResult<()> {
+    db.conn()
+        .execute(
+            "UPDATE source_roots SET filesystem = ?1 WHERE id = ?2",
+            rusqlite::params![kind.as_str(), root_id.to_string()],
+        )
+        .map_err(db_err)?;
+    Ok(())
+}
+
 pub fn load_source_roots(db: &Db, project_id: ProjectId) -> DfResult<Vec<SourceRoot>> {
     let mut stmt = db
         .conn()

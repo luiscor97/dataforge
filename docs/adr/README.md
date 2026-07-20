@@ -30,6 +30,7 @@
 | [ADR-0033](ADR-0033-plugin-ecosystem-integration.md) | Ecosistema de plugins: registro persistido y runs sellados (M0.6) | Aceptada |
 | [ADR-0034](ADR-0034-assisted-intelligence-byok.md) | IA asistida: BYOK, transportes en el borde y consentimiento por digest (M0.7) | Aceptada |
 | [ADR-0035](ADR-0035-incremental-snapshots.md) | Snapshots incrementales por identidad física probada (M0.8) | Aceptada |
+| [ADR-0036](ADR-0036-nas-hardening.md) | NAS endurecido: clasificación real y destino con identidad probada (M0.8) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).

@@ -97,6 +97,10 @@ pub fn validate_project(db: &mut Db, actor: Actor) -> DfResult<()> {
         std::fs::read_dir(path).map_err(|e| DfError::io(path.clone(), e))?;
         df_fs_safety::ensure_physical_roots_disjoint(path, &project.output_root)?;
         df_fs_safety::ensure_physical_roots_disjoint(path, &project.audit_root)?;
+        // Real filesystem classification (ADR-0036): recorded so status and
+        // reports can show which identity guarantees each root offers.
+        let kind = df_fs_safety::classify_filesystem(path);
+        repository::update_source_root_filesystem(db, root.id, kind)?;
     }
     for (i, a) in roots.iter().enumerate() {
         for b in roots.iter().skip(i + 1) {

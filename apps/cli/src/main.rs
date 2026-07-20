@@ -128,6 +128,10 @@ enum Command {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Acknowledge a destination filesystem without physical identity
+        /// guarantees (network shares, FAT variants) — ADR-0036.
+        #[arg(long)]
+        allow_degraded_destination: bool,
     },
     /// Verify the executed plan from primary evidence.
     Verify {
@@ -880,7 +884,18 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 df_facade::approve_plan(path, Actor::Cli).map(Output::Approve)
             }
         },
-        Command::Execute { path } => df_facade::execute_plan(path, Actor::Cli).map(Output::Execute),
+        Command::Execute {
+            path,
+            allow_degraded_destination,
+        } => df_facade::execute_plan_with_options(
+            path,
+            Actor::Cli,
+            &df_facade::ExecuteOptions {
+                allow_degraded_destination: *allow_degraded_destination,
+                ..df_facade::ExecuteOptions::default()
+            },
+        )
+        .map(Output::Execute),
         Command::Verify { path } => {
             df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
         }

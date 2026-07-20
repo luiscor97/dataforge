@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
 pub use df_domain::RuleAction;
+pub use df_executor::ExecuteOptions;
 pub use df_executor::ExecuteOutcome;
 pub use df_hash::{HashOptions, HashOutcome};
 mod ai_transport;
@@ -2119,15 +2120,20 @@ pub fn approve_plan(project_dir: &Path, actor: Actor) -> DfResult<ApproveOutcome
 /// Execute the approved plan (§27). Resumable; ends in `EXECUTED` or
 /// `EXECUTION_PAUSED` when work remains.
 pub fn execute_plan(project_dir: &Path, actor: Actor) -> DfResult<ExecuteOutcome> {
+    execute_plan_with_options(project_dir, actor, &df_executor::ExecuteOptions::default())
+}
+
+/// `allow_degraded_destination` acknowledges writing to a filesystem
+/// without physical identity guarantees (ADR-0036); refused otherwise.
+pub fn execute_plan_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &df_executor::ExecuteOptions,
+) -> DfResult<ExecuteOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_executor::execute_plan(
-        &mut db,
-        actor,
-        &df_executor::ExecuteOptions::default(),
-        None,
-    )
+    df_executor::execute_plan(&mut db, actor, options, None)
 }
 
 /// Verify the executed plan from primary evidence (§28). Ends in

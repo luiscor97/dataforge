@@ -9,6 +9,14 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 #### Añadido
 
+- NAS endurecido (ADR-0036): clasificación real del filesystem en la
+  validación (`UNC`/`DRIVE_REMOTE` → `NETWORK`; nombre de volumen para
+  NTFS/ReFS/FAT32/exFAT), persistida por root y visible en el estado. El
+  executor rechaza destinos sin identidad física (red, FAT, desconocidos)
+  salvo reconocimiento explícito `--allow-degraded-destination` por
+  ejecución; los orígenes degradados no se bloquean — sus garantías por
+  archivo ya se degradan de forma visible (ADR-0019/0035).
+
 - Snapshots incrementales (ADR-0035, migración 0019): los estados
   completados pasan a ser puntos de control reabribles hacia un nuevo
   escaneo (un plan en vuelo sigue bloqueando el rescan), y `hash
@@ -34,8 +42,8 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 #### Pendiente del hito
 
-- NAS endurecido, snapshots incrementales, cache y daemon experimental;
-  garantías de escritura segura reales en Linux/macOS.
+- Cache y daemon experimental; garantías de escritura segura reales en
+  Linux/macOS.
 
 ### Milestone 0.7 — Assisted Intelligence (implementación local)
 

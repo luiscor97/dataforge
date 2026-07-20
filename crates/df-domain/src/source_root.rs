@@ -23,6 +23,14 @@ pub enum FileSystemKind {
 }
 
 impl FileSystemKind {
+    /// Whether ADR-0019 physical identity (volume serial + file id) is
+    /// available: the foundation of substitution detection, incremental
+    /// reuse and the strong-identity leases. Network shares, FAT variants
+    /// and unknown filesystems only offer degraded guarantees.
+    pub fn has_physical_identity(self) -> bool {
+        matches!(self, Self::Ntfs | Self::ReFs)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ntfs => "NTFS",

@@ -699,6 +699,75 @@ pub fn finalize_no_replace(partial: &Path, destination: &Path) -> FsResult<()> {
 ///
 /// The file is opened for metadata only and never followed if it is a reparse
 /// point, so this cannot be tricked into fingerprinting a link's target.
+/// Classify the filesystem that hosts `path` (ADR-0036). UNC paths and
+/// remote drives are `Network` before any volume query; local volumes are
+/// named by the OS. Off Windows the classification is `Unknown` until the
+/// POSIX backend exists — callers must treat that as degraded, never as
+/// safe.
+pub fn classify_filesystem(path: &Path) -> df_domain::FileSystemKind {
+    let text = path.as_os_str().to_string_lossy();
+    let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if stripped.starts_with(r"\\") || stripped.starts_with(r"UNC\") {
+        return df_domain::FileSystemKind::Network;
+    }
+    #[cfg(windows)]
+    {
+        classify_windows_volume(path)
+    }
+    #[cfg(not(windows))]
+    {
+        df_domain::FileSystemKind::Unknown
+    }
+}
+
+#[cfg(windows)]
+fn classify_windows_volume(path: &Path) -> df_domain::FileSystemKind {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
+
+    const DRIVE_REMOTE: u32 = 4;
+
+    let Some(root) = path.ancestors().last().map(std::path::Path::to_path_buf) else {
+        return df_domain::FileSystemKind::Unknown;
+    };
+    // Drive roots need a trailing separator for both APIs.
+    let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+    if wide.last() != Some(&(b'\\' as u16)) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
+
+    // SAFETY: `wide` is a valid, NUL-terminated UTF-16 buffer that outlives
+    // both calls; out buffers are stack arrays of the documented sizes.
+    unsafe {
+        if GetDriveTypeW(wide.as_ptr()) == DRIVE_REMOTE {
+            return df_domain::FileSystemKind::Network;
+        }
+        let mut name = [0u16; 64];
+        let ok = GetVolumeInformationW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        );
+        if ok == 0 {
+            return df_domain::FileSystemKind::Unknown;
+        }
+        let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        match String::from_utf16_lossy(&name[..end]).as_str() {
+            "NTFS" => df_domain::FileSystemKind::Ntfs,
+            "ReFS" => df_domain::FileSystemKind::ReFs,
+            "FAT32" => df_domain::FileSystemKind::Fat32,
+            "exFAT" => df_domain::FileSystemKind::ExFat,
+            _ => df_domain::FileSystemKind::Unknown,
+        }
+    }
+}
+
 pub fn capture_fingerprint(path: &Path) -> FsResult<df_domain::FileFingerprint> {
     platform::capture_fingerprint(path)
 }
@@ -2003,5 +2072,34 @@ mod tests {
                 .status();
             matches!(status, Ok(s) if s.success()) && link.exists()
         }
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn unc_paths_classify_as_network_before_any_volume_query() {
+        for path in [r"\\server\share\data", r"\\?\UNC\server\share\data"] {
+            assert_eq!(
+                classify_filesystem(Path::new(path)),
+                df_domain::FileSystemKind::Network,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_local_temporary_directory_is_never_classified_as_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kind = classify_filesystem(tmp.path());
+        assert_ne!(kind, df_domain::FileSystemKind::Network);
+        assert_ne!(
+            kind,
+            df_domain::FileSystemKind::Unknown,
+            "CI runners are NTFS"
+        );
     }
 }
