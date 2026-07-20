@@ -15,6 +15,10 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   es subir versión + ADR, nunca editar in place. Se exponen como públicos
   los identificadores de contrato `PROFILE_SCHEMA`/`PROFILE_SCHEMA_VERSION`
   y `REQUEST_SCHEMA_VERSION`.
+- Compatibilidad de migraciones: tests que fijan que una instalación limpia
+  aplica y verifica las 19 migraciones, que una base de una build anterior
+  (a la que le falta una migración) se actualiza al abrir, y que un checksum
+  manipulado (deriva silenciosa de esquema) se rechaza al abrir.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
