@@ -1,7 +1,10 @@
 # Modelo de amenazas del núcleo local
 
-Ámbito: fundación, pipeline seguro y evidencia estructural, binaria y
-documental hasta M0.4.
+Ámbito: fundación, pipeline seguro y toda la evidencia hasta M0.8 —
+estructural, binaria, documental, multimedia (M0.5), ecosistema de plugins
+(M0.6), inteligencia asistida (M0.7) y escala/multiplataforma (M0.8).
+Consolidado como threat model final para 1.0 (M0.9): cada milestone añade su
+fila a la tabla de amenazas y su propiedad de fallo cerrado.
 La lista objetivo completa del producto está en RFC-0001 §37.
 
 > Junctions, symlinks, carreras TOCTOU, sustitución del origen, finalize y
@@ -57,6 +60,11 @@ modificar arbitrariamente proceso, base y salida a la vez.
 | Texto derivado o índice se presenta como fuente | SQLite conserva linaje contenido→representación→sujeto/segmento; índices y Parquet se registran solo tras run sellado y son reconstruibles; schemas versionados | Los extractores pueden perder semántica; el texto es evidencia derivada, nunca identidad ni autorización destructiva |
 | La UI aplica lógica privilegiada | CLI y desktop consumen `df-facade`; la UI presenta DTOs y no abre SQLite; capacidades Tauri y CSP acotadas | Un bug de presentación puede confundir, pero no salta las validaciones del motor |
 | Dependencia o bootstrap comprometidos | Lockfiles, `cargo audit`, `cargo deny`, fuentes/licencias acotadas, CI y prohibición de `irm | iex` | Riesgo normal de cadena de suministro; firma de releases y SBOM siguen pendientes |
+| Medio hostil (bomba de decodificación) agota o derriba el proceso | Imagen vía `df-media-worker` aislado; audio/vídeo vía FFmpeg explícito bajo `df-process-safety` (Job Object, memoria, deadline, salida acotada); sin `PATH` ni fallback in-process; una coincidencia perceptual es evidencia de revisión, nunca autoriza una operación (ADR-0032) | Windows es el backend endurecido; sin sidecar el medio queda `WORKER_UNAVAILABLE`; la selección es por extensión, no por sniffing |
+| Un plugin malicioso ejecuta código, escapa o consume recursos | Host WASM Component Model con linker vacío (sin WASI: sin filesystem/red/reloj/entorno), capacidades explícitas concedidas por el operador, límites fuel/epoch/memoria/tablas, registro firmado Ed25519 re-verificado (firma+hash+manifiesto+ABI+compilación) al leerlo del almacén; los findings son afirmaciones, nunca ejecutan (ADR-0033) | Un plugin puede afirmar de más o de menos dentro de su schema cerrado; la revocación de registros queda pendiente |
+| La IA filtra datos a la nube o gana capacidad de actuar | Preparación en dos fases con manifiesto de divulgación y consentimiento por digest SHA-256 por invocación; redacción de rutas/emails/teléfonos; claves BYOK en el Credential Manager del SO (nunca en SQLite/ledger/logs); `df-ai` no enlaza red ni ve credenciales; sin API de ejecución/plan/aprobación; salida validada contra schema cerrado sin acciones (ADR-0034) | El proveedor cloud recibe el texto divulgado que el usuario aceptó; la validación de la clave ocurre en el primer uso real |
+| Un rescan incremental reusa la identidad de un archivo sustituido | El reuso solo transporta bindings con fingerprint v2 byte-idéntico y todos los campos físicos presentes (talla, mtime, ctime, atributos, volumen, file id); v1 o cualquier `none` van al hash completo; el pre/post-check re-verifica antes de confiar; opt-in por ejecución, modo completo por defecto (ADR-0035) | En filesystems sin identidad física (NAS/FAT) el reuso se niega y todo va al hash completo; el escaneo aún recorre el árbol completo |
+| Escribir en un destino sin garantías de identidad debilita la detección de sustitución | Clasificación real del filesystem del output root en la validación (UNC/DRIVE_REMOTE→NETWORK; nombre de volumen para NTFS/ReFS/FAT/exFAT), persistida y visible; el executor rechaza destinos sin identidad física salvo `--allow-degraded-destination` explícito por ejecución (ADR-0036) | Sin prueba de integración con un share real; POSIX clasifica UNKNOWN (tratado como degradado) hasta su backend |
 
 ## Propiedades de fallo cerrado
 
@@ -74,6 +82,14 @@ modificar arbitrariamente proceso, base y salida a la vez.
 - Worker SQL ausente, incompatible o excedido: consulta rechazada, sin
   fallback a hilo.
 - Digest de configuración o artefacto incoherente: run/consulta rechazado.
+- Sidecar de medios ausente: análisis `WORKER_UNAVAILABLE`, sin fallback.
+- Plugin cuya firma, hash, manifiesto, ABI o compilación no verifican:
+  rechazado al registrar y re-verificado al ejecutar.
+- IA sin consentimiento por digest válido para esa divulgación exacta, o
+  cloud sin clave almacenada: no se envía nada, invocación rechazada.
+- Reuso incremental sin identidad física completa: se niega, hash completo.
+- Destino sin identidad física y sin `--allow-degraded-destination`:
+  ejecución rechazada tras la validación de plataforma.
 
 ## Riesgos aceptados y límites
 

@@ -19,6 +19,12 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   aplica y verifica las 19 migraciones, que una base de una build anterior
   (a la que le falta una migración) se actualiza al abrir, y que un checksum
   manipulado (deriva silenciosa de esquema) se rechaza al abrir.
+- Threat model final consolidado (`docs/threat-model/initial.md`): amplía la
+  tabla de amenazas y las propiedades de fallo cerrado a M0.5–M0.8 (medio
+  hostil aislado, plugin WASM sin WASI con registro firmado re-verificado,
+  IA con consentimiento por digest y claves fuera de la base, reuso
+  incremental solo con identidad física probada, destino degradado con
+  reconocimiento explícito).
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
