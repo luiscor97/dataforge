@@ -44,7 +44,13 @@ pub use pdf_worker::PdfWorkerConfig;
 
 /// Semantic backend identifier persisted with each representation. Changing
 /// normalization or dispatch semantics requires changing this identifier.
-pub const EXTRACTOR_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+content-v1");
+///
+/// Frozen as a literal (ADR-0037): this is an algorithm identity sealed
+/// into existing evidence, not the software version. Deriving it from the
+/// crate version would silently re-key every stored representation on a
+/// release bump with unchanged semantics. The leading "0.2.0" is the
+/// historical token under which this identity was first sealed.
+pub const EXTRACTOR_VERSION: &str = "0.2.0+content-v1";
 
 /// Immutable input and caller-owned lineage for one content object.
 #[derive(Debug, Clone, Copy)]

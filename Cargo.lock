@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "dataforge-cli"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "df-domain",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "dataforge-desktop"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-domain",
  "df-error",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "df-ai"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-process-safety",
  "hex",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "df-corpus"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "df-domain",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "df-db"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "df-domain"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-error",
@@ -2144,14 +2144,14 @@ dependencies = [
 
 [[package]]
 name = "df-error"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "df-executor"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "df-extract"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "df-extract-worker"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-domain",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "df-facade"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-ai",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "df-fs-safety"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-domain",
  "df-error",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "df-hash"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2277,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "df-ledger"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-domain",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "df-media"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-db",
  "df-domain",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "df-media-worker"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-domain",
  "df-facade",
@@ -2317,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "df-planner"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-db",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "df-plugin"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-db",
  "df-domain",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "df-process-safety"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-fs-safety",
  "thiserror 2.0.18",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "df-query"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "df-query-worker"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "df-scan"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-db",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "df-search"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "df-db",
  "df-domain",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "df-similarity"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "df-verifier"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "df-db",

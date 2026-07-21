@@ -5,7 +5,43 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
-### Milestone 0.9 — Stabilization (en progreso)
+_Nada pendiente; el trabajo post-1.0 se anotará aquí._
+
+## [1.0.0] — 2026-07-21 — Milestone 1.0 "Stable Reconstruction Platform"
+
+Primera versión estable. El pipeline completo — inventario inmutable,
+análisis estructural y de contenido, plan aprobado, copia verificada y
+auditoría encadenada — está probado de extremo a extremo en Windows hasta
+1.000.000 de archivos con verificación independiente `COMPLETED`. Los
+contratos públicos (schemas, algoritmos, ABI de plugins, 19 migraciones)
+quedan congelados bajo test de regresión (ADR-0037); congelar es subir
+versión + ADR, nunca editar in place.
+
+#### Cambiado
+
+- Versión del workspace, CLI y escritorio: `0.2.0` → `1.0.0`.
+- `EXTRACTOR_VERSION` desacoplado de la versión del crate y congelado como
+  literal `0.2.0+content-v1`: es una identidad de algoritmo sellada en la
+  evidencia existente, no una versión de software — derivarla del crate
+  habría re-clavado silenciosamente cada representación almacenada en un
+  bump sin cambio semántico. El `0.2.0` inicial queda como token histórico
+  (ADR-0037).
+
+#### Alcance declarado de la 1.0 (con veto ejercitable antes del tag)
+
+- **Windows-first**: garantías de escritura probadas de extremo a extremo
+  en Windows; en POSIX la ejecución se bloquea en vez de fingir y la CI de
+  Linux es experimental.
+- **Deuda declarada post-1.0** (ninguna toca garantías de reconstrucción):
+  daemon en segundo plano (M0.8); escritura segura POSIX madura;
+  independencia de ruta/máquina en builds (`--remap-path-prefix`, entorno
+  canónico); firma Authenticode/SmartScreen adicional a Sigstore; pase de
+  lector de pantalla real + axe en CI; revocación de plugins y
+  `SubjectText` (M0.6); informes finales exportables.
+- El mapa garantía→evidencia completo vive en
+  `docs/release/m1.0-acceptance.md`.
+
+### Milestone 0.9 — Stabilization
 
 #### Añadido
 
@@ -74,7 +110,7 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   (Windows-first, daemon post-1.0, vía de firma) quedan aplicadas y
   documentadas con veto abierto en `docs/release/m1.0-acceptance.md`.
 
-### Milestone 0.8 — Cross-platform and Scale (parcial)
+### Milestone 0.8 — Cross-platform and Scale (cerrado Windows-first; daemon y POSIX maduro → post-1.0)
 
 #### Añadido
 
