@@ -21,6 +21,9 @@ param(
     [long]$Files = 0,
     [long]$Seed = 42,
     [string]$Label = "baseline",
+    [int]$Workers = 0,
+    [ValidateSet("", "create", "scan", "hash", "analyze", "plan", "approve", "execute", "verify")]
+    [string]$StopAfter = "",
     [string]$Root = "$env:USERPROFILE\Desktop\dataforge-bench",
     [switch]$SkipBuild,
     [switch]$KeepCorpus
@@ -42,7 +45,7 @@ foreach ($bin in @($cli, $corpusTool)) {
 
 $commit = (git -C $repo rev-parse --short HEAD).Trim()
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$caseName = "$Label-$Profile-f$Files-s$Seed-$commit-$stamp"
+$caseName = "$Label-$Profile-f$Files-w$Workers-s$Seed-$commit-$stamp"
 $caseRoot = Join-Path $Root $caseName
 $corpusDir = Join-Path $caseRoot "corpus"
 $projectDir = Join-Path $caseRoot "project"
@@ -99,18 +102,26 @@ $corpusBytes = [long](($corpusInfo | Select-String "^Bytes\s*:\s*(\d+)").Matches
 
 # --- pipeline -------------------------------------------------------------
 Write-Host "== pipeline =="
+$plan = @(
+    @{ name = "create"; args = @("project", "create", "--name", "bench-$Profile",
+            "--path", $projectDir, "--output-root", $outputDir,
+            "--profile", "generic", "--source", $corpusDir, "--json") },
+    @{ name = "scan"; args = @("scan", "--path", $projectDir, "--json") },
+    @{ name = "hash"; args = @("hash", "--path", $projectDir, "--workers", $Workers, "--json") },
+    @{ name = "analyze"; args = @("analyze", "--path", $projectDir, "--json") },
+    @{ name = "plan"; args = @("plan", "create", "--path", $projectDir,
+            "--duplicate-policy", "REPORT_ONLY", "--json") },
+    @{ name = "approve"; args = @("plan", "approve", "--path", $projectDir, "--json") },
+    @{ name = "execute"; args = @("execute", "--path", $projectDir, "--json") },
+    @{ name = "verify"; args = @("verify", "--path", $projectDir, "--workers", $Workers, "--json") }
+)
 $phases = @()
-$phases += Invoke-Phase "create" @("project", "create", "--name", "bench-$Profile",
-    "--path", $projectDir, "--output-root", $outputDir,
-    "--profile", "generic", "--source", $corpusDir, "--json")
-$phases += Invoke-Phase "scan" @("scan", "--path", $projectDir, "--json")
-$phases += Invoke-Phase "hash" @("hash", "--path", $projectDir, "--json")
-$phases += Invoke-Phase "analyze" @("analyze", "--path", $projectDir, "--json")
-$phases += Invoke-Phase "plan" @("plan", "create", "--path", $projectDir,
-    "--duplicate-policy", "REPORT_ONLY", "--json")
-$phases += Invoke-Phase "approve" @("plan", "approve", "--path", $projectDir, "--json")
-$phases += Invoke-Phase "execute" @("execute", "--path", $projectDir, "--json")
-$phases += Invoke-Phase "verify" @("verify", "--path", $projectDir, "--json")
+foreach ($step in $plan) {
+    $phases += Invoke-Phase $step.name $step.args
+    # -StopAfter lets a worker sweep measure hash without paying for execute,
+    # which does not use the worker count.
+    if ($StopAfter -and $step.name -eq $StopAfter) { break }
+}
 
 foreach ($ph in $phases) {
     if ($ph.exit_code -ne 0) {
@@ -136,6 +147,7 @@ $vol = Get-Volume -FilePath $Root -ErrorAction SilentlyContinue
 $result = [pscustomobject]@{
     label            = $Label
     profile          = $Profile
+    workers          = $Workers
     files            = $corpusFiles
     bytes            = $corpusBytes
     avg_file_bytes   = $avgFile
