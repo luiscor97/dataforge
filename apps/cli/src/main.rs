@@ -143,6 +143,10 @@ enum Command {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Parallel re-hash workers. 0 = auto. The verdict and findings are
+        /// identical for any value; use 1 to reproduce sequential behaviour.
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
     },
     /// Evidence reports derived from the inventory.
     Report {
@@ -906,9 +910,15 @@ fn run(cli: &Cli) -> DfResult<Output> {
             },
         )
         .map(Output::Execute),
-        Command::Verify { path } => {
-            df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
-        }
+        Command::Verify { path, workers } => df_facade::verify_project_output_with_options(
+            path,
+            Actor::Cli,
+            &df_facade::VerifyOptions {
+                workers: *workers,
+                ..df_facade::VerifyOptions::default()
+            },
+        )
+        .map(Output::Verify),
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)
