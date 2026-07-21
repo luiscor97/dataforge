@@ -1,0 +1,45 @@
+{
+    "label":  "hashsweep",
+    "profile":  "a-small",
+    "workers":  1,
+    "files":  100000,
+    "bytes":  274013707,
+    "avg_file_bytes":  2740,
+    "seed":  42,
+    "commit":  "9240a92",
+    "build":  "release --locked",
+    "hardware":  "AMD Ryzen 7 9800X3D 8-Core Processor           ",
+    "os":  "Microsoft Windows 11 Home",
+    "filesystem":  "NTFS",
+    "corpus_seconds":  48.3,
+    "generated_at_utc":  "2026-07-21T19:43:28Z",
+    "phases":  [
+                   {
+                       "phase":  "create",
+                       "seconds":  2.191,
+                       "exit_code":  0,
+                       "peak_ws_mb":  6,
+                       "cpu_seconds":  0,
+                       "files_per_second":  null,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "scan",
+                       "seconds":  12.138,
+                       "exit_code":  0,
+                       "peak_ws_mb":  15.7,
+                       "cpu_seconds":  8.4,
+                       "files_per_second":  8238.6,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "hash",
+                       "seconds":  37.845,
+                       "exit_code":  0,
+                       "peak_ws_mb":  17.8,
+                       "cpu_seconds":  27.3,
+                       "files_per_second":  2642.4,
+                       "mib_per_second":  6.9
+                   }
+               ]
+}
