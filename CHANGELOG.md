@@ -30,6 +30,12 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   informes, revisión, y las capacidades M0.3–M0.7 (similitud, contenido,
   media, plugins, IA/BYOK), perfiles, incremental/NAS, códigos de salida y
   las garantías de diseño. Enlazado desde el README.
+- SBOM CycloneDX 1.5 (`docs/sbom/dataforge.cdx.json`) generado por un script
+  determinista y reproducible (`scripts/generate-sbom.py`, solo cargo +
+  Python 3): 786 componentes (25 crates del workspace + transitivas ancladas
+  por `Cargo.lock`) con versión, licencia SPDX y PURL. Complementa a
+  `cargo audit`/`cargo deny`: el SBOM enumera, las auditorías juzgan
+  (`docs/sbom/README.md`). La firma queda como paso de release.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
