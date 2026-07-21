@@ -7,6 +7,7 @@ import {
   queryContent,
   searchContent,
 } from "../api";
+import { ErrorAlert } from "../components/ErrorAlert";
 import {
   type ContentArtifactBuildOutcome,
   type ContentExtractionOutcome,
@@ -136,7 +137,7 @@ export function ContentIntelligenceView({
         setArtifacts(outcome);
         setRunId(outcome.run_id);
       },
-      "Los artefactos de búsqueda y análisis se han reconstruido.",
+      "La búsqueda y el análisis están preparados.",
     );
   }
 
@@ -208,10 +209,12 @@ export function ContentIntelligenceView({
     >
       <div className="section-heading">
         <div>
-          <h3 id="content-heading">Inteligencia de contenido M0.4</h3>
+          <h3 id="content-heading">
+            Contenido y búsqueda <span className="milestone">M0.4</span>
+          </h3>
           <p>
-            Extracción reanudable, índice de texto y SQL acotado sobre evidencia
-            derivada. Cada operación requiere una acción explícita.
+            Extrae el texto de tus archivos y busca dentro de ellos. Nada ocurre
+            automáticamente: cada paso se lanza con su propio botón.
           </p>
         </div>
         {extraction !== null && (
@@ -221,18 +224,14 @@ export function ContentIntelligenceView({
         )}
       </div>
 
-      {error !== null && (
-        <div className="error content-error" role="alert">
-          <strong>{error.code}</strong>: {error.message}
-        </div>
-      )}
+      {error !== null && <ErrorAlert error={error} />}
       <p className="visually-hidden" role="status" aria-live="polite">
         {activeAction === "extract"
           ? "Extrayendo contenido."
           : activeAction === "fail"
             ? "Cerrando el run."
             : activeAction === "build"
-              ? "Reconstruyendo artefactos."
+              ? "Preparando la búsqueda."
               : activeAction === "search"
                 ? "Buscando contenido."
                 : activeAction === "query"
@@ -265,8 +264,8 @@ export function ContentIntelligenceView({
           <div>
             <h4 id="content-extract-heading">1. Extraer</h4>
             <p>
-              Lee los orígenes verificados con los límites persistidos por el
-              motor.
+              Lee el texto de los archivos ya verificados para poder buscar en
+              ellos. No modifica los originales.
             </p>
           </div>
           <button
@@ -280,7 +279,8 @@ export function ContentIntelligenceView({
 
         {extraction === null ? (
           <p className="diagnostic-status diagnostic-pending" role="status">
-            No se ha ejecutado una extracción en esta sesión.
+            No se ha ejecutado una extracción en esta sesión. Empieza por aquí
+            para poder buscar en tus documentos.
           </p>
         ) : (
           <div className="content-outcome">
@@ -317,7 +317,7 @@ export function ContentIntelligenceView({
         )}
 
         <details className="failure-control">
-          <summary>Cerrar explícitamente un run irrecuperable</summary>
+          <summary>Cerrar un run irrecuperable (avanzado)</summary>
           <p>
             Úsalo solo si el origen no puede restaurarse. Un error normal debe
             conservar el run abierto para poder reanudarlo.
@@ -355,17 +355,18 @@ export function ContentIntelligenceView({
       <section className="content-step" aria-labelledby="content-build-heading">
         <div className="content-step-heading">
           <div>
-            <h4 id="content-build-heading">2. Construir artefactos</h4>
-            <p>Regenera un índice Tantivy y un snapshot Parquet desechables.</p>
+            <h4 id="content-build-heading">2. Preparar la búsqueda</h4>
+            <p>
+              Crea el índice de búsqueda y la tabla de análisis a partir de la
+              extracción. Puedes regenerarlos cuando quieras.
+            </p>
           </div>
           <button
             type="button"
             onClick={() => void handleBuild()}
             disabled={busy}
           >
-            {activeAction === "build"
-              ? "Construyendo…"
-              : "Construir artefactos"}
+            {activeAction === "build" ? "Preparando…" : "Preparar búsqueda"}
           </button>
         </div>
         {artifacts !== null && (
@@ -394,6 +395,9 @@ export function ContentIntelligenceView({
         aria-labelledby="content-search-heading"
       >
         <h4 id="content-search-heading">3. Buscar</h4>
+        <p className="step-description">
+          Busca palabras o frases dentro del contenido extraído de tus archivos.
+        </p>
         <form
           className="inline-form"
           onSubmit={(event) => {
@@ -456,7 +460,11 @@ export function ContentIntelligenceView({
       </section>
 
       <section className="content-step" aria-labelledby="content-query-heading">
-        <h4 id="content-query-heading">4. Consultar SQL</h4>
+        <h4 id="content-query-heading">4. Consultar con SQL (avanzado)</h4>
+        <p className="step-description">
+          Para usuarios avanzados: consultas de solo lectura sobre la evidencia
+          derivada.
+        </p>
         <form
           onSubmit={(event) => {
             event.preventDefault();

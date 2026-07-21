@@ -1,11 +1,44 @@
+/* ---------------------------------------------------------------------------
+ * DataForge desktop — warm, guidance-first theme.
+ * Plain CSS only; colours resolve for light and dark via media queries.
+ * ------------------------------------------------------------------------- */
+
 :root {
   color-scheme: light dark;
   font-family: "Segoe UI", system-ui, sans-serif;
+
   --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-ink: #1d4ed8;
   --danger: #b91c1c;
   --ok: #15803d;
   --warning: #a16207;
-  --border: #d1d5db;
+
+  --bg: #f6f4f1;
+  --surface: #ffffff;
+  --border: #e3ded6;
+  --border-strong: #cfc8bc;
+  --text: #2b2621;
+  --text-muted: #6f675e;
+  --shadow: 0 1px 2px rgba(43, 38, 33, 0.05), 0 4px 16px rgba(43, 38, 33, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent-hover: #3b82f6;
+    --accent-ink: #9dc0ff;
+    --danger: #fca5a5;
+    --ok: #86efac;
+    --warning: #fcd34d;
+
+    --bg: #1a1713;
+    --surface: #242019;
+    --border: #3a352c;
+    --border-strong: #4d463a;
+    --text: #ece7df;
+    --text-muted: #a69e92;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
 }
 
 * {
@@ -14,25 +47,45 @@
 
 body {
   margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.55;
 }
 
+code {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 0.9em;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-radius: 4px;
+  padding: 0.08em 0.3em;
+  overflow-wrap: anywhere;
+}
+
+/* Layout shell ------------------------------------------------------------ */
+
 .shell {
-  max-width: 860px;
+  max-width: 880px;
   margin: 0 auto;
-  padding: 1rem 1.5rem 3rem;
+  padding: 1rem 1.5rem 3.5rem;
+}
+
+.shell[aria-busy="true"] {
+  cursor: progress;
 }
 
 .topbar {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
+  gap: 1rem;
   border-bottom: 1px solid var(--border);
-  margin-bottom: 1.5rem;
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.75rem;
 }
 
 .topbar h1 {
-  font-size: 1.4rem;
-  margin: 0.7rem 0;
+  font-size: 1.3rem;
+  margin: 0.55rem 0 0;
 }
 
 .brand-button {
@@ -41,25 +94,119 @@ body {
   background: transparent;
   color: inherit;
   font-size: inherit;
-  font-weight: 700;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  cursor: pointer;
+}
+
+.brand-button:hover {
+  color: var(--accent-ink);
 }
 
 .version {
-  font-size: 0.8rem;
-  opacity: 0.7;
+  font-size: 0.75rem;
+  color: var(--text-muted);
 }
+
+/* Typography -------------------------------------------------------------- */
 
 .panel h2 {
-  margin-top: 0;
+  margin: 0 0 0.6rem;
+  font-size: 1.5rem;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
 }
 
-.hint {
-  opacity: 0.8;
+.panel h3 {
+  font-size: 1.1rem;
+  line-height: 1.3;
+}
+
+.panel h4 {
+  font-size: 0.98rem;
+}
+
+.lead {
+  font-size: 1.05rem;
+  max-width: 62ch;
+  margin: 0 0 1.25rem;
+}
+
+.screen-intro {
+  color: var(--text-muted);
+  max-width: 62ch;
+  margin: 0 0 1.5rem;
+}
+
+/* Home -------------------------------------------------------------------- */
+
+.steps-title {
+  margin: 1.75rem 0 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.steps {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin: 0 0 1.75rem;
+  padding: 0;
+}
+
+.steps li {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.1rem 1.15rem;
+  box-shadow: var(--shadow);
+}
+
+.steps h4 {
+  margin: 0.65rem 0 0.3rem;
+  font-size: 1rem;
+}
+
+.steps p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.step-number {
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  color: var(--accent-ink);
+  font-weight: 800;
+}
+
+/* Forms ------------------------------------------------------------------- */
+
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 1.15rem 1.25rem 0.6rem;
+  margin: 0 0 1.25rem;
+  box-shadow: var(--shadow);
+}
+
+legend {
+  font-weight: 700;
+  padding-inline: 0.45rem;
 }
 
 form label {
   display: block;
-  margin-bottom: 0.9rem;
+  margin-bottom: 1.1rem;
   font-weight: 600;
 }
 
@@ -68,107 +215,256 @@ form textarea,
 form select {
   display: block;
   width: 100%;
-  margin-top: 0.3rem;
-  padding: 0.5rem 0.6rem;
+  margin-top: 0.35rem;
+  padding: 0.55rem 0.7rem;
   font: inherit;
   font-weight: 400;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
+form input::placeholder,
+form textarea::placeholder {
+  color: var(--text-muted);
+  opacity: 0.8;
 }
 
 .field-help {
   display: block;
-  margin-top: 0.35rem;
+  margin-top: 0.4rem;
   font-size: 0.85rem;
   font-weight: 400;
-  line-height: 1.4;
-  opacity: 0.78;
+  line-height: 1.45;
+  color: var(--text-muted);
 }
+
+/* Buttons ------------------------------------------------------------------ */
 
 .actions {
   display: flex;
-  gap: 0.6rem;
-  margin-top: 1rem;
+  gap: 0.65rem;
+  margin-top: 1.25rem;
+  flex-wrap: wrap;
 }
 
 button {
-  padding: 0.55rem 1.1rem;
+  padding: 0.6rem 1.2rem;
   font: inherit;
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  background: var(--accent);
-  color: white;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
   cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
 }
 
-button[type="button"]:not(:first-child) {
-  background: transparent;
-  color: inherit;
-  border-color: var(--border);
+button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  box-shadow: var(--shadow);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 button:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: wait;
 }
 
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
-select:focus-visible {
-  outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+select:focus-visible,
+summary:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent);
   outline-offset: 2px;
 }
 
-.error {
-  border: 1px solid var(--danger);
+/* Tonal buttons inside step cards. */
+.content-step-heading button,
+.content-step button[type="submit"],
+.diagnostic-status button {
+  background: color-mix(in srgb, var(--accent) 11%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+}
+
+.content-step-heading button:hover:not(:disabled),
+.content-step button[type="submit"]:hover:not(:disabled),
+.diagnostic-status button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+}
+
+.failure-control button {
+  background: transparent;
   color: var(--danger);
-  border-radius: 6px;
-  padding: 0.6rem 0.9rem;
-  margin-bottom: 1rem;
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 }
 
-.facts {
+.failure-control button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  border-color: var(--danger);
+}
+
+/* Errors ------------------------------------------------------------------- */
+
+.error {
   display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.45rem 1.2rem;
+  gap: 0.25rem;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-left: 4px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  border-radius: 10px;
+  padding: 0.8rem 1rem;
+  margin-bottom: 1.25rem;
 }
 
-.facts dt {
-  font-weight: 600;
-}
-
-.facts dd {
+.error p {
   margin: 0;
-  overflow-wrap: anywhere;
 }
 
-.facts ul {
-  margin: 0;
-  padding-left: 1.1rem;
+.error-title {
+  font-weight: 700;
+  color: var(--danger);
+}
+
+.error-code {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* Status view -------------------------------------------------------------- */
+
+.status-header h2 {
+  margin-bottom: 0.85rem;
 }
 
 .state {
-  font-size: 0.75rem;
+  font-size: 0.72rem;
+  font-weight: 700;
   vertical-align: middle;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 999px;
-  padding: 0.15rem 0.6rem;
+  padding: 0.18rem 0.65rem;
   margin-left: 0.5rem;
+  letter-spacing: 0.04em;
+}
+
+.state-ready {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
+  background: color-mix(in srgb, var(--ok) 9%, var(--surface));
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0 0 1rem;
+}
+
+.stat {
+  min-width: 8.5rem;
+  padding: 0.7rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+
+.stat dt {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.stat dd {
+  margin: 0.15rem 0 0;
+  font-size: 1.3rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.integrity {
+  margin: 0 0 1rem;
+  font-size: 0.92rem;
+}
+
+.integrity-unknown {
+  color: var(--text-muted);
+}
+
+.integrity-problems {
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-left: 4px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  border-radius: 10px;
+  padding: 0.8rem 1rem;
+}
+
+.integrity-problems p {
+  margin: 0 0 0.4rem;
 }
 
 .ok {
   color: var(--ok);
+  font-weight: 700;
 }
 
 .problems {
   color: var(--danger);
+  margin: 0;
+  padding-left: 1.2rem;
 }
 
+.next-step {
+  display: grid;
+  gap: 0.55rem;
+  justify-items: start;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  border-radius: 12px;
+  padding: 1.1rem 1.25rem;
+  margin: 0 0 1.25rem;
+  box-shadow: var(--shadow);
+}
+
+.next-step h3 {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-ink);
+}
+
+.next-step p {
+  margin: 0;
+  max-width: 62ch;
+}
+
+/* Diagnostic sections ------------------------------------------------------ */
+
 .diagnostics {
-  margin-top: 1.6rem;
-  padding-top: 1.35rem;
-  border-top: 1px solid var(--border);
+  margin-top: 1.25rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
 }
 
 .section-heading {
@@ -188,7 +484,19 @@ select:focus-visible {
 .diagnostic-group p {
   margin: 0.35rem 0 0;
   line-height: 1.45;
-  opacity: 0.78;
+  color: var(--text-muted);
+}
+
+.milestone {
+  font-size: 0.68rem;
+  font-weight: 600;
+  vertical-align: middle;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  margin-left: 0.4rem;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
 }
 
 .diagnostic-badge {
@@ -202,19 +510,29 @@ select:focus-visible {
 
 .diagnostic-complete {
   color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
 }
 
 .diagnostic-status {
   margin: 0;
-  padding: 0.8rem 0.95rem;
+  padding: 0.85rem 1rem;
   border: 1px solid var(--border);
   border-left-width: 4px;
-  border-radius: 6px;
+  border-radius: 8px;
   line-height: 1.5;
+}
+
+.diagnostic-status p {
+  margin: 0 0 0;
+}
+
+.diagnostic-status button {
+  margin-top: 0.75rem;
 }
 
 .diagnostic-pending {
   border-left-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 6%, var(--surface));
 }
 
 .diagnostics-grid {
@@ -224,10 +542,10 @@ select:focus-visible {
 }
 
 .diagnostic-group {
-  padding: 0.9rem;
+  padding: 0.95rem 1rem;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 3%, var(--surface));
 }
 
 .metric-list {
@@ -239,6 +557,8 @@ select:focus-visible {
 
 .metric-list dt {
   min-width: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
 }
 
 .metric-list dd {
@@ -258,10 +578,72 @@ select:focus-visible {
 
 .diagnostic-note {
   margin: 0.9rem 0 0;
-  font-size: 0.88rem;
+  font-size: 0.85rem;
   line-height: 1.45;
-  opacity: 0.82;
+  color: var(--text-muted);
 }
+
+.similarity-relations ol {
+  margin: 0.75rem 0 0;
+  padding-left: 1.2rem;
+}
+
+.similarity-relations li {
+  margin-bottom: 0.85rem;
+  line-height: 1.5;
+}
+
+.relation-code {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+/* Technical details -------------------------------------------------------- */
+
+.tech-details {
+  margin-top: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.tech-details summary {
+  padding: 0.9rem 1.15rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.tech-details[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.tech-details .facts {
+  padding: 1rem 1.15rem;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.45rem 1.2rem;
+  margin: 0;
+}
+
+.facts dt {
+  font-weight: 600;
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.facts ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+/* Content intelligence ------------------------------------------------------ */
 
 .visually-hidden {
   position: absolute;
@@ -284,15 +666,16 @@ select:focus-visible {
   margin-bottom: 0;
 }
 
-.content-error {
+.content-intelligence .error {
   margin-bottom: 0;
 }
 
 .content-run-control,
 .content-step {
-  padding: 1rem;
+  padding: 1rem 1.1rem;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 2%, var(--surface));
 }
 
 .content-run-control label,
@@ -306,10 +689,23 @@ select:focus-visible {
 .content-step input,
 .content-step textarea {
   width: 100%;
-  padding: 0.5rem 0.6rem;
+  padding: 0.55rem 0.7rem;
   font: inherit;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
+.content-run-control .field-help {
+  margin-top: 0.45rem;
+  margin-bottom: 0;
+}
+
+.step-description {
+  margin: 0.3rem 0 0.9rem;
+  line-height: 1.45;
+  color: var(--text-muted);
 }
 
 .content-step-heading {
@@ -329,7 +725,7 @@ select:focus-visible {
 .content-step-heading p {
   margin-top: 0.3rem;
   line-height: 1.4;
-  opacity: 0.78;
+  color: var(--text-muted);
 }
 
 .content-step-heading button {
@@ -346,6 +742,7 @@ select:focus-visible {
 
 .content-metrics dd {
   overflow-wrap: anywhere;
+  text-align: left;
 }
 
 .metric-pair {
@@ -361,6 +758,7 @@ select:focus-visible {
 .failure-control summary {
   cursor: pointer;
   font-weight: 600;
+  color: var(--text-muted);
 }
 
 .failure-control p {
@@ -403,9 +801,10 @@ select:focus-visible {
 }
 
 .search-results li {
-  padding: 0.75rem;
+  padding: 0.8rem;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
+  background: var(--surface);
 }
 
 .search-results h5 {
@@ -420,20 +819,24 @@ select:focus-visible {
 .search-snippet {
   padding: 0.55rem;
   border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
   white-space: pre-wrap;
   background: color-mix(in srgb, var(--accent) 5%, transparent);
 }
+
+/* Tables -------------------------------------------------------------------- */
 
 .table-scroll {
   max-width: 100%;
   margin-top: 1rem;
   overflow: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
+  background: var(--surface);
 }
 
 .table-scroll:focus-visible {
-  outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent);
   outline-offset: 2px;
 }
 
@@ -472,17 +875,15 @@ select:focus-visible {
   opacity: 0.72;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --danger: #fca5a5;
-    --ok: #86efac;
-    --warning: #fcd34d;
-  }
-}
+/* Responsive ---------------------------------------------------------------- */
 
-@media (max-width: 600px) {
+@media (max-width: 640px) {
   .shell {
     padding-inline: 1rem;
+  }
+
+  .steps {
+    grid-template-columns: 1fr;
   }
 
   .facts {
@@ -502,10 +903,6 @@ select:focus-visible {
     margin-top: 0.7rem;
   }
 
-  .actions {
-    flex-wrap: wrap;
-  }
-
   .content-step-heading,
   .input-action {
     display: grid;
@@ -522,5 +919,11 @@ select:focus-visible {
 
   .content-metrics dt:not(:first-child) {
     margin-top: 0.4rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
   }
 }

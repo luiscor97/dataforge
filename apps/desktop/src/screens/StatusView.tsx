@@ -1,10 +1,98 @@
-import type { ProjectStatus } from "../types";
+import type {
+  MediaRelationView,
+  ProjectStatus,
+  SimilarityRelationView,
+} from "../types";
 import { ContentIntelligenceView } from "./ContentIntelligenceView";
 
 const COUNT_FORMAT = new Intl.NumberFormat("es-ES");
+const SIZE_FORMAT = new Intl.NumberFormat("es-ES", {
+  maximumFractionDigits: 1,
+});
+const SIZE_UNITS = ["bytes", "KB", "MB", "GB", "TB", "PB"] as const;
+
+/** Readable labels for the engine's closed relation enums (presentation only). */
+const SIMILARITY_KIND_LABELS: Record<SimilarityRelationView["kind"], string> = {
+  LIKELY_VERSION: "Probable versión",
+  TRUNCATED_VARIANT: "Variante recortada",
+  RECOMPOSED_CONTENT: "Contenido recompuesto",
+  SIMILAR_CONTENT: "Contenido similar",
+};
+
+const MEDIA_RELATION_LABELS: Record<MediaRelationView["relation"], string> = {
+  IMAGE_PERCEPTUAL_MATCH: "Imágenes que coinciden",
+  AUDIO_ACOUSTIC_MATCH: "Audios que coinciden",
+  VIDEO_PERCEPTUAL_MATCH: "Vídeos que coinciden",
+};
 
 function formatCount(value: number): string {
   return COUNT_FORMAT.format(value);
+}
+
+function formatBytes(value: number): string {
+  let scaled = value;
+  let unit = 0;
+  while (scaled >= 1000 && unit < SIZE_UNITS.length - 1) {
+    scaled /= 1000;
+    unit += 1;
+  }
+  return `${SIZE_FORMAT.format(scaled)} ${SIZE_UNITS[unit]}`;
+}
+
+type NextAction = "refresh" | "similarity" | "media" | null;
+
+interface NextStep {
+  message: string;
+  action: NextAction;
+}
+
+/**
+ * Derives the suggested next step from the same DTO conditions that the
+ * sections below already present. It only points at actions the facade
+ * offers; the shell never decides on its own.
+ */
+function deriveNextStep(status: ProjectStatus): NextStep {
+  if (status.integrity !== null && status.integrity.problems.length > 0) {
+    return {
+      message:
+        "La comprobación de integridad ha encontrado problemas. Revísalos más arriba antes de continuar.",
+      action: null,
+    };
+  }
+  if (status.latest_snapshot_id === null) {
+    return {
+      message:
+        "Todavía no hay un análisis completado de tus carpetas. Actualiza el estado para comprobar si hay novedades.",
+      action: "refresh",
+    };
+  }
+  const diagnostics = status.structural_diagnostics;
+  if (diagnostics === null || !diagnostics.analysis_complete) {
+    return {
+      message:
+        "El análisis estructural está pendiente o en marcha. Actualiza el estado para ver si ya ha terminado.",
+      action: "refresh",
+    };
+  }
+  if (status.similarity === null) {
+    return {
+      message:
+        "El análisis estructural ha terminado. Ahora puedes buscar versiones y contenidos parecidos entre tus archivos.",
+      action: "similarity",
+    };
+  }
+  if (status.media === null) {
+    return {
+      message:
+        "Ya tienes la evidencia de similitud. Ahora puedes analizar fotos, audio y vídeo.",
+      action: "media",
+    };
+  }
+  return {
+    message:
+      "Los análisis principales están completos. Revisa la evidencia de cada sección o busca dentro del contenido más abajo.",
+    action: null,
+  };
 }
 
 interface StatusViewProps {
@@ -27,103 +115,102 @@ export function StatusView({
   const diagnostics = status.structural_diagnostics ?? null;
   const similarity = status.similarity ?? null;
   const media = status.media ?? null;
+  const nextStep = deriveNextStep(status);
 
   return (
-    <section className="panel">
-      <h2>
-        {status.name}{" "}
-        <span className={`state state-${status.state.toLowerCase()}`}>
-          {status.state}
-        </span>
-      </h2>
-      <dl className="facts">
-        <dt>Identificador</dt>
-        <dd>
-          <code>{status.project_id}</code>
-        </dd>
-        <dt>Perfil</dt>
-        <dd>{status.profile}</dd>
-        <dt>Creado</dt>
-        <dd>{status.created_at}</dd>
-        <dt>Actualizado</dt>
-        <dd>{status.updated_at}</dd>
-        <dt>Carpeta</dt>
-        <dd>
-          <code>{status.project_dir}</code>
-        </dd>
-        <dt>Salida</dt>
-        <dd>
-          <code>{status.output_root}</code>
-        </dd>
-        <dt>Auditoría</dt>
-        <dd>
-          <code>{status.audit_root}</code>
-        </dd>
-        <dt>Orígenes</dt>
-        <dd>
-          {status.source_roots.length === 0 ? (
-            "(ninguno registrado)"
-          ) : (
-            <ul>
-              {status.source_roots.map((root) => (
-                <li key={root.id}>
-                  <code>{root.absolute_path}</code> — {root.filesystem}, solo
-                  lectura
-                </li>
-              ))}
-            </ul>
+    <section className="panel status-view">
+      <div className="status-header">
+        <h2>
+          {status.name}{" "}
+          <span className={`state state-${status.state.toLowerCase()}`}>
+            {status.state}
+          </span>
+        </h2>
+      </div>
+
+      {status.inventory !== null && (
+        <dl className="stats" aria-label="Resumen del último inventario">
+          <div className="stat">
+            <dt>Archivos</dt>
+            <dd>{formatCount(status.inventory.files)}</dd>
+          </div>
+          <div className="stat">
+            <dt>Carpetas</dt>
+            <dd>{formatCount(status.inventory.folders)}</dd>
+          </div>
+          <div className="stat">
+            <dt>Tamaño total</dt>
+            <dd>{formatBytes(status.inventory.bytes)}</dd>
+          </div>
+          {status.inventory.hash_pending > 0 && (
+            <div className="stat">
+              <dt>Huellas pendientes</dt>
+              <dd className="metric-warning">
+                {formatCount(status.inventory.hash_pending)}
+              </dd>
+            </div>
           )}
-        </dd>
-        {status.latest_snapshot_id !== null && status.inventory !== null && (
-          <>
-            <dt>Snapshot</dt>
-            <dd>
-              <code>{status.latest_snapshot_id}</code>
-            </dd>
-            <dt>Inventario</dt>
-            <dd>
-              {status.inventory.files} archivo(s), {status.inventory.folders}{" "}
-              carpeta(s), {status.inventory.bytes} byte(s),{" "}
-              {status.inventory.scan_errors} error(es),{" "}
-              {status.inventory.reparse_points} enlace(s) no seguido(s)
-            </dd>
-            <dt>Hashing</dt>
-            <dd>
-              {status.inventory.hash_done} completado(s),{" "}
-              {status.inventory.hash_pending} pendiente(s),{" "}
-              {status.inventory.hash_failed} fallido(s),{" "}
-              {status.inventory.hash_source_changed} con origen modificado
-            </dd>
-          </>
+        </dl>
+      )}
+
+      {status.integrity === null ? (
+        <p className="integrity integrity-unknown">
+          Integridad del proyecto: sin comprobar todavía. Se comprueba cada vez
+          que actualizas el estado.
+        </p>
+      ) : status.integrity.problems.length === 0 ? (
+        <p className="integrity integrity-ok">
+          <span className="ok">Integridad correcta</span>: base de datos, claves
+          y registro de eventos verificados.
+        </p>
+      ) : (
+        <div className="integrity integrity-problems">
+          <p>
+            <strong>Problemas de integridad detectados:</strong>
+          </p>
+          <ul className="problems">
+            {status.integrity.problems.map((problem) => (
+              <li key={problem}>{problem}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="next-step">
+        <h3>Siguiente paso</h3>
+        <p>{nextStep.message}</p>
+        {nextStep.action === "refresh" && (
+          <button
+            type="button"
+            className="primary"
+            onClick={onRefresh}
+            disabled={busy}
+          >
+            {busy ? "Comprobando…" : "Actualizar estado"}
+          </button>
         )}
-        <dt>Ledger</dt>
-        <dd>
-          {status.event_count} evento(s)
-          {status.last_event !== null && (
-            <>
-              {" — último "}
-              <code>{status.last_event.event_type}</code> (
-              {status.last_event.timestamp}, {status.last_event.actor})
-            </>
-          )}
-        </dd>
-        <dt>Integridad</dt>
-        <dd>
-          {status.integrity === null ? (
-            "sin comprobar (usa Actualizar para ejecutar la verificación)"
-          ) : status.integrity.problems.length === 0 ? (
-            <span className="ok">
-              correcta: base de datos, claves foráneas, migraciones y ledger
-            </span>
-          ) : (
-            <ul className="problems">
-              {status.integrity.problems.map((problem) => (
-                <li key={problem}>{problem}</li>
-              ))}
-            </ul>
-          )}
-        </dd>
-      </dl>
+        {nextStep.action === "similarity" && (
+          <button
+            type="button"
+            className="primary"
+            onClick={onAnalyzeSimilarity}
+            disabled={busy || onAnalyzeSimilarity === undefined}
+          >
+            {busy ? "Analizando similitud…" : "Analizar similitud y versiones"}
+          </button>
+        )}
+        {nextStep.action === "media" && (
+          <button
+            type="button"
+            className="primary"
+            onClick={onAnalyzeMedia}
+            disabled={busy || onAnalyzeMedia === undefined}
+          >
+            {busy ? "Analizando medios…" : "Analizar imagen, audio y vídeo"}
+          </button>
+        )}
+      </div>
+
       <section
         className="diagnostics"
         aria-labelledby="structural-diagnostics-heading"
@@ -131,11 +218,11 @@ export function StatusView({
         <div className="section-heading">
           <div>
             <h3 id="structural-diagnostics-heading">
-              Diagnóstico estructural M0.2
+              Diagnóstico estructural <span className="milestone">M0.2</span>
             </h3>
             <p>
-              Evidencia sobre contextos, árboles repetidos y reglas aplicadas al
-              último snapshot.
+              Qué carpetas se repiten, cuáles están protegidas y qué reglas se
+              aplicaron en el último análisis.
             </p>
           </div>
           {diagnostics?.analysis_complete === true && (
@@ -258,13 +345,16 @@ export function StatusView({
           </>
         )}
       </section>
+
       <section className="diagnostics" aria-labelledby="similarity-heading">
         <div className="section-heading">
           <div>
-            <h3 id="similarity-heading">Similitud y versiones M0.3</h3>
+            <h3 id="similarity-heading">
+              Similitud y versiones <span className="milestone">M0.3</span>
+            </h3>
             <p>
-              Relaciones entre contenidos distintos respaldadas por chunks
-              compartidos.
+              Archivos que comparten gran parte de su contenido: posibles
+              versiones o copias parciales.
             </p>
           </div>
           {similarity !== null && (
@@ -281,8 +371,8 @@ export function StatusView({
           <div className="diagnostic-status diagnostic-pending" role="status">
             <p>
               {diagnostics?.analysis_complete === true
-                ? "Pendiente: ejecuta el análisis de similitud sobre el snapshot ya analizado."
-                : "Pendiente: primero debe terminar el análisis estructural M0.2."}
+                ? "Aún no se ha ejecutado. Pulsa el botón cuando quieras: no modifica tus archivos."
+                : "Pendiente: primero debe terminar el análisis estructural."}
             </p>
             {diagnostics?.analysis_complete === true && (
               <button
@@ -357,7 +447,8 @@ export function StatusView({
                   <ol>
                     {similarity.relationships.map((relation) => (
                       <li key={relation.id}>
-                        <strong>{relation.kind}</strong> —{" "}
+                        <strong>{SIMILARITY_KIND_LABELS[relation.kind]}</strong>{" "}
+                        <code className="relation-code">{relation.kind}</code> —{" "}
                         {(relation.similarity * 100).toFixed(1)}%
                         <br />
                         <code>{relation.path_a}</code>
@@ -389,13 +480,16 @@ export function StatusView({
           </>
         )}
       </section>
+
       <section className="diagnostics" aria-labelledby="media-heading">
         <div className="section-heading">
           <div>
-            <h3 id="media-heading">Inteligencia multimedia M0.5</h3>
+            <h3 id="media-heading">
+              Inteligencia multimedia <span className="milestone">M0.5</span>
+            </h3>
             <p>
-              Huellas perceptuales de imagen, audio y vídeo para detectar
-              rediciones del mismo material.
+              Fotos, audios y vídeos que parecen ser el mismo material aunque el
+              archivo sea distinto.
             </p>
           </div>
           {media !== null && (
@@ -412,8 +506,8 @@ export function StatusView({
           <div className="diagnostic-status diagnostic-pending" role="status">
             <p>
               {diagnostics?.analysis_complete === true
-                ? "Pendiente: ejecuta el análisis multimedia sobre el snapshot ya analizado."
-                : "Pendiente: primero debe terminar el análisis estructural M0.2."}
+                ? "Aún no se ha ejecutado. Pulsa el botón cuando quieras: no modifica tus archivos."
+                : "Pendiente: primero debe terminar el análisis estructural."}
             </p>
             {diagnostics?.analysis_complete === true && (
               <button
@@ -477,8 +571,13 @@ export function StatusView({
                   <ol>
                     {media.relations.map((relation) => (
                       <li key={`${relation.content_a}-${relation.content_b}`}>
-                        <strong>{relation.relation}</strong> —{" "}
-                        {(relation.score_millionths / 10_000).toFixed(1)}%
+                        <strong>
+                          {MEDIA_RELATION_LABELS[relation.relation]}
+                        </strong>{" "}
+                        <code className="relation-code">
+                          {relation.relation}
+                        </code>{" "}
+                        — {(relation.score_millionths / 10_000).toFixed(1)}%
                         <br />
                         <code>{relation.path_a ?? relation.content_a}</code>
                         <br />
@@ -504,10 +603,90 @@ export function StatusView({
           </>
         )}
       </section>
+
       <ContentIntelligenceView projectDir={status.project_dir} />
+
+      <details className="tech-details">
+        <summary>Detalles técnicos del proyecto</summary>
+        <dl className="facts">
+          <dt>Identificador</dt>
+          <dd>
+            <code>{status.project_id}</code>
+          </dd>
+          <dt>Perfil</dt>
+          <dd>{status.profile}</dd>
+          <dt>Versión de la app</dt>
+          <dd>{status.app_version}</dd>
+          <dt>Creado</dt>
+          <dd>{status.created_at}</dd>
+          <dt>Actualizado</dt>
+          <dd>{status.updated_at}</dd>
+          <dt>Carpeta del proyecto</dt>
+          <dd>
+            <code>{status.project_dir}</code>
+          </dd>
+          <dt>Carpeta de resultados</dt>
+          <dd>
+            <code>{status.output_root}</code>
+          </dd>
+          <dt>Carpeta de auditoría</dt>
+          <dd>
+            <code>{status.audit_root}</code>
+          </dd>
+          <dt>Orígenes</dt>
+          <dd>
+            {status.source_roots.length === 0 ? (
+              "(ninguno registrado)"
+            ) : (
+              <ul>
+                {status.source_roots.map((root) => (
+                  <li key={root.id}>
+                    <code>{root.absolute_path}</code> — {root.filesystem}, solo
+                    lectura
+                  </li>
+                ))}
+              </ul>
+            )}
+          </dd>
+          {status.latest_snapshot_id !== null && status.inventory !== null && (
+            <>
+              <dt>Snapshot</dt>
+              <dd>
+                <code>{status.latest_snapshot_id}</code>
+              </dd>
+              <dt>Inventario</dt>
+              <dd>
+                {status.inventory.files} archivo(s), {status.inventory.folders}{" "}
+                carpeta(s), {status.inventory.bytes} byte(s),{" "}
+                {status.inventory.scan_errors} error(es),{" "}
+                {status.inventory.reparse_points} enlace(s) no seguido(s)
+              </dd>
+              <dt>Hashing</dt>
+              <dd>
+                {status.inventory.hash_done} completado(s),{" "}
+                {status.inventory.hash_pending} pendiente(s),{" "}
+                {status.inventory.hash_failed} fallido(s),{" "}
+                {status.inventory.hash_source_changed} con origen modificado
+              </dd>
+            </>
+          )}
+          <dt>Registro de eventos</dt>
+          <dd>
+            {status.event_count} evento(s)
+            {status.last_event !== null && (
+              <>
+                {" — último "}
+                <code>{status.last_event.event_type}</code> (
+                {status.last_event.timestamp}, {status.last_event.actor})
+              </>
+            )}
+          </dd>
+        </dl>
+      </details>
+
       <div className="actions">
         <button type="button" onClick={onRefresh} disabled={busy}>
-          {busy ? "Comprobando…" : "Actualizar estado e integridad"}
+          {busy ? "Comprobando…" : "Actualizar estado"}
         </button>
         <button type="button" onClick={onBack} disabled={busy}>
           Volver
