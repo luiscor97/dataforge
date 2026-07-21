@@ -41,6 +41,13 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   `<label>`, errores en `role="alert"`, diagnósticos con `role="status"`/
   `aria-live`, y `<main aria-busy>` durante operaciones asíncronas. Pase con
   lector de pantalla real y axe en CI quedan como refuerzo de release.
+- Fuzzing de los parsers de entrada no confiable (`fuzz/`, cargo-fuzz +
+  libFuzzer): cuatro dianas que fijan la invariante «parsear nunca entra en
+  pánico» sobre el token de fingerprint (ADR-0019), el blob de ruta raw
+  (ADR-0020), el frame del worker de extracción (ADR-0031) y la ruta relativa
+  segura (ADR-0017). Es un workspace propio (nightly + libFuzzer) fuera del
+  build stable; el job de CI `Fuzz targets (experimental M0.9)` los compila y
+  hace una pasada corta de cada uno en ubuntu (`continue-on-error`).
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 

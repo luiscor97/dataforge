@@ -30,3 +30,8 @@ Desktop.ini
 
 # Generated synthetic corpora (regenerable from seed; never versioned)
 fixtures/generated-large/
+
+# cargo-fuzz working data
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

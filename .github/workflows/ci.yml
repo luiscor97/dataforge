@@ -38,6 +38,41 @@ jobs:
       - name: Tests (platform-neutral subset)
         run: cargo test --workspace --exclude dataforge-desktop
 
+  # M0.9 (experimental): fuzz the untrusted-input parsers with libFuzzer.
+  # Allowed to fail while the harnesses mature; a discovered panic is visible
+  # evidence, never a silent gap and never a gate. Needs nightly + libFuzzer,
+  # so it only runs on Linux and lives in its own workspace (crates/fuzz).
+  fuzz:
+    name: Fuzz targets (experimental M0.9)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build every fuzz target
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+
+      - name: Smoke-run each target (short)
+        working-directory: fuzz
+        run: |
+          for target in fingerprint_parse raw_path_from_blob \
+                        extract_worker_response safe_relative_path; do
+            echo "::group::fuzz $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=20 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+
   rust:
     name: Rust (fmt, clippy, tests, build)
     runs-on: windows-latest

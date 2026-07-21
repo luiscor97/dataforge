@@ -1,0 +1,49 @@
+# Independent workspace: cargo-fuzz needs nightly + libFuzzer, so this crate
+# is deliberately excluded from the stable parent workspace build.
+[workspace]
+
+[package]
+name = "dataforge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+df-domain = { path = "../crates/df-domain" }
+df-extract = { path = "../crates/df-extract" }
+df-fs-safety = { path = "../crates/df-fs-safety" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fingerprint_parse"
+path = "fuzz_targets/fingerprint_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_path_from_blob"
+path = "fuzz_targets/raw_path_from_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_worker_response"
+path = "fuzz_targets/extract_worker_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safe_relative_path"
+path = "fuzz_targets/safe_relative_path.rs"
+test = false
+doc = false
+bench = false
