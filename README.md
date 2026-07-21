@@ -9,18 +9,18 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
-**Estado actual: Milestone 0.9 — Stabilization (en curso), sobre los cierres
-de M0.2–M0.8.** El pipeline completo llega de la carpeta caótica a una copia
-verificada — probado hasta **1.000.000 de archivos** con verificación
-independiente `COMPLETED` — e incluye inteligencia documental y multimedia,
-plugins WASM, IA asistida BYOK, snapshots incrementales y NAS endurecido.
-M0.9 congela contratos con test de regresión, consolida el threat model,
-añade fuzzing de los parsers de entrada no confiable, SBOM reproducible,
-manual de usuario y el mapa de aceptación hacia 1.0
-([estado detallado](docs/roadmap/m1.0-implementation-matrix.md)).
+**Estado actual: 1.0.0 — Milestone 1.0 "Stable Reconstruction Platform".**
+El pipeline completo llega de la carpeta caótica a una copia verificada —
+probado hasta **1.000.000 de archivos** con verificación independiente
+`COMPLETED` — e incluye inteligencia documental y multimedia, plugins WASM,
+IA asistida BYOK, snapshots incrementales y NAS endurecido. Los contratos
+públicos (schemas, algoritmos, ABI, 19 migraciones) están congelados bajo
+test de regresión; el mapa garantía→evidencia de la release vive en
+[docs/release/m1.0-acceptance.md](docs/release/m1.0-acceptance.md).
 
-DataForge **no está listo para producción general**. Lo que hay hoy es una
-**copia segura, explicable y verificable**: inventaría un origen sin tocarlo,
+La 1.0 es **Windows-first y de alcance declarado** — no una promesa de
+producción universal. Lo que hay es una **copia segura, explicable y
+verificable**: inventaría un origen sin tocarlo,
 detecta relaciones estructurales y versiones binarias acotadas, extrae e
 indexa contenido documental, propone un plan conservador y audita cada
 decisión. No reconstruye automáticamente expedientes por significado ni deja

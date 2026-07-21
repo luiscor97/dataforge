@@ -6,7 +6,7 @@
     "component": {
       "type": "application",
       "name": "dataforge",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "description": "Local-first, verifiable document reconstruction engine"
     },
     "tools": [
@@ -2596,7 +2596,7 @@
     {
       "type": "library",
       "name": "dataforge-cli",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "DataForge command line interface",
       "licenses": [
@@ -2614,7 +2614,7 @@
     {
       "type": "library",
       "name": "dataforge-desktop",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "DataForge Desktop — Tauri 2 shell over df-facade",
       "licenses": [
@@ -3335,7 +3335,7 @@
     {
       "type": "library",
       "name": "df-ai",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3352,7 +3352,7 @@
     {
       "type": "library",
       "name": "df-corpus",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Deterministic synthetic corpus generator and full-pipeline scale test (RFC-0001 §40, M0.1 acceptance criteria 1 and 10)",
       "licenses": [
@@ -3370,7 +3370,7 @@
     {
       "type": "library",
       "name": "df-db",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "SQLite persistence for DataForge: migrations, repositories and integrity checks",
       "licenses": [
@@ -3388,7 +3388,7 @@
     {
       "type": "library",
       "name": "df-domain",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Domain model of the DataForge engine: typed IDs, entities and the project state machine",
       "licenses": [
@@ -3406,7 +3406,7 @@
     {
       "type": "library",
       "name": "df-error",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Shared typed errors for the DataForge engine",
       "licenses": [
@@ -3424,7 +3424,7 @@
     {
       "type": "library",
       "name": "df-executor",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Transactional execution of approved plans: partial files, streamed hashes, atomic finalize (RFC-0001 §27)",
       "licenses": [
@@ -3442,7 +3442,7 @@
     {
       "type": "library",
       "name": "df-extract",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3459,7 +3459,7 @@
     {
       "type": "library",
       "name": "df-extract-worker",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Resource-isolated PDF parser process for DataForge",
       "licenses": [
@@ -3477,7 +3477,7 @@
     {
       "type": "library",
       "name": "df-facade",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Stable local API of the DataForge engine; every client (CLI, desktop) goes through this crate",
       "licenses": [
@@ -3495,7 +3495,7 @@
     {
       "type": "library",
       "name": "df-fs-safety",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Safe filesystem boundary for DataForge: reparse-aware path resolution, physical identity and no-replace finalization",
       "licenses": [
@@ -3513,7 +3513,7 @@
     {
       "type": "library",
       "name": "df-hash",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Content identity: streaming BLAKE3 + SHA-256 with fingerprint invalidation and a resumable job queue",
       "licenses": [
@@ -3531,7 +3531,7 @@
     {
       "type": "library",
       "name": "df-ledger",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Hash-chained audit ledger primitives for DataForge (RFC-0001 §29)",
       "licenses": [
@@ -3549,7 +3549,7 @@
     {
       "type": "library",
       "name": "df-media",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3566,7 +3566,7 @@
     {
       "type": "library",
       "name": "df-media-worker",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3583,7 +3583,7 @@
     {
       "type": "library",
       "name": "df-planner",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Analysis and planning: duplicate sets, full-coverage plans, canonical approval (RFC-0001 §26)",
       "licenses": [
@@ -3601,7 +3601,7 @@
     {
       "type": "library",
       "name": "df-plugin",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3618,7 +3618,7 @@
     {
       "type": "library",
       "name": "df-process-safety",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3635,7 +3635,7 @@
     {
       "type": "library",
       "name": "df-query",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3652,7 +3652,7 @@
     {
       "type": "library",
       "name": "df-query-worker",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3669,7 +3669,7 @@
     {
       "type": "library",
       "name": "df-scan",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Safe inventory scanner: walks source roots read-only and persists snapshots",
       "licenses": [
@@ -3687,7 +3687,7 @@
     {
       "type": "library",
       "name": "df-search",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "licenses": [
         {
@@ -3704,7 +3704,7 @@
     {
       "type": "library",
       "name": "df-similarity",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Bounded, streaming content-defined chunking and similarity evidence",
       "licenses": [
@@ -3722,7 +3722,7 @@
     {
       "type": "library",
       "name": "df-verifier",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "scope": "required",
       "description": "Independent verification of executed plans: hashes, coverage, partials, untracked files, origin integrity (RFC-0001 §28)",
       "licenses": [
