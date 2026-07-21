@@ -202,7 +202,7 @@ test("renders sealed M0.3 version evidence without implying an automatic action"
     },
   });
 
-  assert.match(markup, /Similitud y versiones M0\.3/);
+  assert.match(markup, /Similitud y versiones/);
   assert.match(markup, /role="status">Evidencia sellada/);
   assert.match(markup, /LIKELY_VERSION/);
   assert.match(markup, /87\.5%/);
@@ -246,7 +246,7 @@ test("renders sealed M0.5 media evidence without implying an automatic action", 
     },
   });
 
-  assert.match(markup, /Inteligencia multimedia M0\.5/);
+  assert.match(markup, /Inteligencia multimedia/);
   assert.match(markup, /role="status">Evidencia sellada/);
   assert.match(markup, /IMAGE_PERCEPTUAL_MATCH/);
   assert.match(markup, /96\.9%/);
@@ -262,9 +262,9 @@ test("keeps the media diagnosis pending until structural analysis completes", ()
     latest_snapshot_id: "snapshot-1",
   });
 
-  assert.match(markup, /Inteligencia multimedia M0\.5/);
+  assert.match(markup, /Inteligencia multimedia/);
   assert.match(
     markup,
-    /Pendiente: primero debe terminar el análisis estructural M0\.2/,
+    /Pendiente: primero debe terminar el análisis estructural/,
   );
 });
