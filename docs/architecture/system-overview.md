@@ -1,6 +1,6 @@
 # DataForge — visión general del sistema
 
-Estado del documento: refleja M0.2–M0.4 implementados localmente. La
+Estado del documento: refleja M0.2–M0.8 implementados y M0.9 en curso. La
 arquitectura objetivo completa está en
 [RFC-0001 §7](../rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
@@ -57,6 +57,18 @@ versionados hacia `df-extract-worker` y `df-query-worker`; `df-process-safety`
 los limita con primitivas del sistema operativo. SQLite conserva toda evidencia
 canónica; Tantivy y Parquet son artefactos derivados reconstruibles.
 
+M0.5–M0.7 siguen el mismo patrón detrás de la fachada: `df-media` extrae
+metadata multimedia acotada en `df-media-worker` (imagen) y FFmpeg opcional
+(audio/vídeo), siempre como evidencia solo-revisión; `df-plugin` ejecuta
+plugins WASM (Wasmtime sin WASI ni filesystem por defecto) desde un registro
+persistido cuyo hash y firma se re-verifican en cada carga; `df-ai` define
+peticiones/respuestas puras y `df-facade` aloja los únicos transportes de
+red (Anthropic/OpenAI) — la clave vive en el Credential Manager del usuario
+y cada invocación exige consentimiento por digest. M0.8 añade snapshots
+incrementales (reuso solo con fingerprint v2 byte-idéntico y completo) y la
+clasificación real del filesystem en `df-fs-safety`, con gate de destino
+degradado en el executor.
+
 ## Reglas de dependencia
 
 - `df-domain` es puro: no hace I/O ni SQL.
@@ -101,7 +113,12 @@ Las migraciones son aditivas y sus checksums se verifican en cada apertura:
 - `0013`: runs de similitud, chunks/membresías, MinHash/LSH, candidatos y
   relaciones de contenido selladas;
 - `0014`: runs de extracción, representaciones/segmentos, correo, adjuntos,
-  entradas ZIP virtuales e índices/snapshots derivados registrados.
+  entradas ZIP virtuales e índices/snapshots derivados registrados;
+- `0015`: índice de la cola de hash reanudable;
+- `0016`: runs multimedia, metadata acotada y relaciones solo-revisión;
+- `0017`: registro de plugins, capacidades y runs sellados;
+- `0018`: auditoría de asistencias de IA (consentimiento, digest, modelo);
+- `0019`: procedencia de bindings reusados por snapshots incrementales.
 
 Los hechos automáticos de `0010` usan ids derivados estables e inserciones
 idempotentes. `0011` impide insertarlos, modificarlos o borrarlos una vez
@@ -232,12 +249,17 @@ un protocolo de coordinación distribuida entre varios escritores.
 
 ## Límites explícitos
 
-M0.4 extrae e indexa documentos, pero no interpreta su significado ni
-reconstruye automáticamente asuntos o expedientes. Sus textos son derivados;
-las relaciones M0.3 proceden de chunks binarios y fechas y las de M0.2 de
-hashes exactos, estructura y marcadores de nombre. Los límites pueden omitir
-contenido/relaciones y ninguna evidencia autoriza consolidar archivos o ramas.
+La extracción, la metadata multimedia, las sugerencias de plugins y las
+explicaciones de IA son evidencia derivada, no comprensión semántica: nada
+reconstruye automáticamente asuntos o expedientes. Las relaciones M0.3
+proceden de chunks binarios y fechas y las de M0.2 de hashes exactos,
+estructura y marcadores de nombre. Los límites pueden omitir
+contenido/relaciones y ninguna evidencia (ni humana asistida por IA sin
+decisión explícita) autoriza consolidar archivos o ramas.
 
-Las garantías de escritura segura siguen siendo Windows-first; NAS/UNC es
-experimental. Véase
-[Modelo de amenazas de filesystem](../threat-model/filesystem-hardening.md).
+Las garantías de escritura segura siguen siendo Windows-first: en POSIX la
+ejecución se bloquea y la CI de Linux es experimental. NAS/UNC está
+clasificado y con gate explícito (ADR-0036), pero sin identidad física la
+detección de sustituciones es degradada por naturaleza. Véase
+[Modelo de amenazas de filesystem](../threat-model/filesystem-hardening.md)
+y [threat model consolidado](../threat-model/initial.md).

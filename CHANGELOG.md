@@ -48,18 +48,24 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   segura (ADR-0017). Es un workspace propio (nightly + libFuzzer) fuera del
   build stable; el job de CI `Fuzz targets (experimental M0.9)` los compila y
   hace una pasada corta de cada uno en ubuntu (`continue-on-error`).
-- Builds reproducibles (`docs/release/reproducible-builds.md`): dependencias
-  ancladas con `--locked`, sin timestamps embebidos, toolchain declarada, y
-  evidencia de rebuild determinista — los cuatro binarios de release son
-  byte-idénticos tras borrar `target/release` y recompilar desde cero. El
-  límite (independencia de ruta/máquina requiere `--remap-path-prefix` y
-  entorno canónico) queda documentado, no prometido.
+- Builds reproducibles (ADR-0038, `docs/release/reproducible-builds.md`):
+  un doble build limpio destapó que los binarios no eran byte-idénticos —
+  causa raíz verificada en la cabecera COFF: el linker rellena el
+  `TimeDateStamp` PE con la hora real. Fix: `/Brepro` vía
+  `.cargo/config.toml`, acotado a la toolchain MSVC de CI/release porque
+  los PE con timestamp a cero disparan heurísticas de Windows Defender en
+  máquinas de desarrollo (build scripts en cuarentena, os error 225 —
+  observado y documentado). Los límites (independencia de ruta/máquina
+  requiere `--remap-path-prefix` y entorno canónico) quedan documentados,
+  no prometidos.
 - Workflow de release (`.github/workflows/release.yml`): al empujar un tag
-  `v*` compila los cuatro binarios con `--locked`, publica checksums
-  SHA-256, re-genera el SBOM y **falla si difiere del versionado**, y crea
-  una release **en borrador** — publicar sigue siendo un acto humano
-  deliberado. La firma se insertará cuando se decida la vía (cosign o
-  certificado); el hueco está documentado en el workflow.
+  `v*` compila los cuatro binarios con `--locked`, **prueba la
+  reproducibilidad con un doble build limpio que bloquea la release si los
+  hashes difieren**, publica checksums SHA-256, re-genera el SBOM y falla
+  si difiere del versionado, y crea una release **en borrador** — publicar
+  sigue siendo un acto humano deliberado. Ensayable sin tag vía
+  `workflow_dispatch`. La firma se insertará cuando se decida la vía
+  (cosign o certificado); el hueco está documentado en el workflow.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
