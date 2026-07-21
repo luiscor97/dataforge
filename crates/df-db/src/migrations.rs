@@ -443,6 +443,73 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_database_has_every_migration_applied_and_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let applied: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied as usize, MIGRATIONS.len());
+        verify_applied(&db).expect("a fresh install verifies");
+    }
+
+    #[test]
+    fn a_database_missing_a_migration_re_applies_it_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.sqlite");
+        drop(Db::open(&path).unwrap());
+
+        // Simulate a database from a build that predates migration 18: drop
+        // the table it created (its triggers drop with it) and forget the
+        // applied row. Re-opening with the full build must upgrade cleanly.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE assistance_audits;
+                 DELETE FROM schema_migrations WHERE version = 18;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).expect("an older database upgrades on open");
+        verify_applied(&db).expect("every migration is applied and verified");
+        let has_table: bool = db
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type='table' AND name='assistance_audits')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_table, "migration 18 was re-applied");
+    }
+
+    #[test]
+    fn a_drifted_checksum_is_rejected_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.sqlite");
+        drop(Db::open(&path).unwrap());
+
+        // A tampered stored checksum is silent schema drift: it must fail
+        // the next open, never open with an unknown schema.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE schema_migrations SET sha256 = ?1 WHERE version = 10",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        }
+
+        let opened = Db::open(&path);
+        assert!(opened.is_err(), "drift must be rejected");
+        let err = opened.err().unwrap();
+        assert!(err.to_string().contains("drift"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn migration_versions_are_strictly_increasing() {
         let mut previous = 0;
         for migration in MIGRATIONS {

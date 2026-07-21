@@ -24,7 +24,7 @@ pub use types::{
     CloudConsentToken, ConfidenceScore, DisclosedField, DisclosureManifest, EvidenceInput,
     ExecutionStatus, FailureCode, LocalRisk, ProviderDescriptor, ProviderKind, RedactionConfig,
     RedactionKind, RedactionRecord, RiskScore, ValidatedSuggestion, AUDIT_SCHEMA_VERSION,
-    DISCLOSURE_SCHEMA_VERSION, PROMPT_VERSION,
+    DISCLOSURE_SCHEMA_VERSION, PROMPT_VERSION, REQUEST_SCHEMA_VERSION,
 };
 
 #[cfg(test)]

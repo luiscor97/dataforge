@@ -5,6 +5,38 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Milestone 0.9 — Stabilization (en progreso)
+
+#### Añadido
+
+- Contratos congelados (ADR-0037): el test `df-facade::frozen_contracts`
+  fija en un único lugar toda versión de schema, algoritmo y ABI, más el
+  número y orden de las 19 migraciones, y falla si algo cambia. Congelar
+  es subir versión + ADR, nunca editar in place. Se exponen como públicos
+  los identificadores de contrato `PROFILE_SCHEMA`/`PROFILE_SCHEMA_VERSION`
+  y `REQUEST_SCHEMA_VERSION`.
+- Compatibilidad de migraciones: tests que fijan que una instalación limpia
+  aplica y verifica las 19 migraciones, que una base de una build anterior
+  (a la que le falta una migración) se actualiza al abrir, y que un checksum
+  manipulado (deriva silenciosa de esquema) se rechaza al abrir.
+- Threat model final consolidado (`docs/threat-model/initial.md`): amplía la
+  tabla de amenazas y las propiedades de fallo cerrado a M0.5–M0.8 (medio
+  hostil aislado, plugin WASM sin WASI con registro firmado re-verificado,
+  IA con consentimiento por digest y claves fuera de la base, reuso
+  incremental solo con identidad física probada, destino degradado con
+  reconocimiento explícito).
+- Manual de usuario (`docs/manual/README.md`): guía completa de la CLI —
+  instalación, el flujo create→scan→hash→analyze→plan→approve→execute→verify,
+  informes, revisión, y las capacidades M0.3–M0.7 (similitud, contenido,
+  media, plugins, IA/BYOK), perfiles, incremental/NAS, códigos de salida y
+  las garantías de diseño. Enlazado desde el README.
+- SBOM CycloneDX 1.5 (`docs/sbom/dataforge.cdx.json`) generado por un script
+  determinista y reproducible (`scripts/generate-sbom.py`, solo cargo +
+  Python 3): 786 componentes (25 crates del workspace + transitivas ancladas
+  por `Cargo.lock`) con versión, licencia SPDX y PURL. Complementa a
+  `cargo audit`/`cargo deny`: el SBOM enumera, las auditorías juzgan
+  (`docs/sbom/README.md`). La firma queda como paso de release.
+
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
 #### Añadido

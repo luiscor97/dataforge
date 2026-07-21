@@ -140,6 +140,9 @@ Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadm
 
 ## Inicio rápido (Windows)
 
+> Guía completa de uso (todos los comandos, capacidades y garantías) en el
+> [Manual de usuario](docs/manual/README.md).
+
 ```powershell
 # 1. Preparar el entorno (idempotente; detecta lo ya instalado)
 powershell -ExecutionPolicy Bypass -File scripts/bootstrap-windows.ps1

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 pub const PROMPT_VERSION: &str = "dataforge.assisted-intelligence-prompt/0.7.0";
 pub const DISCLOSURE_SCHEMA_VERSION: &str = "dataforge.ai-disclosure/0.7.0";
 pub const AUDIT_SCHEMA_VERSION: &str = "dataforge.ai-audit/0.7.0";
-pub(crate) const REQUEST_SCHEMA_VERSION: &str = "dataforge.ai-request/0.7.0";
+pub const REQUEST_SCHEMA_VERSION: &str = "dataforge.ai-request/0.7.0";
 pub(crate) const CONSENT_DOMAIN: &[u8] = b"DataForge cloud disclosure consent\0v1\0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

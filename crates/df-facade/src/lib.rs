@@ -3389,3 +3389,78 @@ mod tests {
         assert_eq!(search.hits[0].file_name, "brief.txt");
     }
 }
+
+/// Frozen contract inventory (M0.9, ADR-0037). Every versioned schema,
+/// algorithm, ABI and the migration chain is pinned here: this test fails
+/// if any of them changes. The policy is that a frozen version is bumped
+/// with a new value and an ADR, never edited in place — so a change that
+/// trips this test is either that deliberate bump (update the expectation
+/// in the same commit as the ADR) or an accident to revert.
+#[cfg(test)]
+mod frozen_contracts {
+    #[test]
+    fn schema_algorithm_and_abi_versions_are_frozen() {
+        // Persistence and profile contracts.
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 19, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
+        assert_eq!(df_db::migrations::MIGRATIONS[18].name, "incremental_reuse");
+        // Versions are unique and consecutive from 1.
+        for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
+            assert_eq!(migration.version, index as i64 + 1, "migration numbering");
+        }
+        assert_eq!(df_domain::PROFILE_SCHEMA, "dataforge.profile");
+        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "1.1.0");
+        assert_eq!(super::MARKER_SCHEMA_VERSION, "1.0.0");
+
+        // Similarity (M0.3).
+        assert_eq!(
+            df_similarity::ALGORITHM_FAMILY,
+            "fastcdc-v2020-l1-minhash-v1"
+        );
+
+        // Content intelligence (M0.4).
+        assert_eq!(df_extract::EXTRACTOR_VERSION, "0.2.0+content-v1");
+        assert_eq!(df_search::SEARCH_SCHEMA_VERSION, "m0.4-tantivy-v1");
+        assert_eq!(df_query::ANALYTICAL_SCHEMA_VERSION, "m0.4-parquet-v1");
+
+        // Media intelligence (M0.5).
+        assert_eq!(
+            df_media::ANALYSIS_CONTRACT_VERSION,
+            "dataforge.media-analysis.v1"
+        );
+        assert_eq!(df_media::IMAGE_ALGORITHM_VERSION, "dct-phash64-v1");
+        assert_eq!(
+            df_media::AUDIO_ALGORITHM_VERSION,
+            "rusty-chromaprint-0.3.0-test2-v1"
+        );
+        assert_eq!(df_media::VIDEO_ALGORITHM_VERSION, "sampled-dct-phash64-v1");
+
+        // Plugin ABI (M0.6).
+        assert_eq!(df_plugin::HOST_ABI_VERSION, "0.1.0");
+        assert_eq!(
+            df_plugin::MANIFEST_SCHEMA_VERSION,
+            "dataforge.plugin-manifest/0.1.0"
+        );
+        assert_eq!(
+            df_plugin::INPUT_SCHEMA_VERSION,
+            "dataforge.plugin-input/0.1.0"
+        );
+        assert_eq!(
+            df_plugin::OUTPUT_SCHEMA_ID,
+            "dataforge.plugin-findings/0.1.0"
+        );
+
+        // Assisted intelligence (M0.7).
+        assert_eq!(df_ai::REQUEST_SCHEMA_VERSION, "dataforge.ai-request/0.7.0");
+        assert_eq!(
+            df_ai::DISCLOSURE_SCHEMA_VERSION,
+            "dataforge.ai-disclosure/0.7.0"
+        );
+        assert_eq!(df_ai::AUDIT_SCHEMA_VERSION, "dataforge.ai-audit/0.7.0");
+        assert_eq!(df_ai::OUTPUT_SCHEMA_ID, "dataforge.ai-suggestions/0.7.0");
+        assert_eq!(
+            df_ai::PROMPT_VERSION,
+            "dataforge.assisted-intelligence-prompt/0.7.0"
+        );
+    }
+}

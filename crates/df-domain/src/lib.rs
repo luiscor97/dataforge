@@ -63,7 +63,10 @@ pub use plan::{
     PlanOperation, PlanStatus, RiskLevel,
 };
 pub use plugins::{PluginRun, PluginRunCounters, PluginRunStatus};
-pub use profile::{GenericMarker, Profile, ProtectedMarker, DEFAULT_PROFILE_ID};
+pub use profile::{
+    GenericMarker, Profile, ProtectedMarker, DEFAULT_PROFILE_ID, PROFILE_SCHEMA,
+    PROFILE_SCHEMA_VERSION,
+};
 pub use project::{ProfileRef, Project};
 pub use raw_path::RawPath;
 pub use similarity::{
