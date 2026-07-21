@@ -71,6 +71,49 @@ pub struct ExecuteOutcome {
     /// Project state after the run: `EXECUTED` when every operation reached
     /// a terminal state, `EXECUTION_PAUSED` when work remains.
     pub state: String,
+    /// Aggregated wall-clock per protocol stage across this run (M1.0.1).
+    /// Local-only diagnostics; never sampled per file beyond two `Instant`
+    /// reads per stage, so the overhead is nanoseconds against I/O costs.
+    pub stage_nanos: StageNanos,
+}
+
+/// Cumulative nanoseconds spent in each stage of the per-file execution
+/// protocol (RFC-0001 §27.1), plus the operation count they cover. The sum
+/// of stages is close to — but intentionally not exactly — the phase wall
+/// time: scheduling and batch queries live between stages.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct StageNanos {
+    /// Source fingerprint capture + manifest fingerprint parse/compare.
+    pub preflight_source: u64,
+    /// Safe destination resolution + source-root boundary validation.
+    pub resolve_destination: u64,
+    /// §27.3 collision decision (existence probe, re-hash when taken).
+    pub collision_check: u64,
+    /// Durable partial lease issuance (SQLite).
+    pub lease: u64,
+    /// Parent directory + create_new partial + open-handle identity capture.
+    pub create_partial: u64,
+    /// Durable ownership claim persistence (SQLite).
+    pub claim_persist: u64,
+    /// Streamed read+write+SHA-256+BLAKE3, excluding the durability sync.
+    pub copy_stream: u64,
+    /// `sync_all` before finalize (strict durability, §27.1).
+    pub sync_all: u64,
+    /// Post-copy source fingerprint capture + compare (§14.5).
+    pub post_fingerprint: u64,
+    /// Root boundary re-proof between copy and finalize.
+    pub revalidate_root: u64,
+    /// No-replace finalize rename on the claimed handle (ADR-0021).
+    pub finalize: u64,
+    /// Operation outcome persistence (SQLite).
+    pub persist_result: u64,
+    /// Operations these accumulators cover.
+    pub operations: u64,
+}
+
+/// Elapsed nanoseconds since `start`, saturated into a `u64`.
+fn nanos_since(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Execute the approved plan; resumable and cancellable.
@@ -144,6 +187,7 @@ pub fn execute_plan(
     let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut bytes_copied: u64 = 0;
     let mut cancelled = false;
+    let mut stages = StageNanos::default();
     'run: loop {
         let batch = plans::executable_operations(db, plan.id, options.operation_batch)?;
         // Operations already attempted in this run stay for the *next* run.
@@ -174,6 +218,7 @@ pub fn execute_plan(
             // A copy receives a fresh unpredictable partial lease in the same
             // durable update that marks it RUNNING. Directory operations do
             // not create partials and therefore carry no ownership token.
+            let lease_started = std::time::Instant::now();
             let partial_lease_token = match operation.operation_type {
                 OperationType::CreateDirectory => {
                     plans::mark_operation_running(db, operation.operation_id)?;
@@ -181,15 +226,20 @@ pub fn execute_plan(
                 }
                 _ => Some(plans::lease_copy_operation(db, operation.operation_id)?),
             };
+            stages.lease += nanos_since(lease_started);
             let outcome = run_operation(
                 db,
                 &safe_root,
                 &operation,
                 partial_lease_token.as_deref(),
                 options,
+                &mut stages,
             );
             bytes_copied += outcome.bytes_copied;
+            let persist_started = std::time::Instant::now();
             plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+            stages.persist_result += nanos_since(persist_started);
+            stages.operations += 1;
         }
     }
 
@@ -235,6 +285,7 @@ pub fn execute_plan(
         bytes_copied,
         cancelled,
         state: project.state.as_str().to_string(),
+        stage_nanos: stages,
     })
 }
 
@@ -271,6 +322,7 @@ fn run_operation(
     operation: &ExecutableOperation,
     partial_lease_token: Option<&str>,
     options: &ExecuteOptions,
+    stages: &mut StageNanos,
 ) -> OperationOutcome {
     let started_at = chrono::Utc::now();
 
@@ -287,7 +339,9 @@ fn run_operation(
                         "copy operation without a durable partial lease",
                     )
                 })
-                .and_then(|token| copy_file(db, safe_root, &relative, operation, token, options)),
+                .and_then(|token| {
+                    copy_file(db, safe_root, &relative, operation, token, options, stages)
+                }),
         },
         Err(error) => Err(OperationFailure::from_fs_safety(error)),
     };
@@ -482,6 +536,7 @@ fn reclaim_interrupted_partial(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_file(
     db: &Db,
     safe_root: &SafeOutputRoot,
@@ -489,7 +544,9 @@ fn copy_file(
     operation: &ExecutableOperation,
     partial_lease_token: &str,
     options: &ExecuteOptions,
+    stages: &mut StageNanos,
 ) -> Result<OperationOutcome, OperationFailure> {
+    let stage_started = std::time::Instant::now();
     validate_source_root(safe_root, operation)?;
     // Resolving proves the planned destination is reachable without crossing a
     // single link, and re-checks the output root's physical identity.
@@ -500,6 +557,7 @@ fn copy_file(
         .to_path_buf();
     let planned_destination = planned_destination.as_path();
     let source = source_path(operation)?;
+    stages.resolve_destination += nanos_since(stage_started);
     let expected_sha256 = operation.expected_sha256.as_deref().ok_or_else(|| {
         OperationFailure::fatal(
             OperationErrorCode::InvalidPath,
@@ -510,6 +568,7 @@ fn copy_file(
     // 1. Validate the source against the fingerprint frozen in the manifest
     // (§27.1). Parsed, not string-compared: a v1 token from an older snapshot
     // must not masquerade as a v2 match (ADR-0019).
+    let stage_started = std::time::Instant::now();
     let pre = current_fingerprint(&source)?;
     let approved = operation
         .source_fingerprint
@@ -534,8 +593,10 @@ fn copy_file(
             "source changed since the snapshot was taken (RFC-0001 §27.5)",
         ));
     }
+    stages.preflight_source += nanos_since(stage_started);
 
     // 2. Reserve the destination (§27.3): never overwrite.
+    let stage_started = std::time::Instant::now();
     let (relative, skip) = resolve_collision(
         safe_root,
         planned_relative,
@@ -543,6 +604,7 @@ fn copy_file(
         expected_sha256,
         options,
     )?;
+    stages.collision_check += nanos_since(stage_started);
     if skip {
         return Ok(OperationOutcome {
             execution_state: ExecutionState::Completed,
@@ -560,6 +622,7 @@ fn copy_file(
         });
     }
 
+    let stage_started = std::time::Instant::now();
     if let Some(parent) = relative.parent() {
         safe_root
             .create_directory_secure(&parent)
@@ -591,7 +654,9 @@ fn copy_file(
                 "filesystem did not provide a physical identity for the new partial",
             )
         })?;
+    stages.create_partial += nanos_since(stage_started);
     let stored_identity = format_partial_identity(partial_identity);
+    let stage_started = std::time::Instant::now();
     if let Err(error) = plans::claim_copy_partial(
         db,
         operation.operation_id,
@@ -607,8 +672,11 @@ fn copy_file(
             retain_partial_lease: false,
         });
     }
+    stages.claim_persist += nanos_since(stage_started);
+    let stage_started = std::time::Instant::now();
     let copy = stream_copy(&source, handle, options.copy_buffer_bytes)
         .map_err(|e| OperationFailure::from_io(&e, "copying"));
+    let copy_total = nanos_since(stage_started);
     let copy = match copy {
         Ok(copy) => copy,
         Err(failure) => {
@@ -620,6 +688,8 @@ fn copy_file(
             ));
         }
     };
+    stages.sync_all += copy.sync_nanos;
+    stages.copy_stream += copy_total.saturating_sub(copy.sync_nanos);
 
     // 6. Compare against the identity recorded at hash time (§27.1).
     if copy.sha256 != expected_sha256 {
@@ -639,6 +709,7 @@ fn copy_file(
     }
 
     // 7. The source must not have changed while we read it (§14.5).
+    let stage_started = std::time::Instant::now();
     match current_fingerprint(&source) {
         Ok(post) if !FileFingerprint::compare(&pre, &post).is_changed() => {}
         _ => {
@@ -654,9 +725,11 @@ fn copy_file(
             ));
         }
     }
+    stages.post_fingerprint += nanos_since(stage_started);
     // Re-prove the root boundary after reading and before committing the
     // destination. This catches a junction/root swap during a long copy; the
     // file fingerprint above independently catches a source-object swap.
+    let stage_started = std::time::Instant::now();
     if let Err(failure) = validate_source_root(safe_root, operation) {
         return Err(cleanup_after_claimed_failure(
             safe_root,
@@ -665,12 +738,14 @@ fn copy_file(
             failure,
         ));
     }
+    stages.revalidate_root += nanos_since(stage_started);
 
     // 8. Finalize. The no-overwrite guarantee comes from the platform, not
     // from a prior exists() check, which would be a race (ADR-0021): if the
     // destination appeared during the copy, the kernel itself refuses. The
     // identity check and rename both happen on the same handle, so a foreign
     // replacement cannot enter between them.
+    let stage_started = std::time::Instant::now();
     if let Err(error) = safe_root.finalize_claimed_partial_no_replace(
         &partial_relative,
         &relative,
@@ -684,6 +759,7 @@ fn copy_file(
             failure,
         ));
     }
+    stages.finalize += nanos_since(stage_started);
 
     Ok(OperationOutcome {
         execution_state: ExecutionState::Completed,
@@ -907,6 +983,9 @@ struct StreamedCopy {
     bytes: u64,
     sha256: String,
     blake3: String,
+    /// Nanoseconds spent in the durability `sync_all`, so the caller can bill
+    /// it to the sync stage separately from the read/write/hash loop.
+    sync_nanos: u64,
 }
 
 /// Stream the source into an already-opened partial, hashing as we go.
@@ -935,11 +1014,14 @@ fn stream_copy(
         bytes += read as u64;
     }
     // Flush to stable storage before the atomic rename (§27.1).
+    let sync_started = std::time::Instant::now();
     writer.sync_all()?;
+    let sync_nanos = nanos_since(sync_started);
     Ok(StreamedCopy {
         bytes,
         sha256: hex::encode(sha.finalize()),
         blake3: blake.finalize().to_hex().to_string(),
+        sync_nanos,
     })
 }
 
