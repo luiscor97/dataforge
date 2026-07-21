@@ -58,6 +58,9 @@ function Invoke-Phase {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $p = Start-Process -FilePath $cli -ArgumentList $CliArgs -NoNewWindow -PassThru `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    # Touch the handle so the Process object caches it; without this, ExitCode
+    # reads back null after the process exits when it was started this way.
+    $null = $p.Handle
     $peakWs = 0; $cpuSeconds = 0.0
     while (-not $p.HasExited) {
         try {
@@ -148,7 +151,9 @@ $result = [pscustomobject]@{
                         cpu_seconds, files_per_second, mib_per_second
 }
 $jsonPath = Join-Path $dataDir "$caseName.json"
-$result | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $jsonPath
+# .NET WriteAllText emits UTF-8 without a BOM; Set-Content -Encoding utf8 on
+# PowerShell 5.1 prepends one and breaks strict JSON parsers.
+[System.IO.File]::WriteAllText($jsonPath, ($result | ConvertTo-Json -Depth 5))
 Write-Host "== resultado: $jsonPath =="
 $result.phases | Format-Table -AutoSize | Out-String | Write-Host
 
