@@ -1,0 +1,99 @@
+name: Release
+
+# Runs only when a version tag is pushed — tagging is a deliberate human
+# act. The result is a DRAFT release: nothing is published until a person
+# reviews and clicks publish, keeping publication an explicit decision
+# (same posture as merges to main).
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  windows-binaries:
+    name: Windows binaries (CLI + workers)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries (locked)
+        run: >
+          cargo build --release --locked
+          -p dataforge-cli
+          -p df-extract-worker
+          -p df-query-worker
+          -p df-media-worker
+
+      - name: Collect artifacts and checksums
+        shell: bash
+        run: |
+          mkdir -p dist
+          for bin in dataforge df-extract-worker df-query-worker df-media-worker; do
+            cp "target/release/$bin.exe" dist/
+          done
+          cd dist && sha256sum *.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist/
+          if-no-files-found: error
+
+  sbom:
+    name: SBOM (regenerate and verify)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The committed SBOM must match a fresh regeneration against the same
+      # Cargo.lock — releasing with a stale SBOM is a hard failure.
+      - name: Regenerate and compare
+        run: |
+          python3 scripts/generate-sbom.py > /tmp/fresh.cdx.json
+          diff docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json
+          echo "SBOM is current"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: docs/sbom/dataforge.cdx.json
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft GitHub release
+    runs-on: ubuntu-latest
+    needs: [windows-binaries, sbom]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Signing of binaries and SBOM is a deliberate publication act that
+      # needs key infrastructure and explicit authorization (see
+      # docs/sbom/README.md). Once the signing route is decided (e.g.
+      # Sigstore cosign or an OV/EV certificate), it slots in here, between
+      # collection and the draft upload.
+      - name: Create draft release with artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --title "DataForge ${{ github.ref_name }}" \
+            --notes "Draft — review the artifacts and the CHANGELOG entry, then publish deliberately." \
+            artifacts/windows-binaries/* \
+            artifacts/sbom/dataforge.cdx.json

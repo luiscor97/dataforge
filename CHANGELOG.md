@@ -48,6 +48,18 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   segura (ADR-0017). Es un workspace propio (nightly + libFuzzer) fuera del
   build stable; el job de CI `Fuzz targets (experimental M0.9)` los compila y
   hace una pasada corta de cada uno en ubuntu (`continue-on-error`).
+- Builds reproducibles (`docs/release/reproducible-builds.md`): dependencias
+  ancladas con `--locked`, sin timestamps embebidos, toolchain declarada, y
+  evidencia de rebuild determinista — los cuatro binarios de release son
+  byte-idénticos tras borrar `target/release` y recompilar desde cero. El
+  límite (independencia de ruta/máquina requiere `--remap-path-prefix` y
+  entorno canónico) queda documentado, no prometido.
+- Workflow de release (`.github/workflows/release.yml`): al empujar un tag
+  `v*` compila los cuatro binarios con `--locked`, publica checksums
+  SHA-256, re-genera el SBOM y **falla si difiere del versionado**, y crea
+  una release **en borrador** — publicar sigue siendo un acto humano
+  deliberado. La firma se insertará cuando se decida la vía (cosign o
+  certificado); el hueco está documentado en el workflow.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
