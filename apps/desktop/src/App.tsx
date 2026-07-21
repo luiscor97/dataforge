@@ -144,7 +144,7 @@ export default function App(): React.JSX.Element {
   }, []);
 
   return (
-    <main className="shell">
+    <main className="shell" aria-busy={busy}>
       <header className="topbar">
         <h1>
           <button type="button" className="brand-button" onClick={goHome}>

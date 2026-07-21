@@ -36,6 +36,11 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   por `Cargo.lock`) con versión, licencia SPDX y PURL. Complementa a
   `cargo audit`/`cargo deny`: el SBOM enumera, las auditorías juzgan
   (`docs/sbom/README.md`). La firma queda como paso de release.
+- Accesibilidad del escritorio (`docs/accessibility.md`): postura documentada
+  y probada — `lang`, landmarks, jerarquía de encabezados, campos con
+  `<label>`, errores en `role="alert"`, diagnósticos con `role="status"`/
+  `aria-live`, y `<main aria-busy>` durante operaciones asíncronas. Pase con
+  lector de pantalla real y axe en CI quedan como refuerzo de release.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
