@@ -9,11 +9,15 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
-**Estado actual: Milestone 0.4 — Content Intelligence (implementación local),
-sobre los cierres demostrados de M0.2 y M0.3.** El pipeline completo llega de
-la carpeta caótica a una copia verificada; M0.4 añade extracción documental,
-correo/ZIP virtual, búsqueda y consulta analítica sin confundir texto derivado
-con identidad ni autoridad para modificar un plan.
+**Estado actual: Milestone 0.9 — Stabilization (en curso), sobre los cierres
+de M0.2–M0.8.** El pipeline completo llega de la carpeta caótica a una copia
+verificada — probado hasta **1.000.000 de archivos** con verificación
+independiente `COMPLETED` — e incluye inteligencia documental y multimedia,
+plugins WASM, IA asistida BYOK, snapshots incrementales y NAS endurecido.
+M0.9 congela contratos con test de regresión, consolida el threat model,
+añade fuzzing de los parsers de entrada no confiable, SBOM reproducible,
+manual de usuario y el mapa de aceptación hacia 1.0
+([estado detallado](docs/roadmap/m1.0-implementation-matrix.md)).
 
 DataForge **no está listo para producción general**. Lo que hay hoy es una
 **copia segura, explicable y verificable**: inventaría un origen sin tocarlo,
@@ -27,8 +31,11 @@ Qué debes saber antes de apuntarlo a datos reales:
 - **Windows es la única plataforma con la seguridad implementada.** En Linux y
   macOS la ejecución **se bloquea** en lugar de fingir garantías que no
   tenemos.
-- **NAS/UNC es experimental** y no está validado: sin identidad física del
-  filesystem, la detección de sustituciones baja a *degradada*.
+- **NAS/UNC está endurecido pero degradado por naturaleza**: la validación
+  clasifica el filesystem real (red, FAT, desconocido) y el executor rechaza
+  destinos sin identidad física salvo reconocimiento explícito
+  (`--allow-degraded-destination`); sin identidad física, la detección de
+  sustituciones baja a *degradada* y DataForge lo dice, no lo oculta.
 - **Las garantías dependen de lo que ofrezca el filesystem.** DataForge lo dice
   explícitamente en cada fingerprint en vez de suponerlo.
 - Frente a quien pueda editar la base del proyecto, la garantía es de
@@ -50,7 +57,7 @@ Qué existe hoy (real, con pruebas):
 - Dominio: IDs tipados, `Project`, `SourceRoot`, `Snapshot`, `AuditEvent`,
   inventario (`PathOccurrence`, `ContentObject`, fingerprints) y la máquina
   de estados completa de RFC-0001 §11.
-- SQLite como única fuente de verdad: migraciones `0001`–`0013` con checksum,
+- SQLite como única fuente de verdad: migraciones `0001`–`0019` con checksum,
   repositorios transaccionales y comprobación de integridad
   (`integrity_check`, FK, migraciones, ledger).
 - Escaneo seguro (`df-scan`): valida orígenes, inventaría archivos y
@@ -98,6 +105,28 @@ Qué existe hoy (real, con pruebas):
   regenerar desde SQLite. SQL de clientes se ejecuta solo en
   `df-query-worker`, sin DDL/DML/spill y con límites de filas, celdas, memoria,
   bytes y tiempo.
+- **Inteligencia multimedia M0.5** (`df-media`): metadata acotada de imagen/
+  audio/vídeo en worker aislado, relaciones solo-revisión selladas por run;
+  nunca una operación automática (ADR-0032).
+- **Plugins WASM M0.6** (`df-plugin`): registro persistido con hash y firma
+  re-verificados en cada carga, ABI WIT versionada, Wasmtime sin WASI ni
+  filesystem por defecto, límites de memoria/tiempo por capacidad y runs
+  sellados sobre evidencia (ADR-0033).
+- **IA asistida BYOK M0.7** (`df-ai`): explicaciones opcionales sobre
+  evidencia con la clave del usuario (Windows Credential Manager, nunca en SQLite ni
+  en el ledger), consentimiento por digest en cada invocación, transportes
+  Anthropic/OpenAI solo en el borde de la fachada y auditoría de cada
+  asistencia; la IA no decide ni modifica planes (ADR-0034).
+- **Escala y evolución M0.8**: pipeline completo probado con 1.000.000 de
+  archivos (1.093.705 operaciones ejecutadas al primer intento, verificación
+  independiente `COMPLETED`, memoria acotada); snapshots incrementales
+  opt-in que solo reusan identidad física probada byte-idéntica
+  (ADR-0035); NAS endurecido con clasificación real del filesystem y
+  destino degradado solo con reconocimiento explícito (ADR-0036).
+- **Estabilización M0.9 (en curso)**: contratos congelados con test de
+  regresión (ADR-0037), fuzzing de los parsers de entrada no confiable,
+  SBOM CycloneDX reproducible, linkado reproducible (ADR-0038), manual de
+  usuario y threat model consolidado.
 - Planificación (`df-planner`): plan con cobertura completa de cada aparición,
   política explícita de duplicados, guía de reglas/revisión, razones por
   operación, validación y aprobación que congela un manifiesto bajo SHA-256.
@@ -119,24 +148,28 @@ Qué existe hoy (real, con pruebas):
   `FAILED`.
 - Ledger de auditoría append-only con encadenamiento SHA-256, verificación
   y eventos de todo el pipeline.
-- CLI `dataforge`: `project create/status`, `scan`, `hash`, `analyze`,
-  `similarity`, `content extract/fail/build/search/query`,
-  `plan create/validate/approve`, `review list/decide`, `execute`,
-  `verify`, informes de duplicados/árboles/contextos/anomalías/similitudes y
-  `audit verify` (con `--json` y códigos de salida documentados).
+- CLI `dataforge`: `project create/status`, `scan`, `hash [--incremental]`,
+  `analyze`, `similarity`, `content extract/fail/build/search/query`,
+  `media`, `plugin register/run/list`, `ai key/explain/audits`,
+  `plan create/validate/approve`, `review list/decide`,
+  `execute [--allow-degraded-destination]`, `verify`, informes de
+  duplicados/árboles/contextos/anomalías/similitudes y `audit verify`
+  (con `--json` y códigos de salida documentados).
 - App de escritorio (Tauri 2 + React + TypeScript strict): crear/abrir proyecto
-  y ver estado, inventario, integridad, diagnóstico estructural M0.2 y
-  relaciones de versiones M0.3; M0.4 permite extraer/reanudar/cerrar, construir
-  artefactos, buscar y consultar SQL con estados accesibles, usando la misma
-  `df-facade` que la CLI.
+  y ver estado, inventario, integridad, diagnóstico estructural M0.2,
+  relaciones de versiones M0.3 y diagnóstico multimedia M0.5; M0.4 permite
+  extraer/reanudar/cerrar, construir artefactos, buscar y consultar SQL con
+  estados accesibles, usando la misma `df-facade` que la CLI.
 
 Qué **no** existe todavía (y no está simulado): relaciones documentales por
-significado, reconstrucción automática de expedientes, inteligencia
-multimedia, plugins de producto, IA asistida, informes finales exportables o
-perfiles de usuario en runtime. La extracción M0.4 produce evidencia derivada
-y búsquedas; no es comprensión semántica ni autoriza consolidar contenido o
-árboles automáticamente.
-Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro).
+significado, reconstrucción automática de expedientes, daemon en segundo
+plano, builds firmadas (la vía de firma está por decidir; el hueco está
+preparado en el workflow de release) e informes finales exportables. La
+extracción produce evidencia derivada y búsquedas; la IA explica sobre
+evidencia con consentimiento — ninguna de las dos es comprensión semántica
+ni autoriza consolidar contenido o árboles automáticamente.
+Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro)
+y el [mapa de aceptación M1.0](docs/release/m1.0-acceptance.md).
 
 ## Inicio rápido (Windows)
 
@@ -194,12 +227,15 @@ pnpm --filter dataforge-desktop tauri dev
 ```text
 apps/cli/        CLI `dataforge`
 apps/desktop/    Tauri 2 + React + TS strict (cliente de df-facade)
-crates/df-*      motor: error, domain, fs-safety, ledger, db, scan, hash,
-                 similarity, planner, executor, verifier, facade
-tools/df-corpus  generador de corpus sintético determinista y prueba de
-                 escala del pipeline (docs/testing/corpus-and-scale.md)
-docs/            RFCs, ADRs, arquitectura, threat model, guías
-scripts/         bootstrap reproducible del entorno (PowerShell)
+crates/df-*      motor: error, domain, fs-safety, process-safety, ledger,
+                 db, scan, hash, similarity, extract, search, query, media,
+                 plugin, ai, planner, executor, verifier, facade
+tools/           df-corpus (corpus sintético + escala,
+                 docs/testing/corpus-and-scale.md) y los sidecars aislados
+                 df-extract-worker, df-query-worker, df-media-worker
+fuzz/            dianas cargo-fuzz de los parsers de entrada no confiable
+docs/            RFCs, ADRs, arquitectura, threat model, manual, release
+scripts/         bootstrap del entorno (PowerShell) y generador de SBOM
 .codex/skills/   skills del repositorio para agentes de codificación
 ```
 
