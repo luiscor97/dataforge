@@ -1,0 +1,11 @@
+# Reproducible linking for release/CI builds: PE headers carry a
+# TimeDateStamp that the linker fills with the wall clock by default, which
+# makes every build byte-unique (docs/release/reproducible-builds.md).
+#
+# Scoped to MSVC (the CI/release toolchain) on purpose: zero-timestamp PE
+# files trip Windows Defender heuristics on developer machines (observed:
+# freshly linked build scripts quarantined mid-build, os error 225), so the
+# GNU dev toolchain keeps default linking; verification instructions for
+# GNU live in the doc above.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]
