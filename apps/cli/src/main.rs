@@ -61,6 +61,11 @@ enum Command {
         /// mode remains the default and the evidential recommendation.
         #[arg(long)]
         incremental: bool,
+        /// Parallel hashing workers. 0 = auto (a conservative cap on the
+        /// machine's parallelism). The result is identical for any value;
+        /// use 1 to reproduce sequential behaviour.
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -602,11 +607,16 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Output::Status),
         },
         Command::Scan { path } => df_facade::scan_project(path, Actor::Cli).map(Output::Scan),
-        Command::Hash { path, incremental } => df_facade::hash_project_with_options(
+        Command::Hash {
+            path,
+            incremental,
+            workers,
+        } => df_facade::hash_project_with_options(
             path,
             Actor::Cli,
             &df_facade::HashOptions {
                 incremental: *incremental,
+                workers: *workers,
                 ..df_facade::HashOptions::default()
             },
         )
