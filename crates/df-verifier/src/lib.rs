@@ -136,6 +136,9 @@ pub fn verify_project(
     let artefacts = plans::verifiable_artefacts(db, plan.id)?;
     let mut expected_files: HashSet<String> = HashSet::new();
     let mut expected_dirs: HashSet<String> = HashSet::new();
+    // One reusable read buffer for the whole verification instead of a fresh
+    // allocation per artefact (M1.0.1).
+    let mut hash_buffer = vec![0u8; options.read_buffer_bytes];
     for artefact in &artefacts {
         // Long outputs are legitimate (the executor writes them via the
         // extended-length prefix), so the verifier must re-read them the same
@@ -168,7 +171,7 @@ pub fn verify_project(
         }
         match (
             &artefact.expected_sha256,
-            hash_file(&destination, options.read_buffer_bytes),
+            hash_file(&destination, &mut hash_buffer),
         ) {
             (Some(expected), Ok(actual)) if &actual == expected => {}
             (Some(expected), Ok(actual)) => findings.push(VerificationFinding {
@@ -455,12 +458,11 @@ fn walk_output(
     }
 }
 
-fn hash_file(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
+fn hash_file(path: &Path, buffer: &mut [u8]) -> std::io::Result<String> {
     let mut reader = std::fs::File::open(path)?;
     let mut sha = sha2::Sha256::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }

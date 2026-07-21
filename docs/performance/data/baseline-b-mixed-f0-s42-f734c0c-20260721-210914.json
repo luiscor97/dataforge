@@ -1,0 +1,89 @@
+﻿{
+    "label":  "baseline",
+    "profile":  "b-mixed",
+    "files":  10000,
+    "bytes":  55170439707,
+    "avg_file_bytes":  5517044,
+    "seed":  42,
+    "commit":  "f734c0c",
+    "build":  "release --locked",
+    "hardware":  "AMD Ryzen 7 9800X3D 8-Core Processor           ",
+    "os":  "Microsoft Windows 11 Home",
+    "filesystem":  "NTFS",
+    "corpus_seconds":  25.9,
+    "generated_at_utc":  "2026-07-21T19:13:06Z",
+    "phases":  [
+                   {
+                       "phase":  "create",
+                       "seconds":  0.898,
+                       "exit_code":  0,
+                       "peak_ws_mb":  6.9,
+                       "cpu_seconds":  0,
+                       "files_per_second":  null,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "scan",
+                       "seconds":  0.796,
+                       "exit_code":  0,
+                       "peak_ws_mb":  12.8,
+                       "cpu_seconds":  0.4,
+                       "files_per_second":  12562.8,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "hash",
+                       "seconds":  33.006,
+                       "exit_code":  0,
+                       "peak_ws_mb":  12,
+                       "cpu_seconds":  31,
+                       "files_per_second":  303,
+                       "mib_per_second":  1594.1
+                   },
+                   {
+                       "phase":  "analyze",
+                       "seconds":  1.395,
+                       "exit_code":  0,
+                       "peak_ws_mb":  43.9,
+                       "cpu_seconds":  1,
+                       "files_per_second":  null,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "plan",
+                       "seconds":  1.056,
+                       "exit_code":  0,
+                       "peak_ws_mb":  26.8,
+                       "cpu_seconds":  0.8,
+                       "files_per_second":  null,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "approve",
+                       "seconds":  0.789,
+                       "exit_code":  0,
+                       "peak_ws_mb":  90.1,
+                       "cpu_seconds":  0.5,
+                       "files_per_second":  null,
+                       "mib_per_second":  null
+                   },
+                   {
+                       "phase":  "execute",
+                       "seconds":  106.184,
+                       "exit_code":  0,
+                       "peak_ws_mb":  22.1,
+                       "cpu_seconds":  71.9,
+                       "files_per_second":  94.2,
+                       "mib_per_second":  495.5
+                   },
+                   {
+                       "phase":  "verify",
+                       "seconds":  60.301,
+                       "exit_code":  0,
+                       "peak_ws_mb":  84.1,
+                       "cpu_seconds":  29.6,
+                       "files_per_second":  165.8,
+                       "mib_per_second":  872.5
+                   }
+               ]
+}

@@ -188,6 +188,10 @@ pub fn execute_plan(
     let mut bytes_copied: u64 = 0;
     let mut cancelled = false;
     let mut stages = StageNanos::default();
+    // One reusable copy/hash buffer for the whole run instead of a fresh
+    // allocation per file (M1.0.1). The sequential executor uses a single
+    // buffer; a future bounded-parallel executor gives one per worker.
+    let mut buffer = vec![0u8; options.copy_buffer_bytes];
     'run: loop {
         let batch = plans::executable_operations(db, plan.id, options.operation_batch)?;
         // Operations already attempted in this run stay for the *next* run.
@@ -232,8 +236,8 @@ pub fn execute_plan(
                 &safe_root,
                 &operation,
                 partial_lease_token.as_deref(),
-                options,
                 &mut stages,
+                &mut buffer,
             );
             bytes_copied += outcome.bytes_copied;
             let persist_started = std::time::Instant::now();
@@ -321,8 +325,8 @@ fn run_operation(
     safe_root: &SafeOutputRoot,
     operation: &ExecutableOperation,
     partial_lease_token: Option<&str>,
-    options: &ExecuteOptions,
     stages: &mut StageNanos,
+    buffer: &mut [u8],
 ) -> OperationOutcome {
     let started_at = chrono::Utc::now();
 
@@ -340,7 +344,7 @@ fn run_operation(
                     )
                 })
                 .and_then(|token| {
-                    copy_file(db, safe_root, &relative, operation, token, options, stages)
+                    copy_file(db, safe_root, &relative, operation, token, stages, buffer)
                 }),
         },
         Err(error) => Err(OperationFailure::from_fs_safety(error)),
@@ -543,8 +547,8 @@ fn copy_file(
     planned_relative: &SafeRelativePath,
     operation: &ExecutableOperation,
     partial_lease_token: &str,
-    options: &ExecuteOptions,
     stages: &mut StageNanos,
+    buffer: &mut [u8],
 ) -> Result<OperationOutcome, OperationFailure> {
     let stage_started = std::time::Instant::now();
     validate_source_root(safe_root, operation)?;
@@ -602,7 +606,7 @@ fn copy_file(
         planned_relative,
         planned_destination,
         expected_sha256,
-        options,
+        buffer,
     )?;
     stages.collision_check += nanos_since(stage_started);
     if skip {
@@ -674,8 +678,8 @@ fn copy_file(
     }
     stages.claim_persist += nanos_since(stage_started);
     let stage_started = std::time::Instant::now();
-    let copy = stream_copy(&source, handle, options.copy_buffer_bytes)
-        .map_err(|e| OperationFailure::from_io(&e, "copying"));
+    let copy =
+        stream_copy(&source, handle, buffer).map_err(|e| OperationFailure::from_io(&e, "copying"));
     let copy_total = nanos_since(stage_started);
     let copy = match copy {
         Ok(copy) => copy,
@@ -841,7 +845,7 @@ fn resolve_collision(
     planned_relative: &SafeRelativePath,
     planned_absolute: &Path,
     expected_sha256: &str,
-    options: &ExecuteOptions,
+    buffer: &mut [u8],
 ) -> Result<(SafeRelativePath, bool), OperationFailure> {
     // Existence and re-hash must use the extended form: a long path probed
     // without it reports "not found" for a file that is really there, and the
@@ -849,7 +853,7 @@ fn resolve_collision(
     if !df_fs_safety::extended_for_io(planned_absolute).exists() {
         return Ok((planned_relative.clone(), false));
     }
-    let existing_sha = hash_existing(planned_absolute, options.copy_buffer_bytes)
+    let existing_sha = hash_existing(planned_absolute, buffer)
         .map_err(|e| OperationFailure::from_io(&e, "hashing existing destination"))?;
     if existing_sha == expected_sha256 {
         return Ok((planned_relative.clone(), true));
@@ -865,7 +869,7 @@ fn resolve_collision(
     if !df_fs_safety::extended_for_io(&suffixed_absolute).exists() {
         return Ok((suffixed_relative, false));
     }
-    let suffixed_sha = hash_existing(&suffixed_absolute, options.copy_buffer_bytes)
+    let suffixed_sha = hash_existing(&suffixed_absolute, buffer)
         .map_err(|e| OperationFailure::from_io(&e, "hashing existing suffixed destination"))?;
     if suffixed_sha == expected_sha256 {
         return Ok((suffixed_relative, true));
@@ -996,15 +1000,14 @@ struct StreamedCopy {
 fn stream_copy(
     source: &Path,
     mut writer: std::fs::File,
-    buffer_bytes: usize,
+    buffer: &mut [u8],
 ) -> std::io::Result<StreamedCopy> {
     let mut reader = std::fs::File::open(source)?;
     let mut sha = sha2::Sha256::new();
     let mut blake = blake3::Hasher::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     let mut bytes: u64 = 0;
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -1025,12 +1028,11 @@ fn stream_copy(
     })
 }
 
-fn hash_existing(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
+fn hash_existing(path: &Path, buffer: &mut [u8]) -> std::io::Result<String> {
     let mut reader = std::fs::File::open(df_fs_safety::extended_for_io(path))?;
     let mut sha = sha2::Sha256::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }
