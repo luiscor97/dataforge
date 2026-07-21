@@ -64,8 +64,15 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   hashes difieren**, publica checksums SHA-256, re-genera el SBOM y falla
   si difiere del versionado, y crea una release **en borrador** — publicar
   sigue siendo un acto humano deliberado. Ensayable sin tag vía
-  `workflow_dispatch`. La firma se insertará cuando se decida la vía
-  (cosign o certificado); el hueco está documentado en el workflow.
+  `workflow_dispatch`.
+- Firma de release keyless (ADR-0039): el job de release firma checksums y
+  SBOM con Sigstore/cosign — certificado efímero ligado al repositorio, al
+  workflow y al tag, sin claves privadas que custodiar, con las
+  instrucciones de verificación en la propia release. El acto humano que la
+  autoriza es empujar el tag; sustituible por certificado OV/EV antes del
+  primer tag sin deuda. Con esto, las tres decisiones de scope de la 1.0
+  (Windows-first, daemon post-1.0, vía de firma) quedan aplicadas y
+  documentadas con veto abierto en `docs/release/m1.0-acceptance.md`.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 

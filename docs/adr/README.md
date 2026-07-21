@@ -33,6 +33,7 @@
 | [ADR-0036](ADR-0036-nas-hardening.md) | NAS endurecido: clasificación real y destino con identidad probada (M0.8) | Aceptada |
 | [ADR-0037](ADR-0037-frozen-contracts.md) | Contratos congelados y su test de regresión (M0.9) | Aceptada |
 | [ADR-0038](ADR-0038-reproducible-release-linking.md) | Linkado reproducible de release (M0.9) | Aceptada |
+| [ADR-0039](ADR-0039-keyless-release-signing.md) | Firma de release keyless (Sigstore) (M0.9) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).

@@ -15,6 +15,9 @@ env:
 
 permissions:
   contents: write
+  # Required for Sigstore keyless signing (ADR-0039): the workflow exchanges
+  # its OIDC identity for a short-lived signing certificate.
+  id-token: write
 
 jobs:
   windows-binaries:
@@ -109,19 +112,47 @@ jobs:
         with:
           path: artifacts
 
-      # Signing of binaries and SBOM is a deliberate publication act that
-      # needs key infrastructure and explicit authorization (see
-      # docs/sbom/README.md). Once the signing route is decided (e.g.
-      # Sigstore cosign or an OV/EV certificate), it slots in here, between
-      # collection and the draft upload.
+      # Sigstore keyless signing (ADR-0039): no private keys to manage. The
+      # ephemeral certificate binds the signature to THIS workflow identity
+      # and THIS tag; the human act that authorizes it is pushing the tag.
+      # Signing SHA256SUMS.txt covers every binary transitively.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums and SBOM (keyless)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature artifacts/windows-binaries/SHA256SUMS.txt.sig \
+            --output-certificate artifacts/windows-binaries/SHA256SUMS.txt.pem \
+            artifacts/windows-binaries/SHA256SUMS.txt
+          cosign sign-blob --yes \
+            --output-signature artifacts/sbom/dataforge.cdx.json.sig \
+            --output-certificate artifacts/sbom/dataforge.cdx.json.pem \
+            artifacts/sbom/dataforge.cdx.json
+
       - name: Create draft release with artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          {
+            echo "Draft — review the artifacts and the CHANGELOG entry, then publish deliberately."
+            echo
+            echo '## Verificación'
+            echo '```'
+            echo 'sha256sum -c SHA256SUMS.txt'
+            echo 'cosign verify-blob \'
+            echo '  --signature SHA256SUMS.txt.sig --certificate SHA256SUMS.txt.pem \'
+            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/\\.github/workflows/release\\.yml@.*' \\"
+            echo '  --certificate-oidc-issuer https://token.actions.githubusercontent.com \'
+            echo '  SHA256SUMS.txt'
+            echo '```'
+          } > release-notes.md
           gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
             --draft \
             --title "DataForge ${{ github.ref_name }}" \
-            --notes "Draft — review the artifacts and the CHANGELOG entry, then publish deliberately." \
+            --notes-file release-notes.md \
             artifacts/windows-binaries/* \
-            artifacts/sbom/dataforge.cdx.json
+            artifacts/sbom/dataforge.cdx.json \
+            artifacts/sbom/dataforge.cdx.json.sig \
+            artifacts/sbom/dataforge.cdx.json.pem
