@@ -25,6 +25,11 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   IA con consentimiento por digest y claves fuera de la base, reuso
   incremental solo con identidad física probada, destino degradado con
   reconocimiento explícito).
+- Manual de usuario (`docs/manual/README.md`): guía completa de la CLI —
+  instalación, el flujo create→scan→hash→analyze→plan→approve→execute→verify,
+  informes, revisión, y las capacidades M0.3–M0.7 (similitud, contenido,
+  media, plugins, IA/BYOK), perfiles, incremental/NAS, códigos de salida y
+  las garantías de diseño. Enlazado desde el README.
 
 ### Milestone 0.8 — Cross-platform and Scale (parcial)
 
