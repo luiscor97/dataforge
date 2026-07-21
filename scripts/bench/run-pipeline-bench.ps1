@@ -1,4 +1,4 @@
-# DataForge M1.0.1 — reproducible pipeline benchmark driver (Windows).
+﻿# DataForge M1.0.1 — reproducible pipeline benchmark driver (Windows).
 #
 # Generates a deterministic corpus (df-corpus profile), runs the full
 # pipeline phase by phase with the release CLI, and records per-phase wall
