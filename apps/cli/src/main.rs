@@ -137,6 +137,12 @@ enum Command {
         /// guarantees (network shares, FAT variants) — ADR-0036.
         #[arg(long)]
         allow_degraded_destination: bool,
+        /// Parallel copy workers under a single database coordinator
+        /// (strict-parallel). Default 1 = sequential; `0` = auto. Any value
+        /// produces byte-identical output and the same recovery. Opt-in until
+        /// the full crash-injection acceptance lands.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
     },
     /// Verify the executed plan from primary evidence.
     Verify {
@@ -901,11 +907,13 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Execute {
             path,
             allow_degraded_destination,
+            workers,
         } => df_facade::execute_plan_with_options(
             path,
             Actor::Cli,
             &df_facade::ExecuteOptions {
                 allow_degraded_destination: *allow_degraded_destination,
+                workers: *workers,
                 ..df_facade::ExecuteOptions::default()
             },
         )
