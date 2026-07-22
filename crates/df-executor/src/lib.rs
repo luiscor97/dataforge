@@ -543,18 +543,24 @@ fn run_parallel(
             let cancel_now = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
             cancelled |= cancel_now;
             // Refill the ready queue from the database when it runs low.
+            // Copy-only paging so directories never mask pending copies.
             if ready.is_empty() && !exhausted && !cancelled {
-                let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
+                let batch =
+                    plans::executable_copy_operations(db, plan_id, options.operation_batch)?;
+                let batch_empty = batch.is_empty();
                 let mut added = 0usize;
                 for op in batch {
-                    if op.operation_type != OperationType::CreateDirectory
-                        && !attempted.contains(&op.operation_id.to_string())
-                    {
+                    if !attempted.contains(&op.operation_id.to_string()) {
                         ready.push_back(op);
                         added += 1;
                     }
                 }
-                if added == 0 {
+                // `batch_empty` means no executable copy remains — truly done.
+                // A non-empty batch with `added == 0` is a window full of
+                // in-flight RUNNING copies (they free as they complete) or of
+                // FAILED_RETRYABLE copies stuck for this run; only give up on
+                // the latter, when nothing is in flight to advance the window.
+                if batch_empty || (added == 0 && outstanding == 0) {
                     exhausted = true;
                 }
             }
@@ -737,13 +743,12 @@ fn run_directory_stage(
     // Directories never read or write file bytes, so no copy buffer is needed.
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
+        // Directory-only paging: a mixed query could return a window full of
+        // copies and hide directories that sit past it.
+        let batch = plans::executable_directory_operations(db, plan_id, options.operation_batch)?;
         let fresh_dirs: Vec<ExecutableOperation> = batch
             .into_iter()
-            .filter(|op| {
-                op.operation_type == OperationType::CreateDirectory
-                    && !attempted.contains(&op.operation_id.to_string())
-            })
+            .filter(|op| !attempted.contains(&op.operation_id.to_string()))
             .collect();
         if fresh_dirs.is_empty() {
             return Ok(false);
@@ -1828,6 +1833,66 @@ mod tests {
             output_tree(&seq.origin),
             output_tree(&par.origin),
             "origin must be untouched in both runs"
+        );
+    }
+
+    #[test]
+    fn parallel_execution_completes_every_operation_across_many_refetches() {
+        // A small operation_batch with many workers forces the coordinator to
+        // page the queue many times while in-flight (RUNNING) and directory
+        // operations sit in the LIMIT window — the case a single-batch test
+        // misses. Every operation must still complete.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        for d in 0..6u32 {
+            let sub = origin.join(format!("dir-{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for i in 0..50u32 {
+                let len = 1 + (i as usize % 200);
+                let content: Vec<u8> = (0..len).map(|b| (b as u8) ^ (d as u8)).collect();
+                std::fs::write(sub.join(format!("f-{d}-{i:03}.bin")), &content).unwrap();
+            }
+        }
+        let output = tmp.path().join("salida");
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "complete",
+            ProfileRef::default(),
+            output.clone(),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
+        approve_plan(&mut db, Actor::Test).unwrap();
+
+        let out = execute_plan(
+            &mut db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 8,
+                operation_batch: 8, // force many refetches with in-flight masking
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.state, "EXECUTED",
+            "every operation must complete (state {}, pending {})",
+            out.state, out.pending
+        );
+        assert_eq!(out.pending, 0, "no operations left pending");
+        assert_eq!(out.failed_final, 0);
+        assert!(
+            out.completed >= 300,
+            "expected >=300 operations completed, got {}",
+            out.completed
         );
     }
 
