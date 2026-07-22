@@ -447,76 +447,91 @@ fn run_parallel(
                         Err(_) => break, // channel closed: shut down
                     };
                     let started_at = chrono::Utc::now();
-                    let result = match SafeRelativePath::parse(Path::new(
-                        &operation.destination_relative_path,
-                    )) {
-                        Ok(relative) => match prepare_copy(
-                            safe_root,
-                            &relative,
-                            &operation,
-                            &token,
-                            &mut worker_stages,
-                            &mut buffer,
-                        ) {
-                            Ok(PrepareOutcome::Skip(outcome)) => Ok(outcome),
-                            Ok(PrepareOutcome::Prepared(prepared)) => {
-                                // Claim barrier: hand the identity to the single
-                                // coordinator and wait for the durable commit
-                                // before copying a byte (rule 7).
-                                let identity = format_partial_identity(prepared.partial_identity);
-                                let (ack_tx, ack_rx) = mpsc::channel();
-                                let claim = msg_tx
-                                    .send(Msg::Claim {
-                                        op_id: operation.operation_id,
-                                        token: token.clone(),
-                                        identity,
-                                        ack: ack_tx,
-                                    })
-                                    .ok()
-                                    .and_then(|()| ack_rx.recv().ok());
-                                match claim {
-                                    Some(Ok(())) => finish_copy(
-                                        safe_root,
-                                        &operation,
-                                        prepared,
-                                        &mut worker_stages,
-                                        &mut buffer,
-                                    ),
-                                    other => {
-                                        // Claim failed or the coordinator is
-                                        // gone: clean up only our own claimed
-                                        // partial (identity-checked), as the
-                                        // sequential path does.
-                                        let PreparedCopy {
-                                            handle,
-                                            partial_relative,
-                                            partial_identity,
-                                            ..
-                                        } = prepared;
-                                        drop(handle);
-                                        let _ = safe_root.remove_leased_partial_secure(
-                                            &partial_relative,
-                                            partial_identity,
-                                        );
-                                        Err(other.and_then(|r| r.err()).unwrap_or_else(|| {
-                                            OperationFailure::fatal(
-                                                OperationErrorCode::IoError,
-                                                "execution coordinator dropped the claim",
-                                            )
-                                        }))
+                    // A worker panic must not hang the coordinator waiting for a
+                    // Done that never arrives: catch it and report the operation
+                    // as retryable, so the next run reclaims any partial (by its
+                    // durable token + identity) and retries it (design window
+                    // coverage; the fs protocol itself never leaks user data).
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match SafeRelativePath::parse(Path::new(
+                            &operation.destination_relative_path,
+                        )) {
+                            Ok(relative) => match prepare_copy(
+                                safe_root,
+                                &relative,
+                                &operation,
+                                &token,
+                                &mut worker_stages,
+                                &mut buffer,
+                            ) {
+                                Ok(PrepareOutcome::Skip(outcome)) => Ok(outcome),
+                                Ok(PrepareOutcome::Prepared(prepared)) => {
+                                    // Claim barrier: hand the identity to the single
+                                    // coordinator and wait for the durable commit
+                                    // before copying a byte (rule 7).
+                                    let identity =
+                                        format_partial_identity(prepared.partial_identity);
+                                    let (ack_tx, ack_rx) = mpsc::channel();
+                                    let claim = msg_tx
+                                        .send(Msg::Claim {
+                                            op_id: operation.operation_id,
+                                            token: token.clone(),
+                                            identity,
+                                            ack: ack_tx,
+                                        })
+                                        .ok()
+                                        .and_then(|()| ack_rx.recv().ok());
+                                    match claim {
+                                        Some(Ok(())) => finish_copy(
+                                            safe_root,
+                                            &operation,
+                                            prepared,
+                                            &mut worker_stages,
+                                            &mut buffer,
+                                        ),
+                                        other => {
+                                            // Claim failed or the coordinator is
+                                            // gone: clean up only our own claimed
+                                            // partial (identity-checked), as the
+                                            // sequential path does.
+                                            let PreparedCopy {
+                                                handle,
+                                                partial_relative,
+                                                partial_identity,
+                                                ..
+                                            } = prepared;
+                                            drop(handle);
+                                            let _ = safe_root.remove_leased_partial_secure(
+                                                &partial_relative,
+                                                partial_identity,
+                                            );
+                                            Err(other.and_then(|r| r.err()).unwrap_or_else(|| {
+                                                OperationFailure::fatal(
+                                                    OperationErrorCode::IoError,
+                                                    "execution coordinator dropped the claim",
+                                                )
+                                            }))
+                                        }
                                     }
                                 }
-                            }
-                            Err(failure) => Err(failure),
-                        },
-                        Err(error) => Err(OperationFailure::from_fs_safety(error)),
-                    };
+                                Err(failure) => Err(failure),
+                            },
+                            Err(error) => Err(OperationFailure::from_fs_safety(error)),
+                        }
+                    }));
                     let outcome = match result {
-                        Ok(mut outcome) => {
+                        Ok(Ok(mut outcome)) => {
                             outcome.started_at = started_at;
                             outcome
                         }
-                        Err(failure) => failure.into_outcome(started_at),
+                        Ok(Err(failure)) => failure.into_outcome(started_at),
+                        Err(_panic) => OperationFailure {
+                            code: OperationErrorCode::IoError,
+                            state: ExecutionState::FailedRetryable,
+                            detail: "copy worker panicked; operation left for retry".to_string(),
+                            retain_partial_lease: false,
+                        }
+                        .into_outcome(started_at),
                     };
                     let _ = msg_tx.send(Msg::Done {
                         op_id: operation.operation_id,
@@ -1893,6 +1908,66 @@ mod tests {
             out.completed >= 300,
             "expected >=300 operations completed, got {}",
             out.completed
+        );
+    }
+
+    #[test]
+    fn parallel_execution_resumes_correctly_after_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_many(tmp.path());
+        let options = ExecuteOptions {
+            workers: 8,
+            ..ExecuteOptions::default()
+        };
+
+        // Cancel shortly after the parallel run starts, from another thread, so
+        // the coordinator drains its in-flight operations mid-run.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let _first = execute_plan(&mut fx.db, Actor::Test, &options, Some(&cancel)).unwrap();
+        stopper.join().unwrap();
+        // Whether it cancelled mid-run or finished first, draining in-flight
+        // operations must never leave an orphan partial behind.
+        assert!(
+            no_partials_left(&fx.output),
+            "cancellation left an orphan partial"
+        );
+
+        // Resume in parallel: every remaining operation completes.
+        let second = execute_plan(&mut fx.db, Actor::Test, &options, None).unwrap();
+        assert_eq!(
+            second.state, "EXECUTED",
+            "resume must complete every operation"
+        );
+        assert_eq!(second.failed_final, 0);
+        assert!(no_partials_left(&fx.output));
+
+        // The resumed parallel output must equal a clean sequential run.
+        let clean_tmp = tempfile::tempdir().unwrap();
+        let mut clean = approved_many(clean_tmp.path());
+        execute_plan(
+            &mut clean.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 1,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            output_tree(&fx.output),
+            output_tree(&clean.output),
+            "resumed parallel output must match a clean sequential run"
+        );
+        assert_eq!(
+            output_tree(&fx.origin),
+            output_tree(&clean.origin),
+            "origin untouched"
         );
     }
 
