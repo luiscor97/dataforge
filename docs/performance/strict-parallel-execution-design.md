@@ -1,9 +1,10 @@
 # Diseño propuesto: ejecución estricta paralela (M1.0.1)
 
-Estado: **propuesta para revisión**. No implementada. El encargo exige
-presentar este diseño —construido desde el modelo de recuperación, con todas
-las ventanas de caída documentadas— antes de refactorizar el executor. Nada
-aquí relaja el modo estricto; la concurrencia es un *cómo*, no un *qué*.
+Estado: **implementación iniciada por incrementos** (ver
+[§10 Estado de implementación](#10-estado-de-implementación-coordinación) al
+final). El diseño fue revisado y se juzgó sólido; la construcción va desde el
+modelo de recuperación, con todas las ventanas de caída documentadas. Nada aquí
+relaja el modo estricto; la concurrencia es un *cómo*, no un *qué*.
 
 ## 1. Por qué (cuello de botella medido)
 
@@ -168,3 +169,25 @@ recupera por su ventana).
 
 Hasta cumplir 1–5, `strict-parallel` no se ofrece como predeterminado y
 `strict` sigue siendo el modo de los proyectos existentes y evidenciales.
+
+## 10. Estado de implementación (coordinación)
+
+Nota entre agentes para no duplicar trabajo (como pasó con el paralelismo de
+hash/verify). La implementación avanza en **incrementos verdes y commiteados**;
+cada uno deja el árbol compilando y con tests en verde.
+
+| Inc | Trabajo | Estado |
+| --- | --- | --- |
+| 1 | Partir `copy_file` en `prepare_copy` (sin SQLite) → **barrera de claim** → `finish_copy` (sin SQLite). Aísla la costura coordinador/worker; comportamiento idéntico | ✅ hecho — commit `44bc009`, 28/28 tests |
+| 2 | `ExecuteOptions.workers`/`max_in_flight` + pre-stage secuencial de `CREATE_DIRECTORY` + módulo de **exclusión por destino** (puro, unit-tested) | ⬜ pendiente |
+| 3 | **Pool de workers acotado + protocolo coordinador↔worker** con la barrera de claim y backpressure. `workers=1` ≡ secuencial | ⬜ pendiente |
+| 4 | **Microlotes** de commit lease/claim/result (el ~32 % de SQLite) | ⬜ pendiente |
+| 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ⬜ pendiente |
+| 6 | Perfiles de durabilidad `strict`/`strict-parallel`/`fast` + ADR de durabilidad (§8) | ⬜ pendiente |
+| 7 | Medir sweep de `execute` + documentar en `m1.0.1-results.md` + PR de borrador | ⬜ pendiente |
+
+**Quien continúe: retomar desde el siguiente ⬜.** El Increment 1 ya dejó
+`prepare_copy`/`finish_copy` como funciones sin acceso a base de datos en
+`crates/df-executor/src/lib.rs`; el pool del Increment 3 mueve esas dos a
+workers y enruta la barrera de claim (y los microlotes del Increment 4) por el
+coordinador único.
