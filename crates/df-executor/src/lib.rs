@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use df_db::plans::{self, ExecutableOperation, OperationOutcome};
 use df_db::{repository, Db};
 use df_domain::{
-    Actor, ExecutionState, FileFingerprint, OperationErrorCode, OperationType, ProjectState,
+    Actor, ExecutionState, FileFingerprint, OperationErrorCode, OperationId, OperationType,
+    ProjectState,
 };
 use df_error::{DfError, DfResult};
 use df_fs_safety::{FileIdentity, FsSafetyError, SafeOutputRoot, SafeRelativePath};
@@ -63,7 +64,12 @@ impl Default for ExecuteOptions {
             allow_degraded_destination: false,
             copy_buffer_bytes: 1024 * 1024,
             operation_batch: 256,
-            workers: 0,
+            // Sequential by default. Unlike hash/verify (whose parallelism is
+            // shipped), execute-parallel stays opt-in until the full
+            // crash-injection acceptance (design §9, Increment 5) passes, per
+            // the "strict-parallel not default until proven" rule. `--workers`
+            // opts in; `0` then means auto.
+            workers: 1,
             max_in_flight: 0,
         }
     }
@@ -73,7 +79,6 @@ impl Default for ExecuteOptions {
 /// machine's parallelism but no higher than [`AUTO_WORKER_CAP`]; using every
 /// logical thread on mixed I/O must be measured, not assumed (see df-hash).
 /// Wired into execution by design Increment 3.
-#[allow(dead_code)]
 fn resolve_workers(requested: usize) -> usize {
     const AUTO_WORKER_CAP: usize = 8;
     if requested > 0 {
@@ -88,7 +93,6 @@ fn resolve_workers(requested: usize) -> usize {
 /// Resolve the in-flight cap from the explicit value or the worker count.
 /// Two per worker keeps every worker fed without unbounded queueing.
 /// Wired into execution by design Increment 3.
-#[allow(dead_code)]
 fn resolve_in_flight(requested: usize, workers: usize) -> usize {
     if requested > 0 {
         requested.max(workers)
@@ -223,68 +227,25 @@ pub fn execute_plan(
         repository::update_project_state(db, ProjectState::Executing, actor)?;
     }
 
-    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut bytes_copied: u64 = 0;
-    let mut cancelled = false;
+    // Sequential by default; the strict-parallel path (design §2/§10) runs
+    // only when more than one worker is requested and is proven byte-identical
+    // to the sequential path by the determinism tests. Both share the exact
+    // per-file protocol (prepare/claim/finish) and per-operation recovery.
+    let workers = resolve_workers(options.workers);
     let mut stages = StageNanos::default();
-    // One reusable copy/hash buffer for the whole run instead of a fresh
-    // allocation per file (M1.0.1). The sequential executor uses a single
-    // buffer; a future bounded-parallel executor gives one per worker.
-    let mut buffer = vec![0u8; options.copy_buffer_bytes];
-    'run: loop {
-        let batch = plans::executable_operations(db, plan.id, options.operation_batch)?;
-        // Operations already attempted in this run stay for the *next* run.
-        let fresh: Vec<ExecutableOperation> = batch
-            .into_iter()
-            .filter(|op| !attempted.contains(&op.operation_id.to_string()))
-            .collect();
-        if fresh.is_empty() {
-            break;
-        }
-        for operation in fresh {
-            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                cancelled = true;
-                break 'run;
-            }
-            attempted.insert(operation.operation_id.to_string());
-            // Reclaim attempt A while A's token and physical identity are
-            // still the durable database state. A fresh lease B is issued
-            // only after this idempotent cleanup succeeds; otherwise a crash
-            // between B and cleanup would destroy the sole ownership proof.
-            if operation.operation_type != OperationType::CreateDirectory {
-                if let Err(failure) = reclaim_interrupted_partial(&safe_root, &operation) {
-                    let outcome = failure.into_outcome(chrono::Utc::now());
-                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
-                    continue;
-                }
-            }
-            // A copy receives a fresh unpredictable partial lease in the same
-            // durable update that marks it RUNNING. Directory operations do
-            // not create partials and therefore carry no ownership token.
-            let lease_started = std::time::Instant::now();
-            let partial_lease_token = match operation.operation_type {
-                OperationType::CreateDirectory => {
-                    plans::mark_operation_running(db, operation.operation_id)?;
-                    None
-                }
-                _ => Some(plans::lease_copy_operation(db, operation.operation_id)?),
-            };
-            stages.lease += nanos_since(lease_started);
-            let outcome = run_operation(
-                db,
-                &safe_root,
-                &operation,
-                partial_lease_token.as_deref(),
-                &mut stages,
-                &mut buffer,
-            );
-            bytes_copied += outcome.bytes_copied;
-            let persist_started = std::time::Instant::now();
-            plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
-            stages.persist_result += nanos_since(persist_started);
-            stages.operations += 1;
-        }
-    }
+    let (bytes_copied, cancelled, any_attempted) = if workers <= 1 {
+        run_sequential(db, &safe_root, plan.id, options, cancel, &mut stages)?
+    } else {
+        run_parallel(
+            db,
+            &safe_root,
+            plan.id,
+            workers,
+            options,
+            cancel,
+            &mut stages,
+        )?
+    };
 
     let progress = plans::plan_progress(db, plan.id)?;
     let all_terminal =
@@ -308,7 +269,7 @@ pub fn execute_plan(
     // Once this invocation attempted an operation, a PAUSED result is new and
     // must receive its own milestone even when the previous latest event has
     // the same kind and plan id.
-    let reuse_interrupted_milestone = recovering_executing && attempted.is_empty() && !cancelled;
+    let reuse_interrupted_milestone = recovering_executing && !any_attempted && !cancelled;
     let project = plans::finish_execution(
         db,
         plan.id,
@@ -330,6 +291,368 @@ pub fn execute_plan(
         state: project.state.as_str().to_string(),
         stage_nanos: stages,
     })
+}
+
+/// The original single-writer execution loop: reclaim, lease, run, record, one
+/// operation at a time. `workers <= 1` uses this untouched path. Returns
+/// (bytes copied, cancelled, whether any operation was attempted).
+fn run_sequential(
+    db: &mut Db,
+    safe_root: &SafeOutputRoot,
+    plan_id: df_domain::PlanId,
+    options: &ExecuteOptions,
+    cancel: Option<&AtomicBool>,
+    stages: &mut StageNanos,
+) -> DfResult<(u64, bool, bool)> {
+    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut bytes_copied: u64 = 0;
+    let mut cancelled = false;
+    let mut buffer = vec![0u8; options.copy_buffer_bytes];
+    'run: loop {
+        let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
+        let fresh: Vec<ExecutableOperation> = batch
+            .into_iter()
+            .filter(|op| !attempted.contains(&op.operation_id.to_string()))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for operation in fresh {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                cancelled = true;
+                break 'run;
+            }
+            attempted.insert(operation.operation_id.to_string());
+            // Reclaim attempt A while A's token and physical identity are still
+            // the durable database state, before issuing a fresh lease B.
+            if operation.operation_type != OperationType::CreateDirectory {
+                if let Err(failure) = reclaim_interrupted_partial(safe_root, &operation) {
+                    let outcome = failure.into_outcome(chrono::Utc::now());
+                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                    continue;
+                }
+            }
+            let lease_started = std::time::Instant::now();
+            let partial_lease_token = match operation.operation_type {
+                OperationType::CreateDirectory => {
+                    plans::mark_operation_running(db, operation.operation_id)?;
+                    None
+                }
+                _ => Some(plans::lease_copy_operation(db, operation.operation_id)?),
+            };
+            stages.lease += nanos_since(lease_started);
+            let outcome = run_operation(
+                db,
+                safe_root,
+                &operation,
+                partial_lease_token.as_deref(),
+                stages,
+                &mut buffer,
+            );
+            bytes_copied += outcome.bytes_copied;
+            let persist_started = std::time::Instant::now();
+            plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+            stages.persist_result += nanos_since(persist_started);
+            stages.operations += 1;
+        }
+    }
+    Ok((bytes_copied, cancelled, !attempted.is_empty()))
+}
+
+/// Strict-parallel execution (design §2/§10). A single coordinator owns the
+/// database — it leases, commits the ownership claim and records the result —
+/// while filesystem workers run `prepare_copy`/`finish_copy` in parallel.
+/// Workers never touch SQLite: they cross the claim barrier by sending the
+/// partial's physical identity to the coordinator and awaiting the durable
+/// commit, exactly as the sequential path commits it inline. Directories are
+/// created first, sequentially, and the `DestinationGuard` keeps two in-flight
+/// copies off the same destination family; the platform no-overwrite finalize
+/// makes any residual race a safe retry, never a corruption. Byte-identical to
+/// the sequential path with the same per-operation recovery.
+fn run_parallel(
+    db: &mut Db,
+    safe_root: &SafeOutputRoot,
+    plan_id: df_domain::PlanId,
+    workers: usize,
+    options: &ExecuteOptions,
+    cancel: Option<&AtomicBool>,
+    stages: &mut StageNanos,
+) -> DfResult<(u64, bool, bool)> {
+    use dest_exclusion::DestinationGuard;
+    use std::sync::mpsc;
+
+    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut bytes_copied: u64 = 0;
+
+    // Stage A: create every directory sequentially, before any parallel copy.
+    if run_directory_stage(
+        db,
+        safe_root,
+        plan_id,
+        options,
+        cancel,
+        stages,
+        &mut attempted,
+    )? {
+        return Ok((bytes_copied, true, !attempted.is_empty()));
+    }
+
+    // Worker → coordinator messages, and coordinator → worker work items.
+    enum Msg {
+        Claim {
+            op_id: OperationId,
+            token: String,
+            identity: String,
+            ack: mpsc::Sender<Result<(), OperationFailure>>,
+        },
+        Done {
+            op_id: OperationId,
+            relative_key: String,
+            outcome: OperationOutcome,
+        },
+    }
+    struct WorkItem {
+        operation: ExecutableOperation,
+        token: String,
+        relative_key: String,
+    }
+
+    let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
+    let work_rx = std::sync::Mutex::new(work_rx);
+    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let in_flight_cap = resolve_in_flight(options.max_in_flight, workers);
+    let buffer_bytes = options.copy_buffer_bytes;
+    let mut cancelled = false;
+
+    let bytes = std::thread::scope(|scope| -> DfResult<u64> {
+        // Workers: pull a copy op, prepare (fs), cross the claim barrier through
+        // the coordinator, finish (fs), report. No database access here.
+        for _ in 0..workers {
+            let work_rx = &work_rx;
+            let msg_tx = msg_tx.clone();
+            scope.spawn(move || {
+                let mut buffer = vec![0u8; buffer_bytes];
+                let mut worker_stages = StageNanos::default();
+                loop {
+                    let item = {
+                        let rx = work_rx.lock().expect("work channel poisoned");
+                        rx.recv()
+                    };
+                    let WorkItem {
+                        operation,
+                        token,
+                        relative_key,
+                    } = match item {
+                        Ok(item) => item,
+                        Err(_) => break, // channel closed: shut down
+                    };
+                    let started_at = chrono::Utc::now();
+                    let result = match SafeRelativePath::parse(Path::new(
+                        &operation.destination_relative_path,
+                    )) {
+                        Ok(relative) => match prepare_copy(
+                            safe_root,
+                            &relative,
+                            &operation,
+                            &token,
+                            &mut worker_stages,
+                            &mut buffer,
+                        ) {
+                            Ok(PrepareOutcome::Skip(outcome)) => Ok(outcome),
+                            Ok(PrepareOutcome::Prepared(prepared)) => {
+                                // Claim barrier: hand the identity to the single
+                                // coordinator and wait for the durable commit
+                                // before copying a byte (rule 7).
+                                let identity = format_partial_identity(prepared.partial_identity);
+                                let (ack_tx, ack_rx) = mpsc::channel();
+                                let claim = msg_tx
+                                    .send(Msg::Claim {
+                                        op_id: operation.operation_id,
+                                        token: token.clone(),
+                                        identity,
+                                        ack: ack_tx,
+                                    })
+                                    .ok()
+                                    .and_then(|()| ack_rx.recv().ok());
+                                match claim {
+                                    Some(Ok(())) => finish_copy(
+                                        safe_root,
+                                        &operation,
+                                        prepared,
+                                        &mut worker_stages,
+                                        &mut buffer,
+                                    ),
+                                    other => {
+                                        // Claim failed or the coordinator is
+                                        // gone: clean up only our own claimed
+                                        // partial (identity-checked), as the
+                                        // sequential path does.
+                                        let PreparedCopy {
+                                            handle,
+                                            partial_relative,
+                                            partial_identity,
+                                            ..
+                                        } = prepared;
+                                        drop(handle);
+                                        let _ = safe_root.remove_leased_partial_secure(
+                                            &partial_relative,
+                                            partial_identity,
+                                        );
+                                        Err(other.and_then(|r| r.err()).unwrap_or_else(|| {
+                                            OperationFailure::fatal(
+                                                OperationErrorCode::IoError,
+                                                "execution coordinator dropped the claim",
+                                            )
+                                        }))
+                                    }
+                                }
+                            }
+                            Err(failure) => Err(failure),
+                        },
+                        Err(error) => Err(OperationFailure::from_fs_safety(error)),
+                    };
+                    let outcome = match result {
+                        Ok(mut outcome) => {
+                            outcome.started_at = started_at;
+                            outcome
+                        }
+                        Err(failure) => failure.into_outcome(started_at),
+                    };
+                    let _ = msg_tx.send(Msg::Done {
+                        op_id: operation.operation_id,
+                        relative_key,
+                        outcome,
+                    });
+                }
+            });
+        }
+        // The coordinator holds no worker clone, so msg_rx closes when the last
+        // worker exits.
+        drop(msg_tx);
+
+        // Coordinator: owns db. Dispatch up to the in-flight cap honouring the
+        // destination guard, then service claim/result messages, dispatching
+        // more as operations complete.
+        let mut guard = DestinationGuard::new();
+        let mut outstanding = 0usize;
+        let mut ready: std::collections::VecDeque<ExecutableOperation> =
+            std::collections::VecDeque::new();
+        let mut deferred: Vec<ExecutableOperation> = Vec::new();
+        let mut exhausted = false;
+        loop {
+            let cancel_now = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+            cancelled |= cancel_now;
+            // Refill the ready queue from the database when it runs low.
+            if ready.is_empty() && !exhausted && !cancelled {
+                let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
+                let mut added = 0usize;
+                for op in batch {
+                    if op.operation_type != OperationType::CreateDirectory
+                        && !attempted.contains(&op.operation_id.to_string())
+                    {
+                        ready.push_back(op);
+                        added += 1;
+                    }
+                }
+                if added == 0 {
+                    exhausted = true;
+                }
+            }
+            // Dispatch while capacity and work remain and not cancelled.
+            while outstanding < in_flight_cap && !cancelled {
+                let Some(operation) = ready.pop_front() else {
+                    break;
+                };
+                let relative_key = operation.destination_relative_path.clone();
+                if !guard.try_acquire(&relative_key) {
+                    // A conflicting destination is in flight; defer this op.
+                    deferred.push(operation);
+                    continue;
+                }
+                attempted.insert(operation.operation_id.to_string());
+                if let Err(failure) = reclaim_interrupted_partial(safe_root, &operation) {
+                    guard.release(&relative_key);
+                    let outcome = failure.into_outcome(chrono::Utc::now());
+                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                    stages.operations += 1;
+                    continue;
+                }
+                let lease_started = std::time::Instant::now();
+                let token = plans::lease_copy_operation(db, operation.operation_id)?;
+                stages.lease += nanos_since(lease_started);
+                work_tx
+                    .send(WorkItem {
+                        operation,
+                        token,
+                        relative_key,
+                    })
+                    .expect("workers dropped the work channel");
+                outstanding += 1;
+            }
+            if outstanding == 0 {
+                // Nothing in flight: no destination is held, so any deferred
+                // op can now be re-offered. Otherwise we are done.
+                if !deferred.is_empty() {
+                    ready.extend(deferred.drain(..));
+                    continue;
+                }
+                if cancelled || (exhausted && ready.is_empty()) {
+                    break;
+                }
+                if ready.is_empty() {
+                    // Not exhausted yet: loop to refill.
+                    continue;
+                }
+                // ready has items the guard let through on the next pass.
+                continue;
+            }
+            // Block for the next worker message.
+            match msg_rx.recv() {
+                Ok(Msg::Claim {
+                    op_id,
+                    token,
+                    identity,
+                    ack,
+                }) => {
+                    let claim_started = std::time::Instant::now();
+                    let result =
+                        plans::claim_copy_partial(db, op_id, &token, &identity).map_err(|error| {
+                            OperationFailure {
+                                code: OperationErrorCode::IoError,
+                                state: ExecutionState::FailedRetryable,
+                                detail: format!("persisting partial ownership claim: {error}"),
+                                retain_partial_lease: false,
+                            }
+                        });
+                    stages.claim_persist += nanos_since(claim_started);
+                    let _ = ack.send(result);
+                }
+                Ok(Msg::Done {
+                    op_id,
+                    relative_key,
+                    outcome,
+                }) => {
+                    bytes_copied += outcome.bytes_copied;
+                    let persist_started = std::time::Instant::now();
+                    plans::record_operation_outcome(db, op_id, &outcome)?;
+                    stages.persist_result += nanos_since(persist_started);
+                    stages.operations += 1;
+                    guard.release(&relative_key);
+                    outstanding -= 1;
+                    // A freed destination may unblock a deferred op.
+                    if !deferred.is_empty() {
+                        ready.extend(deferred.drain(..));
+                    }
+                }
+                Err(_) => break, // all workers gone
+            }
+        }
+        // Close the work channel so idle workers exit; the scope joins them.
+        drop(work_tx);
+        Ok(bytes_copied)
+    })?;
+
+    Ok((bytes, cancelled, !attempted.is_empty()))
 }
 
 fn execution_source_roots(
@@ -402,7 +725,6 @@ fn run_operation(
 /// create every planned directory before any parallel copy starts, so copies
 /// never race on a parent directory. Cheap and single-writer. Returns whether
 /// cancellation fired. Wired into execution by design Increment 3.
-#[allow(dead_code)]
 fn run_directory_stage(
     db: &mut Db,
     safe_root: &SafeOutputRoot,
@@ -447,7 +769,6 @@ fn run_directory_stage(
 /// collision check. Parent/child races are prevented separately by creating
 /// every directory before the parallel copy phase. Pure and single-threaded
 /// (the coordinator owns it); wired by design Increment 3.
-#[allow(dead_code)]
 mod dest_exclusion {
     use std::collections::HashSet;
 
@@ -478,10 +799,12 @@ mod dest_exclusion {
             self.held.remove(&Self::key(relative));
         }
 
+        #[cfg(test)]
         pub(crate) fn len(&self) -> usize {
             self.held.len()
         }
 
+        #[cfg(test)]
         pub(crate) fn is_empty(&self) -> bool {
             self.held.is_empty()
         }
@@ -1389,6 +1712,123 @@ mod tests {
             }
         }
         true
+    }
+
+    /// Platform-neutral snapshot of an output tree: sorted relative paths with
+    /// file bytes (directories carry empty bytes), for byte-for-byte equality.
+    fn output_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut queue = vec![root.to_path_buf()];
+        while let Some(dir) = queue.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if entry.metadata().unwrap().is_dir() {
+                    queue.push(path);
+                    out.push((relative, Vec::new()));
+                } else {
+                    out.push((relative, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Approve a project with many varied-size files across two subdirectories,
+    /// so parallel execution exercises the worker pool and the directory
+    /// pre-stage.
+    fn approved_many(tmp: &Path) -> Fixture {
+        let origin = tmp.join("origen");
+        std::fs::create_dir_all(origin.join("sub")).unwrap();
+        std::fs::create_dir_all(origin.join("otra")).unwrap();
+        for i in 0..40u32 {
+            let len = 1 + (i as usize * 331) % 3000;
+            let content: Vec<u8> = (0..len).map(|b| ((b as u32) ^ i) as u8).collect();
+            std::fs::write(origin.join(format!("f-{i:03}.bin")), &content).unwrap();
+            std::fs::write(origin.join("sub").join(format!("g-{i:03}.bin")), &content).unwrap();
+        }
+        let output = tmp.join("salida");
+        let mut db = Db::open(&tmp.join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "det",
+            ProfileRef::default(),
+            output.clone(),
+            tmp.join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
+        approve_plan(&mut db, Actor::Test).unwrap();
+        Fixture { db, origin, output }
+    }
+
+    #[test]
+    fn parallel_execution_matches_sequential_byte_for_byte() {
+        let seq_tmp = tempfile::tempdir().unwrap();
+        let par_tmp = tempfile::tempdir().unwrap();
+        let mut seq = approved_many(seq_tmp.path());
+        let mut par = approved_many(par_tmp.path());
+
+        let seq_out = execute_plan(
+            &mut seq.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 1,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        let par_out = execute_plan(
+            &mut par.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 8,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(seq_out.state, "EXECUTED");
+        assert_eq!(par_out.state, "EXECUTED", "parallel run must complete");
+        assert_eq!(
+            seq_out.completed, par_out.completed,
+            "same operation count completed"
+        );
+        assert_eq!(par_out.failed_final, 0, "no final failures under parallel");
+        assert_eq!(par_out.failed_retryable, 0, "no retryable failures either");
+        assert!(
+            no_partials_left(&par.output),
+            "no partial files left behind by the parallel run"
+        );
+        // The whole guarantee: the output is byte-identical regardless of the
+        // worker count, and the origin is untouched.
+        assert_eq!(
+            output_tree(&seq.output),
+            output_tree(&par.output),
+            "parallel output must be byte-identical to sequential"
+        );
+        assert_eq!(
+            output_tree(&seq.origin),
+            output_tree(&par.origin),
+            "origin must be untouched in both runs"
+        );
     }
 
     fn first_copy_operation(db: &Db) -> ExecutableOperation {

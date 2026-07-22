@@ -180,18 +180,20 @@ cada uno deja el árbol compilando y con tests en verde.
 | --- | --- | --- |
 | 1 | Partir `copy_file` en `prepare_copy` (sin SQLite) → **barrera de claim** → `finish_copy` (sin SQLite). Aísla la costura coordinador/worker; comportamiento idéntico | ✅ hecho — commit `44bc009`, 28/28 tests |
 | 2 | `ExecuteOptions.workers`/`max_in_flight` + pre-stage secuencial de `CREATE_DIRECTORY` (`run_directory_stage`) + módulo de **exclusión por destino** (`dest_exclusion::DestinationGuard`, puro, unit-tested) | ✅ hecho — 31/31 tests; scaffolding `#[allow(dead_code)]` hasta que el Increment 3 lo cablea |
-| 3 | **Pool de workers acotado + protocolo coordinador↔worker** con la barrera de claim y backpressure. `workers=1` ≡ secuencial | ⬜ pendiente |
+| 3 | **Pool de workers acotado + protocolo coordinador↔worker** con la barrera de claim y backpressure. `workers=1` ≡ secuencial | ✅ hecho — `run_parallel` (coordinador dueño de SQLite + workers `std::thread::scope`, barrera de claim por canal, `DestinationGuard`, dir pre-stage). Default `execute` sigue secuencial (opt-in hasta Increment 5). Test end-to-end `parallel_execution_matches_sequential_byte_for_byte` (workers=1 vs 8, salida byte-idéntica); 32/32 tests estables en 3 corridas |
 | 4 | **Microlotes** de commit lease/claim/result (el ~32 % de SQLite) | ⬜ pendiente |
-| 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ⬜ pendiente |
+| 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ◐ parcial — determinismo end-to-end ya cubierto (Increment 3); faltan las inyecciones de fallo por ventana A–F y respuestas tardías/en pánico bajo el pool |
 | 6 | Perfiles de durabilidad `strict`/`strict-parallel`/`fast` + ADR de durabilidad (§8) | ⬜ pendiente |
 | 7 | Medir sweep de `execute` + documentar en `m1.0.1-results.md` + PR de borrador | ⬜ pendiente |
 
-**Quien continúe: retomar desde el siguiente ⬜ (Increment 3).** Los
-Increments 1–2 dejan listas todas las piezas puras y sin SQLite:
-`prepare_copy`/`finish_copy` (la costura fs), `run_directory_stage` (el
-pre-stage secuencial de directorios) y `dest_exclusion::DestinationGuard` (la
-exclusión por destino). El Increment 3 mueve `prepare_copy`/`finish_copy` a un
-pool de workers acotado, enruta la barrera de claim (y luego los microlotes del
-Increment 4) por el coordinador único que posee la base, y usa el
-`DestinationGuard` para diferir ops en conflicto y el `run_directory_stage`
-antes de la fase paralela.
+**Quien continúe: retomar desde el Increment 4 (microlotes) o completar el
+Increment 5 (inyección de fallo A–F).** El Increment 3 dejó `run_parallel`
+funcionando y probado byte-idéntico al secuencial. Rutas de trabajo abiertas:
+- **Increment 4**: agrupar lease/claim/result en microlotes (el ~32 % de
+  SQLite serializado). Es la palanca que falta para que los archivos pequeños
+  ganen de verdad; hoy `run_parallel` commitea por operación como el
+  secuencial, así que solapa filesystem pero no reduce el nº de commits.
+- **Increment 5**: tests de inyección de fallo por ventana A–F y respuestas
+  tardías/duplicadas/en pánico bajo el pool, antes de considerar mover el
+  default de `execute` a paralelo.
+- **Increment 7**: sweep de `execute --workers` y resultados.
