@@ -112,7 +112,7 @@ $plan = @(
     @{ name = "plan"; args = @("plan", "create", "--path", $projectDir,
             "--duplicate-policy", "REPORT_ONLY", "--json") },
     @{ name = "approve"; args = @("plan", "approve", "--path", $projectDir, "--json") },
-    @{ name = "execute"; args = @("execute", "--path", $projectDir, "--json") },
+    @{ name = "execute"; args = @("execute", "--path", $projectDir, "--workers", $Workers, "--json") },
     @{ name = "verify"; args = @("verify", "--path", $projectDir, "--workers", $Workers, "--json") }
 )
 $phases = @()
