@@ -541,15 +541,43 @@ fn reclaim_interrupted_partial(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn copy_file(
-    db: &Db,
+/// Everything Stage A produces for the claim barrier and Stage B: the open,
+/// physically-identified partial plus the validated paths and the source
+/// identity. It owns all of it (no borrows), so on a parallel executor it can
+/// move from a filesystem worker to the coordinator and back unchanged
+/// (M1.0.1); the claim barrier sits exactly between producing this and
+/// consuming it.
+struct PreparedCopy {
+    handle: std::fs::File,
+    partial_identity: FileIdentity,
+    partial_relative: SafeRelativePath,
+    relative: SafeRelativePath,
+    source: PathBuf,
+    pre: FileFingerprint,
+    expected_sha256: String,
+}
+
+/// Outcome of Stage A: either the destination already holds the exact expected
+/// content (nothing to copy, §27.3) or a partial is open and ready to claim.
+enum PrepareOutcome {
+    Skip(OperationOutcome),
+    Prepared(PreparedCopy),
+}
+
+/// Stage A — pure filesystem, **no SQLite**. Validate the source against the
+/// frozen manifest fingerprint (§27.1), reserve the destination (§27.3), and
+/// create + physically identify the partial through the safe boundary. The
+/// returned identity is what crosses the claim barrier to the coordinator; a
+/// crash after `create_new` but before the claim leaves an unclaimed orphan
+/// that is never deleted (design window B).
+fn prepare_copy(
     safe_root: &SafeOutputRoot,
     planned_relative: &SafeRelativePath,
     operation: &ExecutableOperation,
     partial_lease_token: &str,
     stages: &mut StageNanos,
     buffer: &mut [u8],
-) -> Result<OperationOutcome, OperationFailure> {
+) -> Result<PrepareOutcome, OperationFailure> {
     let stage_started = std::time::Instant::now();
     validate_source_root(safe_root, operation)?;
     // Resolving proves the planned destination is reachable without crossing a
@@ -610,7 +638,7 @@ fn copy_file(
     )?;
     stages.collision_check += nanos_since(stage_started);
     if skip {
-        return Ok(OperationOutcome {
+        return Ok(PrepareOutcome::Skip(OperationOutcome {
             execution_state: ExecutionState::Completed,
             outcome: "SKIP_REPRESENTED".to_string(),
             error_code: None,
@@ -623,7 +651,7 @@ fn copy_file(
             blake3: operation.expected_blake3.clone(),
             started_at: chrono::Utc::now(),
             retain_partial_lease: false,
-        });
+        }));
     }
 
     let stage_started = std::time::Instant::now();
@@ -633,9 +661,11 @@ fn copy_file(
             .map_err(OperationFailure::from_fs_safety)?;
     }
 
-    // 3–5. Partial file, streamed copy with both hashes, flush (§27.1–27.2).
-    // The partial is created through the safe boundary with create_new, so it
-    // can neither follow a link nor reuse someone else's file.
+    // 3. Partial file created through the safe boundary with create_new, then
+    // its physical identity captured from that exact open handle. Ownership is
+    // claimed only *after* create_new succeeded (in the caller, the claim
+    // barrier), using this identity — a path reopen here would let a rename
+    // race claim somebody else's replacement.
     let partial_relative = relative
         .with_file_name(&partial_file_name(operation, partial_lease_token)?)
         .map_err(OperationFailure::from_fs_safety)?;
@@ -647,9 +677,6 @@ fn copy_file(
     let handle = safe_root
         .create_partial_secure(&partial_relative)
         .map_err(OperationFailure::from_fs_safety)?;
-    // Ownership is claimed only *after* create_new succeeded, using identity
-    // read from that exact open handle. A path reopen here would let a rename
-    // race claim somebody else's replacement.
     let partial_identity = df_fs_safety::identity_of_open_file(&handle, &partial)
         .map_err(OperationFailure::from_fs_safety)?
         .ok_or_else(|| {
@@ -659,24 +686,40 @@ fn copy_file(
             )
         })?;
     stages.create_partial += nanos_since(stage_started);
-    let stored_identity = format_partial_identity(partial_identity);
-    let stage_started = std::time::Instant::now();
-    if let Err(error) = plans::claim_copy_partial(
-        db,
-        operation.operation_id,
-        partial_lease_token,
-        &stored_identity,
-    ) {
-        drop(handle);
-        let _ = safe_root.remove_leased_partial_secure(&partial_relative, partial_identity);
-        return Err(OperationFailure {
-            code: OperationErrorCode::IoError,
-            state: ExecutionState::FailedRetryable,
-            detail: format!("persisting partial ownership claim: {error}"),
-            retain_partial_lease: false,
-        });
-    }
-    stages.claim_persist += nanos_since(stage_started);
+
+    Ok(PrepareOutcome::Prepared(PreparedCopy {
+        handle,
+        partial_identity,
+        partial_relative,
+        relative,
+        source,
+        pre,
+        expected_sha256: expected_sha256.to_string(),
+    }))
+}
+
+/// Stage B — pure filesystem, **no SQLite**. With the claim already durable,
+/// copy the bytes (hashing as we go), verify the content hash and source
+/// stability (§14.5), re-prove the boundary and finalize with the platform
+/// no-replace primitive (ADR-0021). Any failure past the claim cleans up only
+/// this executor's own claimed partial (identity-checked), never user data.
+fn finish_copy(
+    safe_root: &SafeOutputRoot,
+    operation: &ExecutableOperation,
+    prepared: PreparedCopy,
+    stages: &mut StageNanos,
+    buffer: &mut [u8],
+) -> Result<OperationOutcome, OperationFailure> {
+    let PreparedCopy {
+        handle,
+        partial_identity,
+        partial_relative,
+        relative,
+        source,
+        pre,
+        expected_sha256,
+    } = prepared;
+
     let stage_started = std::time::Instant::now();
     let copy =
         stream_copy(&source, handle, buffer).map_err(|e| OperationFailure::from_io(&e, "copying"));
@@ -779,6 +822,59 @@ fn copy_file(
         started_at: chrono::Utc::now(),
         retain_partial_lease: false,
     })
+}
+
+/// The coordinator's per-copy driver: Stage A, the durable claim barrier (§27.1
+/// step 4 — the single SQLite touch of the protocol), then Stage B. Splitting
+/// the two pure-filesystem stages around the claim is what lets a bounded
+/// worker pool run the filesystem work while a single coordinator owns the
+/// database (M1.0.1); the sequential executor runs all three inline.
+fn copy_file(
+    db: &Db,
+    safe_root: &SafeOutputRoot,
+    planned_relative: &SafeRelativePath,
+    operation: &ExecutableOperation,
+    partial_lease_token: &str,
+    stages: &mut StageNanos,
+    buffer: &mut [u8],
+) -> Result<OperationOutcome, OperationFailure> {
+    let prepared = match prepare_copy(
+        safe_root,
+        planned_relative,
+        operation,
+        partial_lease_token,
+        stages,
+        buffer,
+    )? {
+        PrepareOutcome::Skip(outcome) => return Ok(outcome),
+        PrepareOutcome::Prepared(prepared) => prepared,
+    };
+
+    // Claim barrier (§27.1 step 4): the partial's physical identity becomes
+    // durable *before* a byte is copied, so ownership stays tied to identity
+    // (rule 7). A crash here leaves an unclaimed orphan that is never deleted
+    // (design window B). This is the only SQLite touch inside the per-file
+    // protocol; a parallel executor routes it through the single coordinator.
+    let stage_started = std::time::Instant::now();
+    if let Err(error) = plans::claim_copy_partial(
+        db,
+        operation.operation_id,
+        partial_lease_token,
+        &format_partial_identity(prepared.partial_identity),
+    ) {
+        drop(prepared.handle);
+        let _ = safe_root
+            .remove_leased_partial_secure(&prepared.partial_relative, prepared.partial_identity);
+        return Err(OperationFailure {
+            code: OperationErrorCode::IoError,
+            state: ExecutionState::FailedRetryable,
+            detail: format!("persisting partial ownership claim: {error}"),
+            retain_partial_lease: false,
+        });
+    }
+    stages.claim_persist += nanos_since(stage_started);
+
+    finish_copy(safe_root, operation, prepared, stages, buffer)
 }
 
 fn validate_source_root(
