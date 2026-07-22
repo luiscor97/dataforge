@@ -35,6 +35,7 @@
 | [ADR-0038](ADR-0038-reproducible-release-linking.md) | Linkado reproducible de release (M0.9) | Aceptada |
 | [ADR-0039](ADR-0039-keyless-release-signing.md) | Firma de release keyless (Sigstore) (M0.9) | Aceptada |
 | [ADR-0040](ADR-0040-bounded-parallel-hash-and-verify.md) | Hash y verificación paralelos acotados (M1.0.1) | Aceptada |
+| [ADR-0041](ADR-0041-strict-parallel-execution.md) | Ejecución estricta paralela (M1.0.1) | Aceptada |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).

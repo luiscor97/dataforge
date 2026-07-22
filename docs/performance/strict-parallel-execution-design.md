@@ -184,7 +184,7 @@ cada uno deja el árbol compilando y con tests en verde.
 | 4 | **Microlotes** de commit lease/claim/result (el ~32 % de SQLite) | ⬜ pendiente |
 | 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ◐ parcial — determinismo end-to-end ya cubierto (Increment 3); faltan las inyecciones de fallo por ventana A–F y respuestas tardías/en pánico bajo el pool |
 | 6 | Perfiles de durabilidad `strict`/`strict-parallel`/`fast` + ADR de durabilidad (§8) | ⬜ pendiente |
-| 7 | Medir sweep de `execute` + documentar en `m1.0.1-results.md` + PR de borrador | ⬜ pendiente |
+| 7 | Medir sweep de `execute` + documentar en `m1.0.1-results.md` + PR de borrador | ◐ parcial — sweep de `execute --workers` medido (corpus A 40k): ~2,0× saturando en 4 workers, correctitud verificada (45.003 ops, 0 fallos); documentado en `m1.0.1-results.md` y ADR-0041. Un bug real de terminación temprana se encontró y arregló aquí. Falta: incluir en la PR borrador |
 
 **Quien continúe: retomar desde el Increment 4 (microlotes) o completar el
 Increment 5 (inyección de fallo A–F).** El Increment 3 dejó `run_parallel`
