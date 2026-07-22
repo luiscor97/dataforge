@@ -41,6 +41,15 @@ pub struct ExecuteOptions {
     pub copy_buffer_bytes: usize,
     /// Operations fetched from the plan per round trip.
     pub operation_batch: u32,
+    /// Filesystem workers copying in parallel under the single database
+    /// coordinator (strict-parallel, design §2/§10). `0` = auto (a
+    /// conservative cap); `1` = the sequential path. Any value produces
+    /// byte-identical output and the same per-operation recovery.
+    pub workers: usize,
+    /// Backpressure bound: at most this many operations may be leased but not
+    /// yet recorded at once (`0` = derive from `workers`). Caps in-flight
+    /// memory so it never grows with the number of files (design §2).
+    pub max_in_flight: usize,
     /// Explicit acknowledgment that the destination filesystem offers only
     /// degraded identity guarantees — network shares, FAT variants or
     /// unclassifiable volumes (ADR-0036). Without it, execution towards
@@ -54,7 +63,37 @@ impl Default for ExecuteOptions {
             allow_degraded_destination: false,
             copy_buffer_bytes: 1024 * 1024,
             operation_batch: 256,
+            workers: 0,
+            max_in_flight: 0,
         }
+    }
+}
+
+/// Resolve the effective execution worker count. `auto` (0) caps at the
+/// machine's parallelism but no higher than [`AUTO_WORKER_CAP`]; using every
+/// logical thread on mixed I/O must be measured, not assumed (see df-hash).
+/// Wired into execution by design Increment 3.
+#[allow(dead_code)]
+fn resolve_workers(requested: usize) -> usize {
+    const AUTO_WORKER_CAP: usize = 8;
+    if requested > 0 {
+        return requested;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, AUTO_WORKER_CAP)
+}
+
+/// Resolve the in-flight cap from the explicit value or the worker count.
+/// Two per worker keeps every worker fed without unbounded queueing.
+/// Wired into execution by design Increment 3.
+#[allow(dead_code)]
+fn resolve_in_flight(requested: usize, workers: usize) -> usize {
+    if requested > 0 {
+        requested.max(workers)
+    } else {
+        workers.saturating_mul(2).max(workers + 1)
     }
 }
 
@@ -356,6 +395,129 @@ fn run_operation(
             outcome
         }
         Err(failure) => failure.into_outcome(started_at),
+    }
+}
+
+/// Sequential `CREATE_DIRECTORY` pre-stage for parallel execution (design §4):
+/// create every planned directory before any parallel copy starts, so copies
+/// never race on a parent directory. Cheap and single-writer. Returns whether
+/// cancellation fired. Wired into execution by design Increment 3.
+#[allow(dead_code)]
+fn run_directory_stage(
+    db: &mut Db,
+    safe_root: &SafeOutputRoot,
+    plan_id: df_domain::PlanId,
+    options: &ExecuteOptions,
+    cancel: Option<&AtomicBool>,
+    stages: &mut StageNanos,
+    attempted: &mut std::collections::HashSet<String>,
+) -> DfResult<bool> {
+    // Directories never read or write file bytes, so no copy buffer is needed.
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
+        let fresh_dirs: Vec<ExecutableOperation> = batch
+            .into_iter()
+            .filter(|op| {
+                op.operation_type == OperationType::CreateDirectory
+                    && !attempted.contains(&op.operation_id.to_string())
+            })
+            .collect();
+        if fresh_dirs.is_empty() {
+            return Ok(false);
+        }
+        for operation in fresh_dirs {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Ok(true);
+            }
+            attempted.insert(operation.operation_id.to_string());
+            plans::mark_operation_running(db, operation.operation_id)?;
+            let outcome = run_operation(db, safe_root, &operation, None, stages, &mut buffer);
+            plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+            stages.operations += 1;
+        }
+    }
+}
+
+/// Destination exclusion for parallel execution (design §4): stops two
+/// in-flight copy operations from racing on the same destination family. The
+/// key is the planned destination path, case-folded — the §27.3 collision
+/// suffix is derived from that base, so an operation and any suffix variant it
+/// might take share one key, and the case fold matches the case-insensitive
+/// collision check. Parent/child races are prevented separately by creating
+/// every directory before the parallel copy phase. Pure and single-threaded
+/// (the coordinator owns it); wired by design Increment 3.
+#[allow(dead_code)]
+mod dest_exclusion {
+    use std::collections::HashSet;
+
+    /// Destination keys currently reserved by in-flight operations.
+    #[derive(Default)]
+    pub(crate) struct DestinationGuard {
+        held: HashSet<String>,
+    }
+
+    impl DestinationGuard {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        fn key(relative: &str) -> String {
+            relative.to_lowercase()
+        }
+
+        /// Reserve `relative` for one in-flight operation. `false` means
+        /// another in-flight operation holds a conflicting key, so the caller
+        /// must defer this operation until that one releases.
+        pub(crate) fn try_acquire(&mut self, relative: &str) -> bool {
+            self.held.insert(Self::key(relative))
+        }
+
+        /// Release a key once its operation has been recorded.
+        pub(crate) fn release(&mut self, relative: &str) {
+            self.held.remove(&Self::key(relative));
+        }
+
+        pub(crate) fn len(&self) -> usize {
+            self.held.len()
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.held.is_empty()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_same_destination_cannot_be_held_twice() {
+            let mut guard = DestinationGuard::new();
+            assert!(guard.try_acquire("casos/a.txt"));
+            assert!(!guard.try_acquire("casos/a.txt"), "already in flight");
+            guard.release("casos/a.txt");
+            assert!(guard.try_acquire("casos/a.txt"), "free after release");
+        }
+
+        #[test]
+        fn distinct_destinations_are_independent() {
+            let mut guard = DestinationGuard::new();
+            assert!(guard.try_acquire("casos/a.txt"));
+            assert!(guard.try_acquire("casos/b.txt"));
+            assert_eq!(guard.len(), 2);
+            assert!(!guard.is_empty());
+        }
+
+        #[test]
+        fn keys_are_case_folded_like_the_collision_check() {
+            // The §27.3 collision check compares destinations the way the
+            // filesystem does (case-insensitive on NTFS); the guard must too,
+            // or two case-variant plans could both go in flight and race.
+            let mut guard = DestinationGuard::new();
+            assert!(guard.try_acquire("Casos/A.txt"));
+            assert!(!guard.try_acquire("casos/a.txt"));
+        }
     }
 }
 

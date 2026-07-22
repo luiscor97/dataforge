@@ -179,15 +179,19 @@ cada uno deja el árbol compilando y con tests en verde.
 | Inc | Trabajo | Estado |
 | --- | --- | --- |
 | 1 | Partir `copy_file` en `prepare_copy` (sin SQLite) → **barrera de claim** → `finish_copy` (sin SQLite). Aísla la costura coordinador/worker; comportamiento idéntico | ✅ hecho — commit `44bc009`, 28/28 tests |
-| 2 | `ExecuteOptions.workers`/`max_in_flight` + pre-stage secuencial de `CREATE_DIRECTORY` + módulo de **exclusión por destino** (puro, unit-tested) | ⬜ pendiente |
+| 2 | `ExecuteOptions.workers`/`max_in_flight` + pre-stage secuencial de `CREATE_DIRECTORY` (`run_directory_stage`) + módulo de **exclusión por destino** (`dest_exclusion::DestinationGuard`, puro, unit-tested) | ✅ hecho — 31/31 tests; scaffolding `#[allow(dead_code)]` hasta que el Increment 3 lo cablea |
 | 3 | **Pool de workers acotado + protocolo coordinador↔worker** con la barrera de claim y backpressure. `workers=1` ≡ secuencial | ⬜ pendiente |
 | 4 | **Microlotes** de commit lease/claim/result (el ~32 % de SQLite) | ⬜ pendiente |
 | 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ⬜ pendiente |
 | 6 | Perfiles de durabilidad `strict`/`strict-parallel`/`fast` + ADR de durabilidad (§8) | ⬜ pendiente |
 | 7 | Medir sweep de `execute` + documentar en `m1.0.1-results.md` + PR de borrador | ⬜ pendiente |
 
-**Quien continúe: retomar desde el siguiente ⬜.** El Increment 1 ya dejó
-`prepare_copy`/`finish_copy` como funciones sin acceso a base de datos en
-`crates/df-executor/src/lib.rs`; el pool del Increment 3 mueve esas dos a
-workers y enruta la barrera de claim (y los microlotes del Increment 4) por el
-coordinador único.
+**Quien continúe: retomar desde el siguiente ⬜ (Increment 3).** Los
+Increments 1–2 dejan listas todas las piezas puras y sin SQLite:
+`prepare_copy`/`finish_copy` (la costura fs), `run_directory_stage` (el
+pre-stage secuencial de directorios) y `dest_exclusion::DestinationGuard` (la
+exclusión por destino). El Increment 3 mueve `prepare_copy`/`finish_copy` a un
+pool de workers acotado, enruta la barrera de claim (y luego los microlotes del
+Increment 4) por el coordinador único que posee la base, y usa el
+`DestinationGuard` para diferir ops en conflicto y el `run_directory_stage`
+antes de la fase paralela.
