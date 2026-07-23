@@ -33,14 +33,77 @@ const PARTIAL_FILE_PREFIX: &str = ".dataforge-partial-";
 pub struct VerifyOptions {
     /// Bytes per I/O call while re-hashing artefacts.
     pub read_buffer_bytes: usize,
+    /// Workers re-hashing artefacts in parallel. `0` = auto (a conservative
+    /// cap on the machine's parallelism). Artefact hashing is independent per
+    /// file; the verdict and the (sorted) findings are identical for any
+    /// worker count (M1.0.1). Use 1 to reproduce sequential behaviour.
+    pub workers: usize,
 }
 
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
             read_buffer_bytes: 1024 * 1024,
+            workers: 0,
         }
     }
+}
+
+/// Resolve the effective worker count (see df-hash for the rationale of the
+/// conservative auto cap).
+fn resolve_workers(requested: usize) -> usize {
+    const AUTO_WORKER_CAP: usize = 8;
+    if requested > 0 {
+        return requested;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, AUTO_WORKER_CAP)
+}
+
+/// Re-hash the given `(artefact_index, destination_path)` artefacts across a
+/// bounded scoped-thread pool, each worker with its own reusable buffer,
+/// pulling by an atomic index. Returns `(artefact_index, Result<hash,
+/// message>)` — content only, no database access — so the caller can emit
+/// findings in a deterministic order.
+fn hash_artefacts_parallel(
+    work: &[(usize, std::path::PathBuf)],
+    workers: usize,
+    read_buffer_bytes: usize,
+) -> Vec<(usize, Result<String, String>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let effective = workers.clamp(1, work.len().max(1));
+    let next = AtomicUsize::new(0);
+    let collected: Vec<Vec<(usize, Result<String, String>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..effective)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    let mut buffer = vec![0u8; read_buffer_bytes];
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= work.len() {
+                            break;
+                        }
+                        let (index, path) = &work[i];
+                        let result = hash_file(path, &mut buffer).map_err(|e| e.to_string());
+                        local.push((*index, result));
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("verify hash worker panicked"))
+            .collect()
+    });
+    let mut out: Vec<(usize, Result<String, String>)> = collected.into_iter().flatten().collect();
+    // Deterministic order for the caller regardless of worker scheduling.
+    out.sort_by_key(|(index, _)| *index);
+    out
 }
 
 /// Result of a verification run.
@@ -133,10 +196,17 @@ pub fn verify_project(
     }
 
     // 3. Artefacts (§28.2): existence and content identity, re-read from disk.
+    // Independent per-file hashing is done in parallel; the surrounding
+    // existence/manifest logic stays sequential and every finding order is
+    // made canonical by a deterministic sort at the end, so the verdict and
+    // findings are identical for any worker count (M1.0.1).
     let artefacts = plans::verifiable_artefacts(db, plan.id)?;
     let mut expected_files: HashSet<String> = HashSet::new();
     let mut expected_dirs: HashSet<String> = HashSet::new();
-    for artefact in &artefacts {
+    // Pre-pass: existence and directory checks (sequential, in order), while
+    // collecting the present files that still need a content re-hash.
+    let mut to_hash: Vec<(usize, std::path::PathBuf)> = Vec::new();
+    for (index, artefact) in artefacts.iter().enumerate() {
         // Long outputs are legitimate (the executor writes them via the
         // extended-length prefix), so the verifier must re-read them the same
         // way or it would report every deep artefact as missing.
@@ -166,10 +236,15 @@ pub fn verify_project(
             });
             continue;
         }
-        match (
-            &artefact.expected_sha256,
-            hash_file(&destination, options.read_buffer_bytes),
-        ) {
+        to_hash.push((index, destination));
+    }
+    // Parallel content re-hash of every present file, then emit findings in
+    // artefact order.
+    let workers = resolve_workers(options.workers);
+    let hashed = hash_artefacts_parallel(&to_hash, workers, options.read_buffer_bytes);
+    for (index, actual) in hashed {
+        let artefact = &artefacts[index];
+        match (&artefact.expected_sha256, actual) {
             (Some(expected), Ok(actual)) if &actual == expected => {}
             (Some(expected), Ok(actual)) => findings.push(VerificationFinding {
                 kind: "HASH_MISMATCH".to_string(),
@@ -249,6 +324,17 @@ pub fn verify_project(
             });
         }
     }
+
+    // Canonical finding order so the recorded run is identical regardless of
+    // hashing worker count or directory-walk timing (M1.0.1): severity first
+    // (problems ahead of warnings), then kind, subject and detail.
+    findings.sort_by(|a, b| {
+        a.severity
+            .cmp(&b.severity)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.subject.cmp(&b.subject))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
 
     let problems = findings
         .iter()
@@ -455,12 +541,11 @@ fn walk_output(
     }
 }
 
-fn hash_file(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
+fn hash_file(path: &Path, buffer: &mut [u8]) -> std::io::Result<String> {
     let mut reader = std::fs::File::open(path)?;
     let mut sha = sha2::Sha256::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -485,6 +570,86 @@ mod tests {
         db: Db,
         origin: PathBuf,
         output: PathBuf,
+    }
+
+    /// Run the whole pipeline over an origin of `pairs` duplicate pairs of
+    /// varied sizes and return the executed project, so verification has many
+    /// artefacts to re-hash in parallel.
+    fn executed_many(dir: &Path, pairs: u32) -> Db {
+        let origin = dir.join("origen");
+        std::fs::create_dir_all(origin.join("sub")).unwrap();
+        for i in 0..pairs {
+            let len = 1 + (i as usize * 613) % 4000;
+            let content: Vec<u8> = (0..len).map(|b| ((b as u32) ^ i) as u8).collect();
+            std::fs::write(origin.join(format!("f-{i:03}.bin")), &content).unwrap();
+            std::fs::write(origin.join("sub").join(format!("g-{i:03}.bin")), &content).unwrap();
+        }
+        let mut db = Db::open(&dir.join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "verify-det",
+            ProfileRef::default(),
+            dir.join("salida"),
+            dir.join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
+        approve_plan(&mut db, Actor::Test).unwrap();
+        execute_plan(&mut db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        db
+    }
+
+    #[test]
+    fn parallel_verification_matches_sequential_regardless_of_worker_count() {
+        let seq_dir = tempfile::tempdir().unwrap();
+        let par_dir = tempfile::tempdir().unwrap();
+        let mut seq_db = executed_many(seq_dir.path(), 40);
+        let mut par_db = executed_many(par_dir.path(), 40);
+
+        let seq = verify_project(
+            &mut seq_db,
+            Actor::Test,
+            &VerifyOptions {
+                workers: 1,
+                read_buffer_bytes: 512,
+            },
+        )
+        .unwrap();
+        let par = verify_project(
+            &mut par_db,
+            Actor::Test,
+            &VerifyOptions {
+                workers: 8,
+                read_buffer_bytes: 512,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(seq.verdict, "COMPLETED");
+        assert_eq!(seq.verdict, par.verdict);
+        assert_eq!(seq.checked, par.checked);
+        assert_eq!(seq.problems, par.problems);
+        assert_eq!(seq.warnings, par.warnings);
+        // The sorted findings must be byte-identical; the parallel path only
+        // changes hashing order, never the recorded evidence.
+        let fingerprint = |o: &VerifyOutcome| {
+            o.findings
+                .iter()
+                .map(|f| {
+                    (
+                        f.severity.clone(),
+                        f.kind.clone(),
+                        f.subject.clone(),
+                        f.detail.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fingerprint(&seq), fingerprint(&par));
     }
 
     /// Create a directory junction with `mklink /J`; false when the

@@ -61,6 +61,11 @@ enum Command {
         /// mode remains the default and the evidential recommendation.
         #[arg(long)]
         incremental: bool,
+        /// Parallel hashing workers. 0 = auto (a conservative cap on the
+        /// machine's parallelism). The result is identical for any value;
+        /// use 1 to reproduce sequential behaviour.
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -132,12 +137,22 @@ enum Command {
         /// guarantees (network shares, FAT variants) — ADR-0036.
         #[arg(long)]
         allow_degraded_destination: bool,
+        /// Parallel copy workers under a single database coordinator
+        /// (strict-parallel). Default 1 = sequential; `0` = auto. Any value
+        /// produces byte-identical output and the same recovery. Opt-in until
+        /// the full crash-injection acceptance lands.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
     },
     /// Verify the executed plan from primary evidence.
     Verify {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Parallel re-hash workers. 0 = auto. The verdict and findings are
+        /// identical for any value; use 1 to reproduce sequential behaviour.
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
     },
     /// Evidence reports derived from the inventory.
     Report {
@@ -602,11 +617,16 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Output::Status),
         },
         Command::Scan { path } => df_facade::scan_project(path, Actor::Cli).map(Output::Scan),
-        Command::Hash { path, incremental } => df_facade::hash_project_with_options(
+        Command::Hash {
+            path,
+            incremental,
+            workers,
+        } => df_facade::hash_project_with_options(
             path,
             Actor::Cli,
             &df_facade::HashOptions {
                 incremental: *incremental,
+                workers: *workers,
                 ..df_facade::HashOptions::default()
             },
         )
@@ -887,18 +907,26 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Execute {
             path,
             allow_degraded_destination,
+            workers,
         } => df_facade::execute_plan_with_options(
             path,
             Actor::Cli,
             &df_facade::ExecuteOptions {
                 allow_degraded_destination: *allow_degraded_destination,
+                workers: *workers,
                 ..df_facade::ExecuteOptions::default()
             },
         )
         .map(Output::Execute),
-        Command::Verify { path } => {
-            df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
-        }
+        Command::Verify { path, workers } => df_facade::verify_project_output_with_options(
+            path,
+            Actor::Cli,
+            &df_facade::VerifyOptions {
+                workers: *workers,
+                ..df_facade::VerifyOptions::default()
+            },
+        )
+        .map(Output::Verify),
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)

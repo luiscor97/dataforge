@@ -805,33 +805,74 @@ pub struct ExecutableOperation {
 /// hash (threat T5). `plan_operations` is still joined, but only for the
 /// mutable *progress* columns (approval, execution_state) — never for what to
 /// read or expect.
+/// Copy-family operation types (everything that opens a partial and finalises).
+const COPY_OPERATION_TYPES: &str =
+    "'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY', \
+     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT'";
+
+/// Every executable operation type (copies plus directories).
+const ALL_EXECUTABLE_TYPES: &str =
+    "'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY', \
+     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY'";
+
+/// Executable operations of any type (copies and directories interleaved by
+/// sequence). Used by the sequential executor, which completes each operation
+/// before the next fetch so a filtered window never masks pending work.
 pub fn executable_operations(
     db: &Db,
     plan_id: PlanId,
     limit: u32,
 ) -> DfResult<Vec<ExecutableOperation>> {
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT m.operation_id, m.sequence, m.operation_type,
-                    m.destination_relative_path, m.source_root_path_snapshot,
-                    m.source_relative_path_exact, m.source_fingerprint,
-                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
-                    m.source_raw_relative_path, m.source_root_identity,
-                    p.execution_state, p.partial_lease_token,
-                    p.partial_lease_identity
-             FROM execution_manifest m
-             JOIN plan_operations p ON p.id = m.operation_id
-             WHERE m.plan_id = ?1
-               AND p.approval = 'APPROVED'
-               AND m.operation_type IN
-                   ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                    'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')
-               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
-             ORDER BY m.sequence
-             LIMIT ?2",
-        )
-        .map_err(db_err)?;
+    query_executable_operations(db, plan_id, limit, ALL_EXECUTABLE_TYPES)
+}
+
+/// Executable **copy** operations only. The parallel executor pages copies
+/// separately from directories: `ORDER BY sequence LIMIT n` over a mixed set
+/// can return a window full of the other type, which the caller would misread
+/// as "no work left" while operations remain past the window.
+pub fn executable_copy_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+) -> DfResult<Vec<ExecutableOperation>> {
+    query_executable_operations(db, plan_id, limit, COPY_OPERATION_TYPES)
+}
+
+/// Executable **directory** operations only (the parallel executor's
+/// sequential pre-stage), paged the same way for the same reason.
+pub fn executable_directory_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+) -> DfResult<Vec<ExecutableOperation>> {
+    query_executable_operations(db, plan_id, limit, "'CREATE_DIRECTORY'")
+}
+
+fn query_executable_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+    operation_types: &str,
+) -> DfResult<Vec<ExecutableOperation>> {
+    // `operation_types` is a hardcoded constant list, never caller input.
+    let sql = format!(
+        "SELECT m.operation_id, m.sequence, m.operation_type,
+                m.destination_relative_path, m.source_root_path_snapshot,
+                m.source_relative_path_exact, m.source_fingerprint,
+                m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
+                m.source_raw_relative_path, m.source_root_identity,
+                p.execution_state, p.partial_lease_token,
+                p.partial_lease_identity
+         FROM execution_manifest m
+         JOIN plan_operations p ON p.id = m.operation_id
+         WHERE m.plan_id = ?1
+           AND p.approval = 'APPROVED'
+           AND m.operation_type IN ({operation_types})
+           AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
+         ORDER BY m.sequence
+         LIMIT ?2"
+    );
+    let mut stmt = db.conn().prepare(&sql).map_err(db_err)?;
     let rows: Vec<DfResult<ExecutableOperation>> = stmt
         .query_map(params![plan_id.to_string(), limit], |row| {
             Ok((

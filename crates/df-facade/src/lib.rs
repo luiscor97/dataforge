@@ -46,7 +46,7 @@ pub use df_plugin::{
 };
 pub use df_scan::ScanOutcome;
 pub use df_similarity::{SimilarityOptions, SimilarityOutcome};
-pub use df_verifier::VerifyOutcome;
+pub use df_verifier::{VerifyOptions, VerifyOutcome};
 pub use secrets::{ai_key_present, remove_ai_key, set_ai_key, AiKeyProvider};
 
 pub use df_extract::ExtractionLimits;
@@ -2139,10 +2139,20 @@ pub fn execute_plan_with_options(
 /// Verify the executed plan from primary evidence (§28). Ends in
 /// `COMPLETED`, `COMPLETED_WITH_WARNINGS` or `FAILED`.
 pub fn verify_project_output(project_dir: &Path, actor: Actor) -> DfResult<VerifyOutcome> {
+    verify_project_output_with_options(project_dir, actor, &df_verifier::VerifyOptions::default())
+}
+
+/// Verify with explicit tuning (parallel re-hash workers, M1.0.1). The
+/// verdict and findings are identical for any worker count.
+pub fn verify_project_output_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &df_verifier::VerifyOptions,
+) -> DfResult<VerifyOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_verifier::verify_project(&mut db, actor, &df_verifier::VerifyOptions::default())
+    df_verifier::verify_project(&mut db, actor, options)
 }
 
 /// Exact duplicate report of the latest snapshot (RFC-0001 §15).

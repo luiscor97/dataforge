@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use df_db::plans::{self, ExecutableOperation, OperationOutcome};
 use df_db::{repository, Db};
 use df_domain::{
-    Actor, ExecutionState, FileFingerprint, OperationErrorCode, OperationType, ProjectState,
+    Actor, ExecutionState, FileFingerprint, OperationErrorCode, OperationId, OperationType,
+    ProjectState,
 };
 use df_error::{DfError, DfResult};
 use df_fs_safety::{FileIdentity, FsSafetyError, SafeOutputRoot, SafeRelativePath};
@@ -41,6 +42,15 @@ pub struct ExecuteOptions {
     pub copy_buffer_bytes: usize,
     /// Operations fetched from the plan per round trip.
     pub operation_batch: u32,
+    /// Filesystem workers copying in parallel under the single database
+    /// coordinator (strict-parallel, design §2/§10). `0` = auto (a
+    /// conservative cap); `1` = the sequential path. Any value produces
+    /// byte-identical output and the same per-operation recovery.
+    pub workers: usize,
+    /// Backpressure bound: at most this many operations may be leased but not
+    /// yet recorded at once (`0` = derive from `workers`). Caps in-flight
+    /// memory so it never grows with the number of files (design §2).
+    pub max_in_flight: usize,
     /// Explicit acknowledgment that the destination filesystem offers only
     /// degraded identity guarantees — network shares, FAT variants or
     /// unclassifiable volumes (ADR-0036). Without it, execution towards
@@ -54,7 +64,40 @@ impl Default for ExecuteOptions {
             allow_degraded_destination: false,
             copy_buffer_bytes: 1024 * 1024,
             operation_batch: 256,
+            // Sequential by default. Unlike hash/verify (whose parallelism is
+            // shipped), execute-parallel stays opt-in until the full
+            // crash-injection acceptance (design §9, Increment 5) passes, per
+            // the "strict-parallel not default until proven" rule. `--workers`
+            // opts in; `0` then means auto.
+            workers: 1,
+            max_in_flight: 0,
         }
+    }
+}
+
+/// Resolve the effective execution worker count. `auto` (0) caps at the
+/// machine's parallelism but no higher than [`AUTO_WORKER_CAP`]; using every
+/// logical thread on mixed I/O must be measured, not assumed (see df-hash).
+/// Wired into execution by design Increment 3.
+fn resolve_workers(requested: usize) -> usize {
+    const AUTO_WORKER_CAP: usize = 8;
+    if requested > 0 {
+        return requested;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, AUTO_WORKER_CAP)
+}
+
+/// Resolve the in-flight cap from the explicit value or the worker count.
+/// Two per worker keeps every worker fed without unbounded queueing.
+/// Wired into execution by design Increment 3.
+fn resolve_in_flight(requested: usize, workers: usize) -> usize {
+    if requested > 0 {
+        requested.max(workers)
+    } else {
+        workers.saturating_mul(2).max(workers + 1)
     }
 }
 
@@ -71,6 +114,49 @@ pub struct ExecuteOutcome {
     /// Project state after the run: `EXECUTED` when every operation reached
     /// a terminal state, `EXECUTION_PAUSED` when work remains.
     pub state: String,
+    /// Aggregated wall-clock per protocol stage across this run (M1.0.1).
+    /// Local-only diagnostics; never sampled per file beyond two `Instant`
+    /// reads per stage, so the overhead is nanoseconds against I/O costs.
+    pub stage_nanos: StageNanos,
+}
+
+/// Cumulative nanoseconds spent in each stage of the per-file execution
+/// protocol (RFC-0001 §27.1), plus the operation count they cover. The sum
+/// of stages is close to — but intentionally not exactly — the phase wall
+/// time: scheduling and batch queries live between stages.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct StageNanos {
+    /// Source fingerprint capture + manifest fingerprint parse/compare.
+    pub preflight_source: u64,
+    /// Safe destination resolution + source-root boundary validation.
+    pub resolve_destination: u64,
+    /// §27.3 collision decision (existence probe, re-hash when taken).
+    pub collision_check: u64,
+    /// Durable partial lease issuance (SQLite).
+    pub lease: u64,
+    /// Parent directory + create_new partial + open-handle identity capture.
+    pub create_partial: u64,
+    /// Durable ownership claim persistence (SQLite).
+    pub claim_persist: u64,
+    /// Streamed read+write+SHA-256+BLAKE3, excluding the durability sync.
+    pub copy_stream: u64,
+    /// `sync_all` before finalize (strict durability, §27.1).
+    pub sync_all: u64,
+    /// Post-copy source fingerprint capture + compare (§14.5).
+    pub post_fingerprint: u64,
+    /// Root boundary re-proof between copy and finalize.
+    pub revalidate_root: u64,
+    /// No-replace finalize rename on the claimed handle (ADR-0021).
+    pub finalize: u64,
+    /// Operation outcome persistence (SQLite).
+    pub persist_result: u64,
+    /// Operations these accumulators cover.
+    pub operations: u64,
+}
+
+/// Elapsed nanoseconds since `start`, saturated into a `u64`.
+fn nanos_since(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Execute the approved plan; resumable and cancellable.
@@ -141,57 +227,25 @@ pub fn execute_plan(
         repository::update_project_state(db, ProjectState::Executing, actor)?;
     }
 
-    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut bytes_copied: u64 = 0;
-    let mut cancelled = false;
-    'run: loop {
-        let batch = plans::executable_operations(db, plan.id, options.operation_batch)?;
-        // Operations already attempted in this run stay for the *next* run.
-        let fresh: Vec<ExecutableOperation> = batch
-            .into_iter()
-            .filter(|op| !attempted.contains(&op.operation_id.to_string()))
-            .collect();
-        if fresh.is_empty() {
-            break;
-        }
-        for operation in fresh {
-            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                cancelled = true;
-                break 'run;
-            }
-            attempted.insert(operation.operation_id.to_string());
-            // Reclaim attempt A while A's token and physical identity are
-            // still the durable database state. A fresh lease B is issued
-            // only after this idempotent cleanup succeeds; otherwise a crash
-            // between B and cleanup would destroy the sole ownership proof.
-            if operation.operation_type != OperationType::CreateDirectory {
-                if let Err(failure) = reclaim_interrupted_partial(&safe_root, &operation) {
-                    let outcome = failure.into_outcome(chrono::Utc::now());
-                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
-                    continue;
-                }
-            }
-            // A copy receives a fresh unpredictable partial lease in the same
-            // durable update that marks it RUNNING. Directory operations do
-            // not create partials and therefore carry no ownership token.
-            let partial_lease_token = match operation.operation_type {
-                OperationType::CreateDirectory => {
-                    plans::mark_operation_running(db, operation.operation_id)?;
-                    None
-                }
-                _ => Some(plans::lease_copy_operation(db, operation.operation_id)?),
-            };
-            let outcome = run_operation(
-                db,
-                &safe_root,
-                &operation,
-                partial_lease_token.as_deref(),
-                options,
-            );
-            bytes_copied += outcome.bytes_copied;
-            plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
-        }
-    }
+    // Sequential by default; the strict-parallel path (design §2/§10) runs
+    // only when more than one worker is requested and is proven byte-identical
+    // to the sequential path by the determinism tests. Both share the exact
+    // per-file protocol (prepare/claim/finish) and per-operation recovery.
+    let workers = resolve_workers(options.workers);
+    let mut stages = StageNanos::default();
+    let (bytes_copied, cancelled, any_attempted) = if workers <= 1 {
+        run_sequential(db, &safe_root, plan.id, options, cancel, &mut stages)?
+    } else {
+        run_parallel(
+            db,
+            &safe_root,
+            plan.id,
+            workers,
+            options,
+            cancel,
+            &mut stages,
+        )?
+    };
 
     let progress = plans::plan_progress(db, plan.id)?;
     let all_terminal =
@@ -215,7 +269,7 @@ pub fn execute_plan(
     // Once this invocation attempted an operation, a PAUSED result is new and
     // must receive its own milestone even when the previous latest event has
     // the same kind and plan id.
-    let reuse_interrupted_milestone = recovering_executing && attempted.is_empty() && !cancelled;
+    let reuse_interrupted_milestone = recovering_executing && !any_attempted && !cancelled;
     let project = plans::finish_execution(
         db,
         plan.id,
@@ -235,7 +289,391 @@ pub fn execute_plan(
         bytes_copied,
         cancelled,
         state: project.state.as_str().to_string(),
+        stage_nanos: stages,
     })
+}
+
+/// The original single-writer execution loop: reclaim, lease, run, record, one
+/// operation at a time. `workers <= 1` uses this untouched path. Returns
+/// (bytes copied, cancelled, whether any operation was attempted).
+fn run_sequential(
+    db: &mut Db,
+    safe_root: &SafeOutputRoot,
+    plan_id: df_domain::PlanId,
+    options: &ExecuteOptions,
+    cancel: Option<&AtomicBool>,
+    stages: &mut StageNanos,
+) -> DfResult<(u64, bool, bool)> {
+    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut bytes_copied: u64 = 0;
+    let mut cancelled = false;
+    let mut buffer = vec![0u8; options.copy_buffer_bytes];
+    'run: loop {
+        let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
+        let fresh: Vec<ExecutableOperation> = batch
+            .into_iter()
+            .filter(|op| !attempted.contains(&op.operation_id.to_string()))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for operation in fresh {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                cancelled = true;
+                break 'run;
+            }
+            attempted.insert(operation.operation_id.to_string());
+            // Reclaim attempt A while A's token and physical identity are still
+            // the durable database state, before issuing a fresh lease B.
+            if operation.operation_type != OperationType::CreateDirectory {
+                if let Err(failure) = reclaim_interrupted_partial(safe_root, &operation) {
+                    let outcome = failure.into_outcome(chrono::Utc::now());
+                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                    continue;
+                }
+            }
+            let lease_started = std::time::Instant::now();
+            let partial_lease_token = match operation.operation_type {
+                OperationType::CreateDirectory => {
+                    plans::mark_operation_running(db, operation.operation_id)?;
+                    None
+                }
+                _ => Some(plans::lease_copy_operation(db, operation.operation_id)?),
+            };
+            stages.lease += nanos_since(lease_started);
+            let outcome = run_operation(
+                db,
+                safe_root,
+                &operation,
+                partial_lease_token.as_deref(),
+                stages,
+                &mut buffer,
+            );
+            bytes_copied += outcome.bytes_copied;
+            let persist_started = std::time::Instant::now();
+            plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+            stages.persist_result += nanos_since(persist_started);
+            stages.operations += 1;
+        }
+    }
+    Ok((bytes_copied, cancelled, !attempted.is_empty()))
+}
+
+/// Strict-parallel execution (design §2/§10). A single coordinator owns the
+/// database — it leases, commits the ownership claim and records the result —
+/// while filesystem workers run `prepare_copy`/`finish_copy` in parallel.
+/// Workers never touch SQLite: they cross the claim barrier by sending the
+/// partial's physical identity to the coordinator and awaiting the durable
+/// commit, exactly as the sequential path commits it inline. Directories are
+/// created first, sequentially, and the `DestinationGuard` keeps two in-flight
+/// copies off the same destination family; the platform no-overwrite finalize
+/// makes any residual race a safe retry, never a corruption. Byte-identical to
+/// the sequential path with the same per-operation recovery.
+fn run_parallel(
+    db: &mut Db,
+    safe_root: &SafeOutputRoot,
+    plan_id: df_domain::PlanId,
+    workers: usize,
+    options: &ExecuteOptions,
+    cancel: Option<&AtomicBool>,
+    stages: &mut StageNanos,
+) -> DfResult<(u64, bool, bool)> {
+    use dest_exclusion::DestinationGuard;
+    use std::sync::mpsc;
+
+    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut bytes_copied: u64 = 0;
+
+    // Stage A: create every directory sequentially, before any parallel copy.
+    if run_directory_stage(
+        db,
+        safe_root,
+        plan_id,
+        options,
+        cancel,
+        stages,
+        &mut attempted,
+    )? {
+        return Ok((bytes_copied, true, !attempted.is_empty()));
+    }
+
+    // Worker → coordinator messages, and coordinator → worker work items.
+    enum Msg {
+        Claim {
+            op_id: OperationId,
+            token: String,
+            identity: String,
+            ack: mpsc::Sender<Result<(), OperationFailure>>,
+        },
+        Done {
+            op_id: OperationId,
+            relative_key: String,
+            outcome: OperationOutcome,
+        },
+    }
+    struct WorkItem {
+        operation: ExecutableOperation,
+        token: String,
+        relative_key: String,
+    }
+
+    let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
+    let work_rx = std::sync::Mutex::new(work_rx);
+    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let in_flight_cap = resolve_in_flight(options.max_in_flight, workers);
+    let buffer_bytes = options.copy_buffer_bytes;
+    let mut cancelled = false;
+
+    let bytes = std::thread::scope(|scope| -> DfResult<u64> {
+        // Workers: pull a copy op, prepare (fs), cross the claim barrier through
+        // the coordinator, finish (fs), report. No database access here.
+        for _ in 0..workers {
+            let work_rx = &work_rx;
+            let msg_tx = msg_tx.clone();
+            scope.spawn(move || {
+                let mut buffer = vec![0u8; buffer_bytes];
+                let mut worker_stages = StageNanos::default();
+                loop {
+                    let item = {
+                        let rx = work_rx.lock().expect("work channel poisoned");
+                        rx.recv()
+                    };
+                    let WorkItem {
+                        operation,
+                        token,
+                        relative_key,
+                    } = match item {
+                        Ok(item) => item,
+                        Err(_) => break, // channel closed: shut down
+                    };
+                    let started_at = chrono::Utc::now();
+                    // A worker panic must not hang the coordinator waiting for a
+                    // Done that never arrives: catch it and report the operation
+                    // as retryable, so the next run reclaims any partial (by its
+                    // durable token + identity) and retries it (design window
+                    // coverage; the fs protocol itself never leaks user data).
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match SafeRelativePath::parse(Path::new(
+                            &operation.destination_relative_path,
+                        )) {
+                            Ok(relative) => match prepare_copy(
+                                safe_root,
+                                &relative,
+                                &operation,
+                                &token,
+                                &mut worker_stages,
+                                &mut buffer,
+                            ) {
+                                Ok(PrepareOutcome::Skip(outcome)) => Ok(outcome),
+                                Ok(PrepareOutcome::Prepared(prepared)) => {
+                                    // Claim barrier: hand the identity to the single
+                                    // coordinator and wait for the durable commit
+                                    // before copying a byte (rule 7).
+                                    let identity =
+                                        format_partial_identity(prepared.partial_identity);
+                                    let (ack_tx, ack_rx) = mpsc::channel();
+                                    let claim = msg_tx
+                                        .send(Msg::Claim {
+                                            op_id: operation.operation_id,
+                                            token: token.clone(),
+                                            identity,
+                                            ack: ack_tx,
+                                        })
+                                        .ok()
+                                        .and_then(|()| ack_rx.recv().ok());
+                                    match claim {
+                                        Some(Ok(())) => finish_copy(
+                                            safe_root,
+                                            &operation,
+                                            prepared,
+                                            &mut worker_stages,
+                                            &mut buffer,
+                                        ),
+                                        other => {
+                                            // Claim failed or the coordinator is
+                                            // gone: clean up only our own claimed
+                                            // partial (identity-checked), as the
+                                            // sequential path does.
+                                            let PreparedCopy {
+                                                handle,
+                                                partial_relative,
+                                                partial_identity,
+                                                ..
+                                            } = prepared;
+                                            drop(handle);
+                                            let _ = safe_root.remove_leased_partial_secure(
+                                                &partial_relative,
+                                                partial_identity,
+                                            );
+                                            Err(other.and_then(|r| r.err()).unwrap_or_else(|| {
+                                                OperationFailure::fatal(
+                                                    OperationErrorCode::IoError,
+                                                    "execution coordinator dropped the claim",
+                                                )
+                                            }))
+                                        }
+                                    }
+                                }
+                                Err(failure) => Err(failure),
+                            },
+                            Err(error) => Err(OperationFailure::from_fs_safety(error)),
+                        }
+                    }));
+                    let outcome = match result {
+                        Ok(Ok(mut outcome)) => {
+                            outcome.started_at = started_at;
+                            outcome
+                        }
+                        Ok(Err(failure)) => failure.into_outcome(started_at),
+                        Err(_panic) => OperationFailure {
+                            code: OperationErrorCode::IoError,
+                            state: ExecutionState::FailedRetryable,
+                            detail: "copy worker panicked; operation left for retry".to_string(),
+                            retain_partial_lease: false,
+                        }
+                        .into_outcome(started_at),
+                    };
+                    let _ = msg_tx.send(Msg::Done {
+                        op_id: operation.operation_id,
+                        relative_key,
+                        outcome,
+                    });
+                }
+            });
+        }
+        // The coordinator holds no worker clone, so msg_rx closes when the last
+        // worker exits.
+        drop(msg_tx);
+
+        // Coordinator: owns db. Dispatch up to the in-flight cap honouring the
+        // destination guard, then service claim/result messages, dispatching
+        // more as operations complete.
+        let mut guard = DestinationGuard::new();
+        let mut outstanding = 0usize;
+        let mut ready: std::collections::VecDeque<ExecutableOperation> =
+            std::collections::VecDeque::new();
+        let mut deferred: Vec<ExecutableOperation> = Vec::new();
+        let mut exhausted = false;
+        loop {
+            let cancel_now = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+            cancelled |= cancel_now;
+            // Refill the ready queue from the database when it runs low.
+            // Copy-only paging so directories never mask pending copies.
+            if ready.is_empty() && !exhausted && !cancelled {
+                let batch =
+                    plans::executable_copy_operations(db, plan_id, options.operation_batch)?;
+                let batch_empty = batch.is_empty();
+                let mut added = 0usize;
+                for op in batch {
+                    if !attempted.contains(&op.operation_id.to_string()) {
+                        ready.push_back(op);
+                        added += 1;
+                    }
+                }
+                // `batch_empty` means no executable copy remains — truly done.
+                // A non-empty batch with `added == 0` is a window full of
+                // in-flight RUNNING copies (they free as they complete) or of
+                // FAILED_RETRYABLE copies stuck for this run; only give up on
+                // the latter, when nothing is in flight to advance the window.
+                if batch_empty || (added == 0 && outstanding == 0) {
+                    exhausted = true;
+                }
+            }
+            // Dispatch while capacity and work remain and not cancelled.
+            while outstanding < in_flight_cap && !cancelled {
+                let Some(operation) = ready.pop_front() else {
+                    break;
+                };
+                let relative_key = operation.destination_relative_path.clone();
+                if !guard.try_acquire(&relative_key) {
+                    // A conflicting destination is in flight; defer this op.
+                    deferred.push(operation);
+                    continue;
+                }
+                attempted.insert(operation.operation_id.to_string());
+                if let Err(failure) = reclaim_interrupted_partial(safe_root, &operation) {
+                    guard.release(&relative_key);
+                    let outcome = failure.into_outcome(chrono::Utc::now());
+                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                    stages.operations += 1;
+                    continue;
+                }
+                let lease_started = std::time::Instant::now();
+                let token = plans::lease_copy_operation(db, operation.operation_id)?;
+                stages.lease += nanos_since(lease_started);
+                work_tx
+                    .send(WorkItem {
+                        operation,
+                        token,
+                        relative_key,
+                    })
+                    .expect("workers dropped the work channel");
+                outstanding += 1;
+            }
+            if outstanding == 0 {
+                // Nothing in flight: no destination is held, so any deferred
+                // op can now be re-offered. Otherwise we are done.
+                if !deferred.is_empty() {
+                    ready.extend(deferred.drain(..));
+                    continue;
+                }
+                if cancelled || (exhausted && ready.is_empty()) {
+                    break;
+                }
+                if ready.is_empty() {
+                    // Not exhausted yet: loop to refill.
+                    continue;
+                }
+                // ready has items the guard let through on the next pass.
+                continue;
+            }
+            // Block for the next worker message.
+            match msg_rx.recv() {
+                Ok(Msg::Claim {
+                    op_id,
+                    token,
+                    identity,
+                    ack,
+                }) => {
+                    let claim_started = std::time::Instant::now();
+                    let result =
+                        plans::claim_copy_partial(db, op_id, &token, &identity).map_err(|error| {
+                            OperationFailure {
+                                code: OperationErrorCode::IoError,
+                                state: ExecutionState::FailedRetryable,
+                                detail: format!("persisting partial ownership claim: {error}"),
+                                retain_partial_lease: false,
+                            }
+                        });
+                    stages.claim_persist += nanos_since(claim_started);
+                    let _ = ack.send(result);
+                }
+                Ok(Msg::Done {
+                    op_id,
+                    relative_key,
+                    outcome,
+                }) => {
+                    bytes_copied += outcome.bytes_copied;
+                    let persist_started = std::time::Instant::now();
+                    plans::record_operation_outcome(db, op_id, &outcome)?;
+                    stages.persist_result += nanos_since(persist_started);
+                    stages.operations += 1;
+                    guard.release(&relative_key);
+                    outstanding -= 1;
+                    // A freed destination may unblock a deferred op.
+                    if !deferred.is_empty() {
+                        ready.extend(deferred.drain(..));
+                    }
+                }
+                Err(_) => break, // all workers gone
+            }
+        }
+        // Close the work channel so idle workers exit; the scope joins them.
+        drop(work_tx);
+        Ok(bytes_copied)
+    })?;
+
+    Ok((bytes, cancelled, !attempted.is_empty()))
 }
 
 fn execution_source_roots(
@@ -270,7 +708,8 @@ fn run_operation(
     safe_root: &SafeOutputRoot,
     operation: &ExecutableOperation,
     partial_lease_token: Option<&str>,
-    options: &ExecuteOptions,
+    stages: &mut StageNanos,
+    buffer: &mut [u8],
 ) -> OperationOutcome {
     let started_at = chrono::Utc::now();
 
@@ -287,7 +726,9 @@ fn run_operation(
                         "copy operation without a durable partial lease",
                     )
                 })
-                .and_then(|token| copy_file(db, safe_root, &relative, operation, token, options)),
+                .and_then(|token| {
+                    copy_file(db, safe_root, &relative, operation, token, stages, buffer)
+                }),
         },
         Err(error) => Err(OperationFailure::from_fs_safety(error)),
     };
@@ -298,6 +739,128 @@ fn run_operation(
             outcome
         }
         Err(failure) => failure.into_outcome(started_at),
+    }
+}
+
+/// Sequential `CREATE_DIRECTORY` pre-stage for parallel execution (design §4):
+/// create every planned directory before any parallel copy starts, so copies
+/// never race on a parent directory. Cheap and single-writer. Returns whether
+/// cancellation fired. Wired into execution by design Increment 3.
+fn run_directory_stage(
+    db: &mut Db,
+    safe_root: &SafeOutputRoot,
+    plan_id: df_domain::PlanId,
+    options: &ExecuteOptions,
+    cancel: Option<&AtomicBool>,
+    stages: &mut StageNanos,
+    attempted: &mut std::collections::HashSet<String>,
+) -> DfResult<bool> {
+    // Directories never read or write file bytes, so no copy buffer is needed.
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        // Directory-only paging: a mixed query could return a window full of
+        // copies and hide directories that sit past it.
+        let batch = plans::executable_directory_operations(db, plan_id, options.operation_batch)?;
+        let fresh_dirs: Vec<ExecutableOperation> = batch
+            .into_iter()
+            .filter(|op| !attempted.contains(&op.operation_id.to_string()))
+            .collect();
+        if fresh_dirs.is_empty() {
+            return Ok(false);
+        }
+        for operation in fresh_dirs {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Ok(true);
+            }
+            attempted.insert(operation.operation_id.to_string());
+            plans::mark_operation_running(db, operation.operation_id)?;
+            let outcome = run_operation(db, safe_root, &operation, None, stages, &mut buffer);
+            plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+            stages.operations += 1;
+        }
+    }
+}
+
+/// Destination exclusion for parallel execution (design §4): stops two
+/// in-flight copy operations from racing on the same destination family. The
+/// key is the planned destination path, case-folded — the §27.3 collision
+/// suffix is derived from that base, so an operation and any suffix variant it
+/// might take share one key, and the case fold matches the case-insensitive
+/// collision check. Parent/child races are prevented separately by creating
+/// every directory before the parallel copy phase. Pure and single-threaded
+/// (the coordinator owns it); wired by design Increment 3.
+mod dest_exclusion {
+    use std::collections::HashSet;
+
+    /// Destination keys currently reserved by in-flight operations.
+    #[derive(Default)]
+    pub(crate) struct DestinationGuard {
+        held: HashSet<String>,
+    }
+
+    impl DestinationGuard {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        fn key(relative: &str) -> String {
+            relative.to_lowercase()
+        }
+
+        /// Reserve `relative` for one in-flight operation. `false` means
+        /// another in-flight operation holds a conflicting key, so the caller
+        /// must defer this operation until that one releases.
+        pub(crate) fn try_acquire(&mut self, relative: &str) -> bool {
+            self.held.insert(Self::key(relative))
+        }
+
+        /// Release a key once its operation has been recorded.
+        pub(crate) fn release(&mut self, relative: &str) {
+            self.held.remove(&Self::key(relative));
+        }
+
+        #[cfg(test)]
+        pub(crate) fn len(&self) -> usize {
+            self.held.len()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn is_empty(&self) -> bool {
+            self.held.is_empty()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_same_destination_cannot_be_held_twice() {
+            let mut guard = DestinationGuard::new();
+            assert!(guard.try_acquire("casos/a.txt"));
+            assert!(!guard.try_acquire("casos/a.txt"), "already in flight");
+            guard.release("casos/a.txt");
+            assert!(guard.try_acquire("casos/a.txt"), "free after release");
+        }
+
+        #[test]
+        fn distinct_destinations_are_independent() {
+            let mut guard = DestinationGuard::new();
+            assert!(guard.try_acquire("casos/a.txt"));
+            assert!(guard.try_acquire("casos/b.txt"));
+            assert_eq!(guard.len(), 2);
+            assert!(!guard.is_empty());
+        }
+
+        #[test]
+        fn keys_are_case_folded_like_the_collision_check() {
+            // The §27.3 collision check compares destinations the way the
+            // filesystem does (case-insensitive on NTFS); the guard must too,
+            // or two case-variant plans could both go in flight and race.
+            let mut guard = DestinationGuard::new();
+            assert!(guard.try_acquire("Casos/A.txt"));
+            assert!(!guard.try_acquire("casos/a.txt"));
+        }
     }
 }
 
@@ -482,14 +1045,45 @@ fn reclaim_interrupted_partial(
     Ok(())
 }
 
-fn copy_file(
-    db: &Db,
+#[allow(clippy::too_many_arguments)]
+/// Everything Stage A produces for the claim barrier and Stage B: the open,
+/// physically-identified partial plus the validated paths and the source
+/// identity. It owns all of it (no borrows), so on a parallel executor it can
+/// move from a filesystem worker to the coordinator and back unchanged
+/// (M1.0.1); the claim barrier sits exactly between producing this and
+/// consuming it.
+struct PreparedCopy {
+    handle: std::fs::File,
+    partial_identity: FileIdentity,
+    partial_relative: SafeRelativePath,
+    relative: SafeRelativePath,
+    source: PathBuf,
+    pre: FileFingerprint,
+    expected_sha256: String,
+}
+
+/// Outcome of Stage A: either the destination already holds the exact expected
+/// content (nothing to copy, §27.3) or a partial is open and ready to claim.
+enum PrepareOutcome {
+    Skip(OperationOutcome),
+    Prepared(PreparedCopy),
+}
+
+/// Stage A — pure filesystem, **no SQLite**. Validate the source against the
+/// frozen manifest fingerprint (§27.1), reserve the destination (§27.3), and
+/// create + physically identify the partial through the safe boundary. The
+/// returned identity is what crosses the claim barrier to the coordinator; a
+/// crash after `create_new` but before the claim leaves an unclaimed orphan
+/// that is never deleted (design window B).
+fn prepare_copy(
     safe_root: &SafeOutputRoot,
     planned_relative: &SafeRelativePath,
     operation: &ExecutableOperation,
     partial_lease_token: &str,
-    options: &ExecuteOptions,
-) -> Result<OperationOutcome, OperationFailure> {
+    stages: &mut StageNanos,
+    buffer: &mut [u8],
+) -> Result<PrepareOutcome, OperationFailure> {
+    let stage_started = std::time::Instant::now();
     validate_source_root(safe_root, operation)?;
     // Resolving proves the planned destination is reachable without crossing a
     // single link, and re-checks the output root's physical identity.
@@ -500,6 +1094,7 @@ fn copy_file(
         .to_path_buf();
     let planned_destination = planned_destination.as_path();
     let source = source_path(operation)?;
+    stages.resolve_destination += nanos_since(stage_started);
     let expected_sha256 = operation.expected_sha256.as_deref().ok_or_else(|| {
         OperationFailure::fatal(
             OperationErrorCode::InvalidPath,
@@ -510,6 +1105,7 @@ fn copy_file(
     // 1. Validate the source against the fingerprint frozen in the manifest
     // (§27.1). Parsed, not string-compared: a v1 token from an older snapshot
     // must not masquerade as a v2 match (ADR-0019).
+    let stage_started = std::time::Instant::now();
     let pre = current_fingerprint(&source)?;
     let approved = operation
         .source_fingerprint
@@ -534,17 +1130,20 @@ fn copy_file(
             "source changed since the snapshot was taken (RFC-0001 §27.5)",
         ));
     }
+    stages.preflight_source += nanos_since(stage_started);
 
     // 2. Reserve the destination (§27.3): never overwrite.
+    let stage_started = std::time::Instant::now();
     let (relative, skip) = resolve_collision(
         safe_root,
         planned_relative,
         planned_destination,
         expected_sha256,
-        options,
+        buffer,
     )?;
+    stages.collision_check += nanos_since(stage_started);
     if skip {
-        return Ok(OperationOutcome {
+        return Ok(PrepareOutcome::Skip(OperationOutcome {
             execution_state: ExecutionState::Completed,
             outcome: "SKIP_REPRESENTED".to_string(),
             error_code: None,
@@ -557,18 +1156,21 @@ fn copy_file(
             blake3: operation.expected_blake3.clone(),
             started_at: chrono::Utc::now(),
             retain_partial_lease: false,
-        });
+        }));
     }
 
+    let stage_started = std::time::Instant::now();
     if let Some(parent) = relative.parent() {
         safe_root
             .create_directory_secure(&parent)
             .map_err(OperationFailure::from_fs_safety)?;
     }
 
-    // 3–5. Partial file, streamed copy with both hashes, flush (§27.1–27.2).
-    // The partial is created through the safe boundary with create_new, so it
-    // can neither follow a link nor reuse someone else's file.
+    // 3. Partial file created through the safe boundary with create_new, then
+    // its physical identity captured from that exact open handle. Ownership is
+    // claimed only *after* create_new succeeded (in the caller, the claim
+    // barrier), using this identity — a path reopen here would let a rename
+    // race claim somebody else's replacement.
     let partial_relative = relative
         .with_file_name(&partial_file_name(operation, partial_lease_token)?)
         .map_err(OperationFailure::from_fs_safety)?;
@@ -580,9 +1182,6 @@ fn copy_file(
     let handle = safe_root
         .create_partial_secure(&partial_relative)
         .map_err(OperationFailure::from_fs_safety)?;
-    // Ownership is claimed only *after* create_new succeeded, using identity
-    // read from that exact open handle. A path reopen here would let a rename
-    // race claim somebody else's replacement.
     let partial_identity = df_fs_safety::identity_of_open_file(&handle, &partial)
         .map_err(OperationFailure::from_fs_safety)?
         .ok_or_else(|| {
@@ -591,24 +1190,45 @@ fn copy_file(
                 "filesystem did not provide a physical identity for the new partial",
             )
         })?;
-    let stored_identity = format_partial_identity(partial_identity);
-    if let Err(error) = plans::claim_copy_partial(
-        db,
-        operation.operation_id,
-        partial_lease_token,
-        &stored_identity,
-    ) {
-        drop(handle);
-        let _ = safe_root.remove_leased_partial_secure(&partial_relative, partial_identity);
-        return Err(OperationFailure {
-            code: OperationErrorCode::IoError,
-            state: ExecutionState::FailedRetryable,
-            detail: format!("persisting partial ownership claim: {error}"),
-            retain_partial_lease: false,
-        });
-    }
-    let copy = stream_copy(&source, handle, options.copy_buffer_bytes)
-        .map_err(|e| OperationFailure::from_io(&e, "copying"));
+    stages.create_partial += nanos_since(stage_started);
+
+    Ok(PrepareOutcome::Prepared(PreparedCopy {
+        handle,
+        partial_identity,
+        partial_relative,
+        relative,
+        source,
+        pre,
+        expected_sha256: expected_sha256.to_string(),
+    }))
+}
+
+/// Stage B — pure filesystem, **no SQLite**. With the claim already durable,
+/// copy the bytes (hashing as we go), verify the content hash and source
+/// stability (§14.5), re-prove the boundary and finalize with the platform
+/// no-replace primitive (ADR-0021). Any failure past the claim cleans up only
+/// this executor's own claimed partial (identity-checked), never user data.
+fn finish_copy(
+    safe_root: &SafeOutputRoot,
+    operation: &ExecutableOperation,
+    prepared: PreparedCopy,
+    stages: &mut StageNanos,
+    buffer: &mut [u8],
+) -> Result<OperationOutcome, OperationFailure> {
+    let PreparedCopy {
+        handle,
+        partial_identity,
+        partial_relative,
+        relative,
+        source,
+        pre,
+        expected_sha256,
+    } = prepared;
+
+    let stage_started = std::time::Instant::now();
+    let copy =
+        stream_copy(&source, handle, buffer).map_err(|e| OperationFailure::from_io(&e, "copying"));
+    let copy_total = nanos_since(stage_started);
     let copy = match copy {
         Ok(copy) => copy,
         Err(failure) => {
@@ -620,6 +1240,8 @@ fn copy_file(
             ));
         }
     };
+    stages.sync_all += copy.sync_nanos;
+    stages.copy_stream += copy_total.saturating_sub(copy.sync_nanos);
 
     // 6. Compare against the identity recorded at hash time (§27.1).
     if copy.sha256 != expected_sha256 {
@@ -639,6 +1261,7 @@ fn copy_file(
     }
 
     // 7. The source must not have changed while we read it (§14.5).
+    let stage_started = std::time::Instant::now();
     match current_fingerprint(&source) {
         Ok(post) if !FileFingerprint::compare(&pre, &post).is_changed() => {}
         _ => {
@@ -654,9 +1277,11 @@ fn copy_file(
             ));
         }
     }
+    stages.post_fingerprint += nanos_since(stage_started);
     // Re-prove the root boundary after reading and before committing the
     // destination. This catches a junction/root swap during a long copy; the
     // file fingerprint above independently catches a source-object swap.
+    let stage_started = std::time::Instant::now();
     if let Err(failure) = validate_source_root(safe_root, operation) {
         return Err(cleanup_after_claimed_failure(
             safe_root,
@@ -665,12 +1290,14 @@ fn copy_file(
             failure,
         ));
     }
+    stages.revalidate_root += nanos_since(stage_started);
 
     // 8. Finalize. The no-overwrite guarantee comes from the platform, not
     // from a prior exists() check, which would be a race (ADR-0021): if the
     // destination appeared during the copy, the kernel itself refuses. The
     // identity check and rename both happen on the same handle, so a foreign
     // replacement cannot enter between them.
+    let stage_started = std::time::Instant::now();
     if let Err(error) = safe_root.finalize_claimed_partial_no_replace(
         &partial_relative,
         &relative,
@@ -684,6 +1311,7 @@ fn copy_file(
             failure,
         ));
     }
+    stages.finalize += nanos_since(stage_started);
 
     Ok(OperationOutcome {
         execution_state: ExecutionState::Completed,
@@ -699,6 +1327,59 @@ fn copy_file(
         started_at: chrono::Utc::now(),
         retain_partial_lease: false,
     })
+}
+
+/// The coordinator's per-copy driver: Stage A, the durable claim barrier (§27.1
+/// step 4 — the single SQLite touch of the protocol), then Stage B. Splitting
+/// the two pure-filesystem stages around the claim is what lets a bounded
+/// worker pool run the filesystem work while a single coordinator owns the
+/// database (M1.0.1); the sequential executor runs all three inline.
+fn copy_file(
+    db: &Db,
+    safe_root: &SafeOutputRoot,
+    planned_relative: &SafeRelativePath,
+    operation: &ExecutableOperation,
+    partial_lease_token: &str,
+    stages: &mut StageNanos,
+    buffer: &mut [u8],
+) -> Result<OperationOutcome, OperationFailure> {
+    let prepared = match prepare_copy(
+        safe_root,
+        planned_relative,
+        operation,
+        partial_lease_token,
+        stages,
+        buffer,
+    )? {
+        PrepareOutcome::Skip(outcome) => return Ok(outcome),
+        PrepareOutcome::Prepared(prepared) => prepared,
+    };
+
+    // Claim barrier (§27.1 step 4): the partial's physical identity becomes
+    // durable *before* a byte is copied, so ownership stays tied to identity
+    // (rule 7). A crash here leaves an unclaimed orphan that is never deleted
+    // (design window B). This is the only SQLite touch inside the per-file
+    // protocol; a parallel executor routes it through the single coordinator.
+    let stage_started = std::time::Instant::now();
+    if let Err(error) = plans::claim_copy_partial(
+        db,
+        operation.operation_id,
+        partial_lease_token,
+        &format_partial_identity(prepared.partial_identity),
+    ) {
+        drop(prepared.handle);
+        let _ = safe_root
+            .remove_leased_partial_secure(&prepared.partial_relative, prepared.partial_identity);
+        return Err(OperationFailure {
+            code: OperationErrorCode::IoError,
+            state: ExecutionState::FailedRetryable,
+            detail: format!("persisting partial ownership claim: {error}"),
+            retain_partial_lease: false,
+        });
+    }
+    stages.claim_persist += nanos_since(stage_started);
+
+    finish_copy(safe_root, operation, prepared, stages, buffer)
 }
 
 fn validate_source_root(
@@ -765,7 +1446,7 @@ fn resolve_collision(
     planned_relative: &SafeRelativePath,
     planned_absolute: &Path,
     expected_sha256: &str,
-    options: &ExecuteOptions,
+    buffer: &mut [u8],
 ) -> Result<(SafeRelativePath, bool), OperationFailure> {
     // Existence and re-hash must use the extended form: a long path probed
     // without it reports "not found" for a file that is really there, and the
@@ -773,7 +1454,7 @@ fn resolve_collision(
     if !df_fs_safety::extended_for_io(planned_absolute).exists() {
         return Ok((planned_relative.clone(), false));
     }
-    let existing_sha = hash_existing(planned_absolute, options.copy_buffer_bytes)
+    let existing_sha = hash_existing(planned_absolute, buffer)
         .map_err(|e| OperationFailure::from_io(&e, "hashing existing destination"))?;
     if existing_sha == expected_sha256 {
         return Ok((planned_relative.clone(), true));
@@ -789,7 +1470,7 @@ fn resolve_collision(
     if !df_fs_safety::extended_for_io(&suffixed_absolute).exists() {
         return Ok((suffixed_relative, false));
     }
-    let suffixed_sha = hash_existing(&suffixed_absolute, options.copy_buffer_bytes)
+    let suffixed_sha = hash_existing(&suffixed_absolute, buffer)
         .map_err(|e| OperationFailure::from_io(&e, "hashing existing suffixed destination"))?;
     if suffixed_sha == expected_sha256 {
         return Ok((suffixed_relative, true));
@@ -907,6 +1588,9 @@ struct StreamedCopy {
     bytes: u64,
     sha256: String,
     blake3: String,
+    /// Nanoseconds spent in the durability `sync_all`, so the caller can bill
+    /// it to the sync stage separately from the read/write/hash loop.
+    sync_nanos: u64,
 }
 
 /// Stream the source into an already-opened partial, hashing as we go.
@@ -917,15 +1601,14 @@ struct StreamedCopy {
 fn stream_copy(
     source: &Path,
     mut writer: std::fs::File,
-    buffer_bytes: usize,
+    buffer: &mut [u8],
 ) -> std::io::Result<StreamedCopy> {
     let mut reader = std::fs::File::open(source)?;
     let mut sha = sha2::Sha256::new();
     let mut blake = blake3::Hasher::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     let mut bytes: u64 = 0;
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -935,20 +1618,22 @@ fn stream_copy(
         bytes += read as u64;
     }
     // Flush to stable storage before the atomic rename (§27.1).
+    let sync_started = std::time::Instant::now();
     writer.sync_all()?;
+    let sync_nanos = nanos_since(sync_started);
     Ok(StreamedCopy {
         bytes,
         sha256: hex::encode(sha.finalize()),
         blake3: blake.finalize().to_hex().to_string(),
+        sync_nanos,
     })
 }
 
-fn hash_existing(path: &Path, buffer_bytes: usize) -> std::io::Result<String> {
+fn hash_existing(path: &Path, buffer: &mut [u8]) -> std::io::Result<String> {
     let mut reader = std::fs::File::open(df_fs_safety::extended_for_io(path))?;
     let mut sha = sha2::Sha256::new();
-    let mut buffer = vec![0u8; buffer_bytes];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -1047,6 +1732,243 @@ mod tests {
             }
         }
         true
+    }
+
+    /// Platform-neutral snapshot of an output tree: sorted relative paths with
+    /// file bytes (directories carry empty bytes), for byte-for-byte equality.
+    fn output_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut queue = vec![root.to_path_buf()];
+        while let Some(dir) = queue.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if entry.metadata().unwrap().is_dir() {
+                    queue.push(path);
+                    out.push((relative, Vec::new()));
+                } else {
+                    out.push((relative, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Approve a project with many varied-size files across two subdirectories,
+    /// so parallel execution exercises the worker pool and the directory
+    /// pre-stage.
+    fn approved_many(tmp: &Path) -> Fixture {
+        let origin = tmp.join("origen");
+        std::fs::create_dir_all(origin.join("sub")).unwrap();
+        std::fs::create_dir_all(origin.join("otra")).unwrap();
+        for i in 0..40u32 {
+            let len = 1 + (i as usize * 331) % 3000;
+            let content: Vec<u8> = (0..len).map(|b| ((b as u32) ^ i) as u8).collect();
+            std::fs::write(origin.join(format!("f-{i:03}.bin")), &content).unwrap();
+            std::fs::write(origin.join("sub").join(format!("g-{i:03}.bin")), &content).unwrap();
+        }
+        let output = tmp.join("salida");
+        let mut db = Db::open(&tmp.join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "det",
+            ProfileRef::default(),
+            output.clone(),
+            tmp.join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
+        approve_plan(&mut db, Actor::Test).unwrap();
+        Fixture { db, origin, output }
+    }
+
+    #[test]
+    fn parallel_execution_matches_sequential_byte_for_byte() {
+        let seq_tmp = tempfile::tempdir().unwrap();
+        let par_tmp = tempfile::tempdir().unwrap();
+        let mut seq = approved_many(seq_tmp.path());
+        let mut par = approved_many(par_tmp.path());
+
+        let seq_out = execute_plan(
+            &mut seq.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 1,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        let par_out = execute_plan(
+            &mut par.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 8,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(seq_out.state, "EXECUTED");
+        assert_eq!(par_out.state, "EXECUTED", "parallel run must complete");
+        assert_eq!(
+            seq_out.completed, par_out.completed,
+            "same operation count completed"
+        );
+        assert_eq!(par_out.failed_final, 0, "no final failures under parallel");
+        assert_eq!(par_out.failed_retryable, 0, "no retryable failures either");
+        assert!(
+            no_partials_left(&par.output),
+            "no partial files left behind by the parallel run"
+        );
+        // The whole guarantee: the output is byte-identical regardless of the
+        // worker count, and the origin is untouched.
+        assert_eq!(
+            output_tree(&seq.output),
+            output_tree(&par.output),
+            "parallel output must be byte-identical to sequential"
+        );
+        assert_eq!(
+            output_tree(&seq.origin),
+            output_tree(&par.origin),
+            "origin must be untouched in both runs"
+        );
+    }
+
+    #[test]
+    fn parallel_execution_completes_every_operation_across_many_refetches() {
+        // A small operation_batch with many workers forces the coordinator to
+        // page the queue many times while in-flight (RUNNING) and directory
+        // operations sit in the LIMIT window — the case a single-batch test
+        // misses. Every operation must still complete.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        for d in 0..6u32 {
+            let sub = origin.join(format!("dir-{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for i in 0..50u32 {
+                let len = 1 + (i as usize % 200);
+                let content: Vec<u8> = (0..len).map(|b| (b as u8) ^ (d as u8)).collect();
+                std::fs::write(sub.join(format!("f-{d}-{i:03}.bin")), &content).unwrap();
+            }
+        }
+        let output = tmp.path().join("salida");
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "complete",
+            ProfileRef::default(),
+            output.clone(),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin.clone())];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        analyze_project(&mut db, Actor::Test).unwrap();
+        create_plan(&mut db, Actor::Test, df_domain::DuplicatePolicy::ReportOnly).unwrap();
+        approve_plan(&mut db, Actor::Test).unwrap();
+
+        let out = execute_plan(
+            &mut db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 8,
+                operation_batch: 8, // force many refetches with in-flight masking
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.state, "EXECUTED",
+            "every operation must complete (state {}, pending {})",
+            out.state, out.pending
+        );
+        assert_eq!(out.pending, 0, "no operations left pending");
+        assert_eq!(out.failed_final, 0);
+        assert!(
+            out.completed >= 300,
+            "expected >=300 operations completed, got {}",
+            out.completed
+        );
+    }
+
+    #[test]
+    fn parallel_execution_resumes_correctly_after_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_many(tmp.path());
+        let options = ExecuteOptions {
+            workers: 8,
+            ..ExecuteOptions::default()
+        };
+
+        // Cancel shortly after the parallel run starts, from another thread, so
+        // the coordinator drains its in-flight operations mid-run.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let _first = execute_plan(&mut fx.db, Actor::Test, &options, Some(&cancel)).unwrap();
+        stopper.join().unwrap();
+        // Whether it cancelled mid-run or finished first, draining in-flight
+        // operations must never leave an orphan partial behind.
+        assert!(
+            no_partials_left(&fx.output),
+            "cancellation left an orphan partial"
+        );
+
+        // Resume in parallel: every remaining operation completes.
+        let second = execute_plan(&mut fx.db, Actor::Test, &options, None).unwrap();
+        assert_eq!(
+            second.state, "EXECUTED",
+            "resume must complete every operation"
+        );
+        assert_eq!(second.failed_final, 0);
+        assert!(no_partials_left(&fx.output));
+
+        // The resumed parallel output must equal a clean sequential run.
+        let clean_tmp = tempfile::tempdir().unwrap();
+        let mut clean = approved_many(clean_tmp.path());
+        execute_plan(
+            &mut clean.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 1,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            output_tree(&fx.output),
+            output_tree(&clean.output),
+            "resumed parallel output must match a clean sequential run"
+        );
+        assert_eq!(
+            output_tree(&fx.origin),
+            output_tree(&clean.origin),
+            "origin untouched"
+        );
     }
 
     fn first_copy_operation(db: &Db) -> ExecutableOperation {

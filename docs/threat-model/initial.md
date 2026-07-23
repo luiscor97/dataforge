@@ -90,6 +90,11 @@ modificar arbitrariamente proceso, base y salida a la vez.
 - Reuso incremental sin identidad física completa: se niega, hash completo.
 - Destino sin identidad física y sin `--allow-degraded-destination`:
   ejecución rechazada tras la validación de plataforma.
+- Paralelismo de hash/verificación (M1.0.1): los workers nunca abren SQLite
+  (un único escritor coordinador), el resultado es byte-idéntico a
+  `workers=1` (probado) y la cancelación solo deja de tomar trabajos nuevos;
+  ninguna respuesta depende del scheduling. Más hilos no relajan ninguna
+  comprobación (ADR-0040).
 
 ## Riesgos aceptados y límites
 
