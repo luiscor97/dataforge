@@ -123,10 +123,11 @@ Qué existe hoy (real, con pruebas):
   opt-in que solo reusan identidad física probada byte-idéntica
   (ADR-0035); NAS endurecido con clasificación real del filesystem y
   destino degradado solo con reconocimiento explícito (ADR-0036).
-- **Estabilización M0.9 (en curso)**: contratos congelados con test de
-  regresión (ADR-0037), fuzzing de los parsers de entrada no confiable,
-  SBOM CycloneDX reproducible, linkado reproducible (ADR-0038), manual de
-  usuario y threat model consolidado.
+- **Estabilización M0.9**: contratos congelados con test de regresión
+  (ADR-0037), fuzzing de los parsers de entrada no confiable, SBOM CycloneDX
+  reproducible, linkado reproducible verificado en CI (ADR-0038), firma de
+  release keyless con Sigstore (ADR-0039), manual de usuario y threat model
+  consolidado.
 - Planificación (`df-planner`): plan con cobertura completa de cada aparición,
   política explícita de duplicados, guía de reglas/revisión, razones por
   operación, validación y aprobación que congela un manifiesto bajo SHA-256.
@@ -163,11 +164,12 @@ Qué existe hoy (real, con pruebas):
 
 Qué **no** existe todavía (y no está simulado): relaciones documentales por
 significado, reconstrucción automática de expedientes, daemon en segundo
-plano, builds firmadas (la vía de firma está por decidir; el hueco está
-preparado en el workflow de release) e informes finales exportables. La
-extracción produce evidencia derivada y búsquedas; la IA explica sobre
-evidencia con consentimiento — ninguna de las dos es comprensión semántica
-ni autoriza consolidar contenido o árboles automáticamente.
+plano, firma Authenticode/SmartScreen (los artefactos se firman con Sigstore
+keyless, ADR-0039, pero eso no es una firma de código de Windows) e informes
+finales exportables. La extracción produce evidencia derivada y búsquedas; la
+IA explica sobre evidencia con consentimiento — ninguna de las dos es
+comprensión semántica ni autoriza consolidar contenido o árboles
+automáticamente.
 Ver el [roadmap](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md#45-roadmap-maestro)
 y el [mapa de aceptación M1.0](docs/release/m1.0-acceptance.md).
 

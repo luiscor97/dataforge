@@ -7,7 +7,7 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 _Nada pendiente; el trabajo post-1.0 se anotará aquí._
 
-## [1.0.0] — 2026-07-21 — Milestone 1.0 "Stable Reconstruction Platform"
+## [1.0.0] — 2026-07-24 — Milestone 1.0 "Stable Reconstruction Platform"
 
 Primera versión estable. El pipeline completo — inventario inmutable,
 análisis estructural y de contenido, plan aprobado, copia verificada y
