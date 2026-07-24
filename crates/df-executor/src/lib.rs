@@ -1333,7 +1333,13 @@ fn finish_copy(
     stages.sync_all += copy.sync_nanos;
     stages.copy_stream += copy_total.saturating_sub(copy.sync_nanos);
 
-    // 6. Compare against the identity recorded at hash time (§27.1).
+    // 6. Compare against the identity recorded at hash time (§27.1). Both
+    // digests are checked: computing BLAKE3 and never comparing it would make
+    // "double hash" a claim the code does not keep — the whole point of the
+    // second algorithm is that a failure or collision in one does not pass.
+    // `expected_blake3` is optional because snapshots predating it exist; a
+    // missing value degrades to SHA-256 only, it never silently passes a
+    // mismatch.
     if copy.sha256 != expected_sha256 {
         let failure = OperationFailure::fatal(
             OperationErrorCode::HashMismatch,
@@ -1348,6 +1354,25 @@ fn finish_copy(
             partial_identity,
             failure,
         ));
+    }
+    if let Some(expected_blake3) = operation.expected_blake3.as_deref() {
+        if copy.blake3 != expected_blake3 {
+            let failure = OperationFailure::fatal(
+                OperationErrorCode::HashMismatch,
+                format!(
+                    "copied bytes BLAKE3-hash to {} but the snapshot recorded \
+                     {expected_blake3} (SHA-256 matched, so this is a digest \
+                     disagreement, not an ordinary content change)",
+                    copy.blake3
+                ),
+            );
+            return Err(cleanup_after_claimed_failure(
+                safe_root,
+                &partial_relative,
+                partial_identity,
+                failure,
+            ));
+        }
     }
 
     // 7. The source must not have changed while we read it (§14.5).
@@ -1938,6 +1963,53 @@ mod tests {
             output_tree(&seq.origin),
             output_tree(&par.origin),
             "origin must be untouched in both runs"
+        );
+    }
+
+    /// The second digest must actually gate the copy. Before this was wired,
+    /// BLAKE3 was computed, stored and never read: the executor would happily
+    /// finalise a file whose BLAKE3 disagreed with the sealed manifest, so the
+    /// "double hash" guarantee did not exist. Here the manifest's BLAKE3 is
+    /// corrupted while its SHA-256 is left intact, which is exactly the case
+    /// only the second algorithm can catch.
+    #[test]
+    fn a_copy_whose_blake3_disagrees_with_the_manifest_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+
+        // The manifest is immutable through the public API by design, so reach
+        // past the trigger the same way the tampering tests do.
+        fx.db
+            .conn_for_tests()
+            .execute("DROP TRIGGER IF EXISTS execution_manifest_no_update", [])
+            .unwrap();
+        let bogus = "0".repeat(64);
+        let changed = fx
+            .db
+            .conn_for_tests()
+            .execute(
+                "UPDATE execution_manifest SET expected_blake3 = ?1 WHERE operation_id = ?2",
+                [&bogus, &operation.operation_id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the test must actually corrupt the manifest");
+
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+
+        assert!(
+            outcome.failed_final >= 1,
+            "a BLAKE3 disagreement must fail the operation, got {outcome:?}"
+        );
+        let destination = fx.output.join(&operation.destination_relative_path);
+        assert!(
+            !destination.exists(),
+            "a file failing the second digest must never be finalised"
+        );
+        assert!(
+            no_partials_left(&fx.output),
+            "the refused copy must clean up its own partial"
         );
     }
 
