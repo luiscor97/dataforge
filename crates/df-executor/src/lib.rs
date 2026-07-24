@@ -456,11 +456,18 @@ fn run_parallel(
                         Err(_) => break, // channel closed: shut down
                     };
                     let started_at = chrono::Utc::now();
+                    // Whether this operation's ownership claim reached the
+                    // database before a panic. It decides how the panic is
+                    // journaled: erasing a committed claim would strand the
+                    // partial on disk with no durable proof of ownership, and
+                    // reclaim (which demands token *and* identity) could then
+                    // never remove it — a permanent orphan that fails
+                    // verification.
+                    let claim_committed = std::sync::atomic::AtomicBool::new(false);
                     // A worker panic must not hang the coordinator waiting for a
-                    // Done that never arrives: catch it and report the operation
-                    // as retryable, so the next run reclaims any partial (by its
-                    // durable token + identity) and retries it (design window
-                    // coverage; the fs protocol itself never leaks user data).
+                    // Done that never arrives: catch it and journal the operation
+                    // so the next run can recover it (the fs protocol itself
+                    // never touches user data).
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match SafeRelativePath::parse(Path::new(
                             &operation.destination_relative_path,
@@ -491,13 +498,20 @@ fn run_parallel(
                                         .ok()
                                         .and_then(|()| ack_rx.recv().ok());
                                     match claim {
-                                        Some(Ok(())) => finish_copy(
-                                            safe_root,
-                                            &operation,
-                                            prepared,
-                                            &mut worker_stages,
-                                            &mut buffer,
-                                        ),
+                                        Some(Ok(())) => {
+                                            // From here on the claim is durable:
+                                            // a panic must preserve it, not erase
+                                            // it (see `claim_committed`).
+                                            claim_committed
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            finish_copy(
+                                                safe_root,
+                                                &operation,
+                                                prepared,
+                                                &mut worker_stages,
+                                                &mut buffer,
+                                            )
+                                        }
                                         other => {
                                             // Claim failed or the coordinator is
                                             // gone: clean up only our own claimed
@@ -534,13 +548,31 @@ fn run_parallel(
                             outcome
                         }
                         Ok(Err(failure)) => failure.into_outcome(started_at),
-                        Err(_panic) => OperationFailure {
-                            code: OperationErrorCode::IoError,
-                            state: ExecutionState::FailedRetryable,
-                            detail: "copy worker panicked; operation left for retry".to_string(),
-                            retain_partial_lease: false,
+                        Err(_panic) => {
+                            if claim_committed.load(std::sync::atomic::Ordering::Relaxed) {
+                                // The claim is durable and a partial may sit on
+                                // disk: keep token and identity so the next run
+                                // can prove ownership and reclaim it. Clearing
+                                // them would strand the partial forever.
+                                OperationFailure::retained_cleanup(
+                                    "copy worker panicked after the ownership claim; \
+                                     partial retained for reclaim",
+                                )
+                                .into_outcome(started_at)
+                            } else {
+                                // Nothing claimed: any partial created is an
+                                // unclaimed orphan, which is never deleted by
+                                // design (design window B). Plain retry.
+                                OperationFailure {
+                                    code: OperationErrorCode::IoError,
+                                    state: ExecutionState::FailedRetryable,
+                                    detail: "copy worker panicked; operation left for retry"
+                                        .to_string(),
+                                    retain_partial_lease: false,
+                                }
+                                .into_outcome(started_at)
+                            }
                         }
-                        .into_outcome(started_at),
                     };
                     let _ = msg_tx.send(Msg::Done {
                         op_id: operation.operation_id,
