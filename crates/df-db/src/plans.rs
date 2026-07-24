@@ -1058,12 +1058,50 @@ pub fn record_operation_outcome(
     operation_id: OperationId,
     outcome: &OperationOutcome,
 ) -> DfResult<()> {
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    record_outcome_in(&tx, operation_id, outcome)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Record several finished operations in **one** transaction (M1.0.1).
+///
+/// Safe to batch because every operation in the batch has already finalised on
+/// disk: if the commit never lands, each one sits in the "finalised but not
+/// recorded" window, where the next run finds the destination holding the
+/// expected content and resolves it idempotently as `SKIP_REPRESENTED` while
+/// clearing the lease (the window is pinned by
+/// `crash_after_finalize_before_outcome_resumes_and_clears_lease`). What must
+/// **not** be batched is the ownership claim: it is the durable barrier that
+/// has to commit before a worker writes a byte, so it stays one commit per
+/// operation.
+pub fn record_operation_outcomes(
+    db: &mut Db,
+    outcomes: &[(OperationId, OperationOutcome)],
+) -> DfResult<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for (operation_id, outcome) in outcomes {
+        record_outcome_in(&tx, *operation_id, outcome)?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// The per-operation body shared by the single and batched paths, so both
+/// write exactly the same rows and enforce the same invariants.
+fn record_outcome_in(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outcome: &OperationOutcome,
+) -> DfResult<()> {
     if outcome.retain_partial_lease && outcome.execution_state != ExecutionState::Running {
         return Err(DfError::Validation(
             "a retained partial lease requires RUNNING execution state".to_string(),
         ));
     }
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO operation_results
             (id, operation_id, outcome, error_code, detail, final_relative_path,
@@ -1116,7 +1154,6 @@ pub fn record_operation_outcome(
             "operation {operation_id} cannot record its outcome/lease state"
         )));
     }
-    tx.commit().map_err(db_err)?;
     Ok(())
 }
 

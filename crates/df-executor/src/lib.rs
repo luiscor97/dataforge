@@ -550,6 +550,11 @@ fn run_parallel(
         // more as operations complete.
         let mut guard = DestinationGuard::new();
         let mut outstanding = 0usize;
+        // Finished operations awaiting their (batched) durable result. Bounded
+        // by the in-flight cap, so memory never grows with the file count and
+        // the batch always fills from work that is genuinely in flight.
+        let mut pending_results: Vec<(OperationId, OperationOutcome)> = Vec::new();
+        let result_batch = in_flight_cap;
         let mut ready: std::collections::VecDeque<ExecutableOperation> =
             std::collections::VecDeque::new();
         let mut deferred: Vec<ExecutableOperation> = Vec::new();
@@ -572,10 +577,13 @@ fn run_parallel(
                 }
                 // `batch_empty` means no executable copy remains — truly done.
                 // A non-empty batch with `added == 0` is a window full of
-                // in-flight RUNNING copies (they free as they complete) or of
-                // FAILED_RETRYABLE copies stuck for this run; only give up on
-                // the latter, when nothing is in flight to advance the window.
-                if batch_empty || (added == 0 && outstanding == 0) {
+                // copies that are still RUNNING in the database: either in
+                // flight, or finished but sitting in an unflushed result batch.
+                // Both free the window as they land, so only give up when
+                // neither exists — otherwise a batched run would stop early
+                // with work left (the failure mode the type-filtered paging fix
+                // already had to cure once).
+                if batch_empty || (added == 0 && outstanding == 0 && pending_results.is_empty()) {
                     exhausted = true;
                 }
             }
@@ -611,8 +619,18 @@ fn run_parallel(
                 outstanding += 1;
             }
             if outstanding == 0 {
-                // Nothing in flight: no destination is held, so any deferred
-                // op can now be re-offered. Otherwise we are done.
+                // Nothing in flight. Flush any batched results first: until
+                // they commit, their operations still read as RUNNING, so the
+                // refill below would misjudge what is left.
+                if !pending_results.is_empty() {
+                    let persist_started = std::time::Instant::now();
+                    plans::record_operation_outcomes(db, &pending_results)?;
+                    stages.persist_result += nanos_since(persist_started);
+                    stages.operations += pending_results.len() as u64;
+                    pending_results.clear();
+                }
+                // No destination is held now, so any deferred op can be
+                // re-offered. Otherwise we are done.
                 if !deferred.is_empty() {
                     ready.extend(deferred.drain(..));
                     continue;
@@ -654,12 +672,21 @@ fn run_parallel(
                     outcome,
                 }) => {
                     bytes_copied += outcome.bytes_copied;
-                    let persist_started = std::time::Instant::now();
-                    plans::record_operation_outcome(db, op_id, &outcome)?;
-                    stages.persist_result += nanos_since(persist_started);
-                    stages.operations += 1;
+                    // Micro-batch the result commits: every operation here has
+                    // already finalised on disk, so a lost batch leaves each one
+                    // in the finalised-but-unrecorded window, which the next run
+                    // resolves idempotently (design §6). The claim above is NOT
+                    // batched — it must be durable before a byte is written.
+                    pending_results.push((op_id, outcome));
                     guard.release(&relative_key);
                     outstanding -= 1;
+                    if pending_results.len() >= result_batch {
+                        let persist_started = std::time::Instant::now();
+                        plans::record_operation_outcomes(db, &pending_results)?;
+                        stages.persist_result += nanos_since(persist_started);
+                        stages.operations += pending_results.len() as u64;
+                        pending_results.clear();
+                    }
                     // A freed destination may unblock a deferred op.
                     if !deferred.is_empty() {
                         ready.extend(deferred.drain(..));
@@ -667,6 +694,15 @@ fn run_parallel(
                 }
                 Err(_) => break, // all workers gone
             }
+        }
+        // Flush whatever the last batch did not fill, before the workers are
+        // joined and the run reports its progress.
+        if !pending_results.is_empty() {
+            let persist_started = std::time::Instant::now();
+            plans::record_operation_outcomes(db, &pending_results)?;
+            stages.persist_result += nanos_since(persist_started);
+            stages.operations += pending_results.len() as u64;
+            pending_results.clear();
         }
         // Close the work channel so idle workers exit; the scope joins them.
         drop(work_tx);
