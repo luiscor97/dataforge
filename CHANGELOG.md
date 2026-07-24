@@ -5,7 +5,41 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
-_Nada pendiente; el trabajo post-1.0 se anotará aquí._
+### M1.0.1 — Performance Engineering (en curso)
+
+#### Añadido
+
+- Benchmark reproducible: perfiles de corpus deterministas A–D en `df-corpus`
+  (bandas de tamaño log-uniformes con aritmética entera + escritura en
+  streaming), driver `scripts/bench/run-pipeline-bench.ps1` (mide por fase,
+  CPU/memoria, throughput; JSON por caso en `docs/performance/data/`) y
+  metodología (`docs/performance/benchmark-methodology.md`). Baseline en
+  `docs/performance/m1.0.1-baseline.md`.
+- Instrumentación por etapa del executor (`ExecuteOutcome.stage_nanos`, vía
+  `--json`): mide las 12 etapas del protocolo §27.1. El desglose destapa el
+  cuello de botella **medido**: copiar bytes es solo el 5,7 % del tiempo de
+  ejecución; dominan los commits SQLite por operación (~32 %) y la latencia de
+  syscalls por archivo (~32 %). No es ancho de banda, es latencia por archivo.
+- Hashing y verificación paralelos acotados (ADR-0040): un coordinador SQLite
+  único entrega trabajos inmutables a un pool acotado (`std::thread::scope`,
+  sin dependencias nuevas; buffer por worker; work-stealing por índice
+  atómico), `--workers auto|N`. Determinismo probado: `workers=1` y
+  `workers=N` dan salida byte-idéntica. Ganancia medida ~2,5× en archivos
+  grandes (techo del NVMe), ~1,26× en pequeños (latency-bound); cifras y causa
+  en `docs/performance/m1.0.1-results.md`, sin maquillar.
+
+#### Cambiado
+
+- Los buffers de lectura del executor y del verificador se reutilizan por run
+  en vez de reservarse por archivo (higiene de asignación; efecto en tiempo de
+  pared dentro del ruido en estos corpus).
+
+#### Diseño (propuesto, no implementado)
+
+- Ejecución estricta paralela (`docs/performance/strict-parallel-execution-design.md`):
+  coordinador SQLite único, exclusión por destino, protocolo §27.1 intacto y
+  las seis ventanas de caída con su recuperación. A revisar antes de
+  refactorizar el executor; el modo estricto actual no cambia.
 
 ## [1.0.0] — 2026-07-24 — Milestone 1.0 "Stable Reconstruction Platform"
 
