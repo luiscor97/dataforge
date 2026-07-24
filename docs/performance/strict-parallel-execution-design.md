@@ -182,18 +182,52 @@ cada uno deja el árbol compilando y con tests en verde.
 | 2 | `ExecuteOptions.workers`/`max_in_flight` + pre-stage secuencial de `CREATE_DIRECTORY` (`run_directory_stage`) + módulo de **exclusión por destino** (`dest_exclusion::DestinationGuard`, puro, unit-tested) | ✅ hecho — 31/31 tests; scaffolding `#[allow(dead_code)]` hasta que el Increment 3 lo cablea |
 | 3 | **Pool de workers acotado + protocolo coordinador↔worker** con la barrera de claim y backpressure. `workers=1` ≡ secuencial | ✅ hecho — `run_parallel` (coordinador dueño de SQLite + workers `std::thread::scope`, barrera de claim por canal, `DestinationGuard`, dir pre-stage). Default `execute` sigue secuencial (opt-in hasta Increment 5). Test end-to-end `parallel_execution_matches_sequential_byte_for_byte` (workers=1 vs 8, salida byte-idéntica); 32/32 tests estables en 3 corridas |
 | 4 | **Microlotes** de commit lease/claim/result (el ~32 % de SQLite) | ⬜ pendiente |
-| 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ◐ avanzado — determinismo workers=1 vs 8 (Inc 3); completitud a escala (Inc paginación); resume-tras-cancelación bajo el pool (drena in-flight, sin huérfanos, salida == secuencial limpio); **guard de pánico de worker** (`catch_unwind` → op reintentable en vez de colgar al coordinador). Las ventanas A–F por operación las cubren los 28 adversariales existentes (recuperación idéntica por operación, sea el parcial creado por el camino secuencial o paralelo). Falta: inyección de respuesta tardía/duplicada de worker |
+| 5 | Tests de inyección de fallo para las ventanas A–F + respuestas tardías/duplicadas/en pánico + determinismo `workers=1` vs `N` (§9.1–9.4) | ◐ avanzado — determinismo workers=1 vs 8 (Inc 3); completitud a escala (Inc paginación); resume-tras-cancelación bajo el pool (drena in-flight, sin huérfanos, salida == secuencial limpio); **guard de pánico de worker** (`catch_unwind` → op reintentable en vez de colgar al coordinador). Recuperación **bajo el pool** con parcial real: reclaim de un parcial reclamado de una corrida anterior, y huérfano sin claim que sobrevive intacto (ventana B). Corregido: la afirmación previa de que «los 28 adversariales existentes cubren A–F sea cual sea el camino» era un **argumento, no evidencia** — todos corren con `workers: 1`, y el coordinador paralelo tiene su propio call-site de reclaim. Falta: inyección de respuesta tardía/duplicada de worker, y ENOSPC |
 | 6 | Perfiles de durabilidad `strict`/`strict-parallel`/`fast` + ADR de durabilidad (§8) | ⬜ pendiente |
 | 7 | Medir sweep de `execute` + documentar en `m1.0.1-results.md` + PR de borrador | ◐ parcial — sweep de `execute --workers` medido (corpus A 40k): ~2,0× saturando en 4 workers, correctitud verificada (45.003 ops, 0 fallos); documentado en `m1.0.1-results.md` y ADR-0041. Un bug real de terminación temprana se encontró y arregló aquí. Falta: incluir en la PR borrador |
 
-**Quien continúe: retomar desde el Increment 4 (microlotes) o completar el
-Increment 5 (inyección de fallo A–F).** El Increment 3 dejó `run_parallel`
-funcionando y probado byte-idéntico al secuencial. Rutas de trabajo abiertas:
-- **Increment 4**: agrupar lease/claim/result en microlotes (el ~32 % de
-  SQLite serializado). Es la palanca que falta para que los archivos pequeños
-  ganen de verdad; hoy `run_parallel` commitea por operación como el
-  secuencial, así que solapa filesystem pero no reduce el nº de commits.
-- **Increment 5**: tests de inyección de fallo por ventana A–F y respuestas
-  tardías/duplicadas/en pánico bajo el pool, antes de considerar mover el
-  default de `execute` a paralelo.
-- **Increment 7**: sweep de `execute --workers` y resultados.
+**Quien continúe: completar el Increment 5, luego el 6.** Los Increments 2–4
+están hechos y medidos (~2,5× frente al secuencial en archivos pequeños tras
+los microlotes). El default de `execute` sigue **secuencial** y debe seguir
+así hasta cerrar el Increment 5.
+
+### Hallazgos de auditoría ya corregidos (2026-07-25)
+
+Una revisión independiente del código de concurrencia encontró tres defectos
+reales, los tres arreglados con test:
+
+1. **Cuelgue permanente.** El canal de mensajes se creaba fuera del
+   `thread::scope`, así que su receptor sobrevivía a la clausura. Un `?` del
+   coordinador con un worker esperando en la barrera de claim dejaba vivo el
+   emisor de respuesta encolado: el worker esperaba para siempre y el `join`
+   nunca retornaba. Reproducido con un programa autónomo. Arreglado creando el
+   canal dentro del scope.
+2. **Resultados descartados.** Esos mismos `?` se saltaban el flush final,
+   tirando hasta `in_flight_cap` resultados ya finalizados (recuperables, pero
+   trabajo a rehacer y filas de auditoría perdidas). El bucle corre ahora en
+   una clausura cuyo error se captura, y el flush ocurre en ambos caminos.
+3. **Pánico tras el claim dejaba un huérfano irreclamable.** El guard de
+   pánico journalaba con `retain_partial_lease: false`, que borra token e
+   identidad; si el pánico ocurría dentro de `finish_copy`, el parcial quedaba
+   en disco sin prueba durable de propiedad y el reclaim (que exige ambos) no
+   podía borrarlo nunca — huérfano permanente que hace fallar la verificación.
+   El worker distingue ahora si su claim llegó a comprometerse.
+
+### Abierto (por orden de importancia)
+
+- **Increment 5**: inyección de respuesta tardía/duplicada de worker; ENOSPC
+  (disco lleno) no tiene cobertura en ningún sitio del repo y es el fallo más
+  probable en producción; fallo parcial a escala bajo `workers > 1`.
+- `parallel_execution_resumes_correctly_after_cancellation` depende de un
+  `sleep` y su propio comentario admite que puede no cancelar nada: debería
+  cancelar de forma determinista tras N `Done` y afirmar que la primera
+  corrida quedó pausada con trabajo pendiente.
+- Los tests de endurecimiento que hacen `return` silencioso si `mklink`/
+  `icacls` fallan pasan en verde sin probar nada. Una variable de entorno en
+  CI (`DF_REQUIRE_HARDENING=1`) que convierta el skip en `panic!` haría que un
+  verde signifique lo que promete.
+- `dest_exclusion` clavea por ruta planificada completa, no por *stem* base
+  como pide §4; hoy inalcanzable porque el planner de-duplica destinos.
+- `--workers` no tiene tope cuando se da explícitamente (`--workers 100000`
+  lanza 100.000 hilos).
+- **Increment 6**: perfiles de durabilidad.
