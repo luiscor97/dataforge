@@ -1918,6 +1918,10 @@ mod tests {
         let par_tmp = tempfile::tempdir().unwrap();
         let mut seq = approved_many(seq_tmp.path());
         let mut par = approved_many(par_tmp.path());
+        // Snapshot each origin before its run, so "untouched" is proven against
+        // its own prior state rather than against the other run.
+        let seq_origin_before = output_tree(&seq.origin);
+        let par_origin_before = output_tree(&par.origin);
 
         let seq_out = execute_plan(
             &mut seq.db,
@@ -1959,10 +1963,18 @@ mod tests {
             output_tree(&par.output),
             "parallel output must be byte-identical to sequential"
         );
+        // Each origin is compared against the snapshot taken before its own
+        // run, not against the other origin: two runs corrupting the origin
+        // the same way would satisfy a run-to-run comparison.
         assert_eq!(
             output_tree(&seq.origin),
+            seq_origin_before,
+            "the sequential run must leave the origin untouched"
+        );
+        assert_eq!(
             output_tree(&par.origin),
-            "origin must be untouched in both runs"
+            par_origin_before,
+            "the parallel run must leave the origin untouched"
         );
     }
 
@@ -2011,6 +2023,83 @@ mod tests {
             no_partials_left(&fx.output),
             "the refused copy must clean up its own partial"
         );
+    }
+
+    /// `--workers N` tells users it keeps "the same recovery", but every
+    /// adversarial test runs the sequential path (ExecuteOptions::default is
+    /// workers: 1). The parallel coordinator has its own reclaim call site, so
+    /// this exercises it with a real claimed partial from an interrupted run:
+    /// it must be reclaimed by token+identity and the copy redone.
+    #[test]
+    fn parallel_execution_reclaims_a_claimed_partial_from_a_previous_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let source_bytes = std::fs::read(source_path(&operation).unwrap()).unwrap();
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        // A previous run died holding a claimed, half-written partial.
+        let (partial, _identity) = create_and_claim_partial(
+            &fx.db,
+            &fx.output,
+            &operation,
+            &token,
+            &source_bytes[..source_bytes.len() / 2],
+        );
+        assert!(partial.exists(), "the planted partial must exist");
+
+        let outcome = execute_plan(
+            &mut fx.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 8,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.state, "EXECUTED", "{outcome:?}");
+        assert!(!partial.exists(), "the reclaimed partial must be gone");
+        assert!(no_partials_left(&fx.output));
+        let destination = fx.output.join(&operation.destination_relative_path);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            source_bytes,
+            "the redone copy must hold the complete source bytes"
+        );
+    }
+
+    /// The mirror image, under the pool: a partial that was never claimed is
+    /// not ours to delete, no matter that its name carries a token (design
+    /// window B). Deleting it would be deleting data we cannot prove is ours.
+    #[test]
+    fn parallel_execution_never_deletes_an_unclaimed_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let operation = first_copy_operation(&fx.db);
+        let token = plans::lease_copy_operation(&fx.db, operation.operation_id).unwrap();
+        // Named like ours, but no durable claim ever committed for it.
+        let orphan = planted_partial(&fx.output, &operation, &token);
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, b"foreign bytes").unwrap();
+
+        let outcome = execute_plan(
+            &mut fx.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 8,
+                ..ExecuteOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"foreign bytes",
+            "an unclaimed partial must survive untouched"
+        );
+        assert_eq!(outcome.failed_final, 0, "{outcome:?}");
     }
 
     #[test]
