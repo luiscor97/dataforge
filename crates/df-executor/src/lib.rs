@@ -419,12 +419,21 @@ fn run_parallel(
 
     let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
     let work_rx = std::sync::Mutex::new(work_rx);
-    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let in_flight_cap = resolve_in_flight(options.max_in_flight, workers);
     let buffer_bytes = options.copy_buffer_bytes;
     let mut cancelled = false;
 
     let bytes = std::thread::scope(|scope| -> DfResult<u64> {
+        // The message channel is created *inside* the scope on purpose. A
+        // worker waiting at the claim barrier holds its reply sender inside a
+        // queued message; if the receiver outlived this closure, an early exit
+        // (any `?` below) would leave that sender alive, the worker blocked on
+        // recv forever, and the scope's join would never return — a permanent
+        // hang. Owning the receiver here drops it on every exit path, so a
+        // waiting worker gets a disconnect, cleans up its own claimed partial
+        // (identity-checked) and exits.
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+
         // Workers: pull a copy op, prepare (fs), cross the claim barrier through
         // the coordinator, finish (fs), report. No database access here.
         for _ in 0..workers {
@@ -559,150 +568,163 @@ fn run_parallel(
             std::collections::VecDeque::new();
         let mut deferred: Vec<ExecutableOperation> = Vec::new();
         let mut exhausted = false;
-        loop {
-            let cancel_now = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
-            cancelled |= cancel_now;
-            // Refill the ready queue from the database when it runs low.
-            // Copy-only paging so directories never mask pending copies.
-            if ready.is_empty() && !exhausted && !cancelled {
-                let batch =
-                    plans::executable_copy_operations(db, plan_id, options.operation_batch)?;
-                let batch_empty = batch.is_empty();
-                let mut added = 0usize;
-                for op in batch {
-                    if !attempted.contains(&op.operation_id.to_string()) {
-                        ready.push_back(op);
-                        added += 1;
+        // The loop runs inside a closure so an early database error does not
+        // skip the flush below: without this, a failure would discard up to
+        // `in_flight_cap` already-finalised results, turning recorded work into
+        // work the next run has to redo (and losing its audit rows).
+        let loop_outcome: DfResult<()> = (|| {
+            loop {
+                let cancel_now = cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+                cancelled |= cancel_now;
+                // Refill the ready queue from the database when it runs low.
+                // Copy-only paging so directories never mask pending copies.
+                if ready.is_empty() && !exhausted && !cancelled {
+                    let batch =
+                        plans::executable_copy_operations(db, plan_id, options.operation_batch)?;
+                    let batch_empty = batch.is_empty();
+                    let mut added = 0usize;
+                    for op in batch {
+                        if !attempted.contains(&op.operation_id.to_string()) {
+                            ready.push_back(op);
+                            added += 1;
+                        }
+                    }
+                    // `batch_empty` means no executable copy remains — truly done.
+                    // A non-empty batch with `added == 0` is a window full of
+                    // copies that are still RUNNING in the database: either in
+                    // flight, or finished but sitting in an unflushed result batch.
+                    // Both free the window as they land, so only give up when
+                    // neither exists — otherwise a batched run would stop early
+                    // with work left (the failure mode the type-filtered paging fix
+                    // already had to cure once).
+                    if batch_empty || (added == 0 && outstanding == 0 && pending_results.is_empty())
+                    {
+                        exhausted = true;
                     }
                 }
-                // `batch_empty` means no executable copy remains — truly done.
-                // A non-empty batch with `added == 0` is a window full of
-                // copies that are still RUNNING in the database: either in
-                // flight, or finished but sitting in an unflushed result batch.
-                // Both free the window as they land, so only give up when
-                // neither exists — otherwise a batched run would stop early
-                // with work left (the failure mode the type-filtered paging fix
-                // already had to cure once).
-                if batch_empty || (added == 0 && outstanding == 0 && pending_results.is_empty()) {
-                    exhausted = true;
+                // Dispatch while capacity and work remain and not cancelled.
+                while outstanding < in_flight_cap && !cancelled {
+                    let Some(operation) = ready.pop_front() else {
+                        break;
+                    };
+                    let relative_key = operation.destination_relative_path.clone();
+                    if !guard.try_acquire(&relative_key) {
+                        // A conflicting destination is in flight; defer this op.
+                        deferred.push(operation);
+                        continue;
+                    }
+                    attempted.insert(operation.operation_id.to_string());
+                    if let Err(failure) = reclaim_interrupted_partial(safe_root, &operation) {
+                        guard.release(&relative_key);
+                        let outcome = failure.into_outcome(chrono::Utc::now());
+                        plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                        stages.operations += 1;
+                        continue;
+                    }
+                    let lease_started = std::time::Instant::now();
+                    let token = plans::lease_copy_operation(db, operation.operation_id)?;
+                    stages.lease += nanos_since(lease_started);
+                    work_tx
+                        .send(WorkItem {
+                            operation,
+                            token,
+                            relative_key,
+                        })
+                        .expect("workers dropped the work channel");
+                    outstanding += 1;
                 }
-            }
-            // Dispatch while capacity and work remain and not cancelled.
-            while outstanding < in_flight_cap && !cancelled {
-                let Some(operation) = ready.pop_front() else {
-                    break;
-                };
-                let relative_key = operation.destination_relative_path.clone();
-                if !guard.try_acquire(&relative_key) {
-                    // A conflicting destination is in flight; defer this op.
-                    deferred.push(operation);
-                    continue;
-                }
-                attempted.insert(operation.operation_id.to_string());
-                if let Err(failure) = reclaim_interrupted_partial(safe_root, &operation) {
-                    guard.release(&relative_key);
-                    let outcome = failure.into_outcome(chrono::Utc::now());
-                    plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
-                    stages.operations += 1;
-                    continue;
-                }
-                let lease_started = std::time::Instant::now();
-                let token = plans::lease_copy_operation(db, operation.operation_id)?;
-                stages.lease += nanos_since(lease_started);
-                work_tx
-                    .send(WorkItem {
-                        operation,
-                        token,
-                        relative_key,
-                    })
-                    .expect("workers dropped the work channel");
-                outstanding += 1;
-            }
-            if outstanding == 0 {
-                // Nothing in flight. Flush any batched results first: until
-                // they commit, their operations still read as RUNNING, so the
-                // refill below would misjudge what is left.
-                if !pending_results.is_empty() {
-                    let persist_started = std::time::Instant::now();
-                    plans::record_operation_outcomes(db, &pending_results)?;
-                    stages.persist_result += nanos_since(persist_started);
-                    stages.operations += pending_results.len() as u64;
-                    pending_results.clear();
-                }
-                // No destination is held now, so any deferred op can be
-                // re-offered. Otherwise we are done.
-                if !deferred.is_empty() {
-                    ready.extend(deferred.drain(..));
-                    continue;
-                }
-                if cancelled || (exhausted && ready.is_empty()) {
-                    break;
-                }
-                if ready.is_empty() {
-                    // Not exhausted yet: loop to refill.
-                    continue;
-                }
-                // ready has items the guard let through on the next pass.
-                continue;
-            }
-            // Block for the next worker message.
-            match msg_rx.recv() {
-                Ok(Msg::Claim {
-                    op_id,
-                    token,
-                    identity,
-                    ack,
-                }) => {
-                    let claim_started = std::time::Instant::now();
-                    let result =
-                        plans::claim_copy_partial(db, op_id, &token, &identity).map_err(|error| {
-                            OperationFailure {
-                                code: OperationErrorCode::IoError,
-                                state: ExecutionState::FailedRetryable,
-                                detail: format!("persisting partial ownership claim: {error}"),
-                                retain_partial_lease: false,
-                            }
-                        });
-                    stages.claim_persist += nanos_since(claim_started);
-                    let _ = ack.send(result);
-                }
-                Ok(Msg::Done {
-                    op_id,
-                    relative_key,
-                    outcome,
-                }) => {
-                    bytes_copied += outcome.bytes_copied;
-                    // Micro-batch the result commits: every operation here has
-                    // already finalised on disk, so a lost batch leaves each one
-                    // in the finalised-but-unrecorded window, which the next run
-                    // resolves idempotently (design §6). The claim above is NOT
-                    // batched — it must be durable before a byte is written.
-                    pending_results.push((op_id, outcome));
-                    guard.release(&relative_key);
-                    outstanding -= 1;
-                    if pending_results.len() >= result_batch {
+                if outstanding == 0 {
+                    // Nothing in flight. Flush any batched results first: until
+                    // they commit, their operations still read as RUNNING, so the
+                    // refill below would misjudge what is left.
+                    if !pending_results.is_empty() {
                         let persist_started = std::time::Instant::now();
                         plans::record_operation_outcomes(db, &pending_results)?;
                         stages.persist_result += nanos_since(persist_started);
                         stages.operations += pending_results.len() as u64;
                         pending_results.clear();
                     }
-                    // A freed destination may unblock a deferred op.
+                    // No destination is held now, so any deferred op can be
+                    // re-offered. Otherwise we are done.
                     if !deferred.is_empty() {
                         ready.extend(deferred.drain(..));
+                        continue;
                     }
+                    if cancelled || (exhausted && ready.is_empty()) {
+                        break;
+                    }
+                    if ready.is_empty() {
+                        // Not exhausted yet: loop to refill.
+                        continue;
+                    }
+                    // ready has items the guard let through on the next pass.
+                    continue;
                 }
-                Err(_) => break, // all workers gone
+                // Block for the next worker message.
+                match msg_rx.recv() {
+                    Ok(Msg::Claim {
+                        op_id,
+                        token,
+                        identity,
+                        ack,
+                    }) => {
+                        let claim_started = std::time::Instant::now();
+                        let result = plans::claim_copy_partial(db, op_id, &token, &identity)
+                            .map_err(|error| OperationFailure {
+                                code: OperationErrorCode::IoError,
+                                state: ExecutionState::FailedRetryable,
+                                detail: format!("persisting partial ownership claim: {error}"),
+                                retain_partial_lease: false,
+                            });
+                        stages.claim_persist += nanos_since(claim_started);
+                        let _ = ack.send(result);
+                    }
+                    Ok(Msg::Done {
+                        op_id,
+                        relative_key,
+                        outcome,
+                    }) => {
+                        bytes_copied += outcome.bytes_copied;
+                        // Micro-batch the result commits: every operation here has
+                        // already finalised on disk, so a lost batch leaves each one
+                        // in the finalised-but-unrecorded window, which the next run
+                        // resolves idempotently (design §6). The claim above is NOT
+                        // batched — it must be durable before a byte is written.
+                        pending_results.push((op_id, outcome));
+                        guard.release(&relative_key);
+                        outstanding -= 1;
+                        if pending_results.len() >= result_batch {
+                            let persist_started = std::time::Instant::now();
+                            plans::record_operation_outcomes(db, &pending_results)?;
+                            stages.persist_result += nanos_since(persist_started);
+                            stages.operations += pending_results.len() as u64;
+                            pending_results.clear();
+                        }
+                        // A freed destination may unblock a deferred op.
+                        if !deferred.is_empty() {
+                            ready.extend(deferred.drain(..));
+                        }
+                    }
+                    Err(_) => break, // all workers gone
+                }
             }
-        }
+            Ok(())
+        })();
         // Flush whatever the last batch did not fill, before the workers are
-        // joined and the run reports its progress.
+        // joined and the run reports its progress. This runs on the failure
+        // path too, so finished work is recorded even when the loop aborted.
         if !pending_results.is_empty() {
             let persist_started = std::time::Instant::now();
-            plans::record_operation_outcomes(db, &pending_results)?;
+            let flushed = plans::record_operation_outcomes(db, &pending_results);
             stages.persist_result += nanos_since(persist_started);
-            stages.operations += pending_results.len() as u64;
+            if flushed.is_ok() {
+                stages.operations += pending_results.len() as u64;
+            }
             pending_results.clear();
+            // A flush failure must not mask the original error, if any.
+            loop_outcome.and(flushed)?;
+        } else {
+            loop_outcome?;
         }
         // Close the work channel so idle workers exit; the scope joins them.
         drop(work_tx);
