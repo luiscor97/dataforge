@@ -304,6 +304,66 @@ export interface ProjectStatus {
   integrity: IntegrityReport | null;
 }
 
+// --- Reconstruction pipeline outcomes ------------------------------------
+
+export interface ScanOutcome {
+  snapshot_id: string;
+  files: number;
+  folders: number;
+  errors: number;
+  state: string;
+}
+
+export interface HashOutcome {
+  snapshot_id: string;
+  hashed: number;
+  reused: number;
+  failed: number;
+  source_changed: number;
+  pending: number;
+  cancelled: boolean;
+  state: string;
+}
+
+export interface AnalyzeOutcome {
+  snapshot_id: string;
+  duplicate_sets: number;
+  state: string;
+}
+
+export interface PlanOutcome {
+  plan_id: string;
+  operations: number;
+  state: string;
+}
+
+export interface ApproveOutcome {
+  plan_id: string;
+  state: string;
+}
+
+export interface ExecuteOutcome {
+  plan_id: string;
+  completed: number;
+  failed_retryable: number;
+  failed_final: number;
+  pending: number;
+  bytes_copied: number;
+  cancelled: boolean;
+  state: string;
+}
+
+export interface VerifyOutcome {
+  verification_run_id: string;
+  plan_id: string;
+  /** `COMPLETED`, `COMPLETED_WITH_WARNINGS` or `FAILED`. */
+  verdict: string;
+  checked: number;
+  problems: number;
+  warnings: number;
+  state: string;
+}
+
 export interface ErrorDto {
   code: string;
   message: string;

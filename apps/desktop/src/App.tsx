@@ -9,10 +9,11 @@ import {
   projectStatus,
 } from "./api";
 import { ErrorAlert } from "./components/ErrorAlert";
+import { GuidedFlow } from "./screens/GuidedFlow";
 import { StatusView } from "./screens/StatusView";
 import { type ErrorDto, type ProjectStatus, isErrorDto } from "./types";
 
-type Screen = "home" | "create" | "open" | "status";
+type Screen = "home" | "guided" | "create" | "open" | "status";
 type BuiltInProfile = "generic" | "legal";
 
 interface CreateFormState {
@@ -182,20 +183,20 @@ export default function App(): React.JSX.Element {
               <span className="step-number" aria-hidden="true">
                 2
               </span>
-              <h4>Deja que analice</h4>
+              <h4>Deja que los examine</h4>
               <p>
-                DataForge examina los archivos en modo solo lectura y guarda
-                cada evidencia en el proyecto.
+                Los lee sin modificarlos, identifica cada uno y encuentra las
+                copias repetidas.
               </p>
             </li>
             <li>
               <span className="step-number" aria-hidden="true">
                 3
               </span>
-              <h4>Revisa la evidencia</h4>
+              <h4>Recibe una copia ordenada</h4>
               <p>
-                Consulta duplicados, versiones y anomalías, y busca dentro del
-                contenido de tus archivos.
+                Se copia a la carpeta que elijas y se comprueba archivo por
+                archivo. Tus originales quedan intactos.
               </p>
             </li>
           </ol>
@@ -203,15 +204,41 @@ export default function App(): React.JSX.Element {
             <button
               type="button"
               className="primary"
-              onClick={() => setScreen("create")}
+              onClick={() => setScreen("guided")}
             >
-              Crear proyecto
+              Empezar
             </button>
             <button type="button" onClick={() => setScreen("open")}>
-              Abrir proyecto existente
+              Abrir un proyecto que ya tenía
             </button>
           </div>
+          <p className="hint">
+            <button
+              type="button"
+              className="linklike"
+              onClick={() => setScreen("create")}
+            >
+              Prefiero configurarlo yo (modo avanzado)
+            </button>
+          </p>
         </section>
+      )}
+
+      {screen === "guided" && (
+        <GuidedFlow
+          onOpenAdvanced={(dir) => {
+            setError(null);
+            setBusy(true);
+            projectStatus(dir)
+              .then((opened) => {
+                setStatus(opened);
+                setScreen("status");
+              })
+              .catch(handleFailure)
+              .finally(() => setBusy(false));
+          }}
+          onExit={goHome}
+        />
       )}
 
       {screen === "create" && (
