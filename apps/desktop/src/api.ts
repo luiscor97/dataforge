@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import {
+  type AnalyzeOutcome,
+  type ApproveOutcome,
   type ContentArtifactBuildOutcome,
   type ContentExtractionOutcome,
   type ContentQueryOutcome,
@@ -8,9 +10,14 @@ import {
   type ContentSearchRequest,
   type CreateProjectRequest,
   type ErrorDto,
+  type ExecuteOutcome,
+  type HashOutcome,
   type MediaOutcome,
+  type PlanOutcome,
   type ProjectStatus,
+  type ScanOutcome,
   type SimilarityOutcome,
+  type VerifyOutcome,
   isErrorDto,
 } from "./types";
 
@@ -37,6 +44,38 @@ export function createProject(
   request: CreateProjectRequest,
 ): Promise<ProjectStatus> {
   return call<ProjectStatus>("create_project", { request });
+}
+
+// --- The reconstruction pipeline -----------------------------------------
+// Each call is one stage of RFC-0001's flow. The guided experience chains
+// them so the user never has to know they exist.
+
+export function scanProject(projectDir: string): Promise<ScanOutcome> {
+  return call<ScanOutcome>("scan_project", { projectDir });
+}
+
+export function hashProject(projectDir: string): Promise<HashOutcome> {
+  return call<HashOutcome>("hash_project", { projectDir });
+}
+
+export function analyzeProject(projectDir: string): Promise<AnalyzeOutcome> {
+  return call<AnalyzeOutcome>("analyze_project", { projectDir });
+}
+
+export function createPlan(projectDir: string): Promise<PlanOutcome> {
+  return call<PlanOutcome>("create_plan", { projectDir });
+}
+
+export function approvePlan(projectDir: string): Promise<ApproveOutcome> {
+  return call<ApproveOutcome>("approve_plan", { projectDir });
+}
+
+export function executePlan(projectDir: string): Promise<ExecuteOutcome> {
+  return call<ExecuteOutcome>("execute_plan", { projectDir });
+}
+
+export function verifyProject(projectDir: string): Promise<VerifyOutcome> {
+  return call<VerifyOutcome>("verify_project", { projectDir });
 }
 
 export function openProject(projectDir: string): Promise<ProjectStatus> {

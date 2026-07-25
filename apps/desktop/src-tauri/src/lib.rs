@@ -3,12 +3,13 @@
 //! The UI holds no critical logic (RFC-0001 rule 16): every command below
 //! delegates to `df-facade`, exactly like the CLI does.
 
-use df_domain::Actor;
+use df_domain::{Actor, DuplicatePolicy};
 use df_error::DfError;
 use df_facade::{
-    ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
-    ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest, MediaOutcome, ProjectStatus,
-    QueryOptions, SearchRequest, SimilarityOutcome, SnapshotBuildOptions,
+    AnalyzeOutcome, ApproveOutcome, ContentArtifactBuildOutcome, ContentExtractionOptions,
+    ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest,
+    ExecuteOutcome, HashOutcome, MediaOutcome, PlanOutcome, ProjectStatus, QueryOptions,
+    ScanOutcome, SearchRequest, SimilarityOutcome, SnapshotBuildOptions, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -65,6 +66,82 @@ fn open_project(project_dir: String) -> Result<ProjectStatus, ErrorDto> {
 #[tauri::command]
 fn project_status(project_dir: String) -> Result<ProjectStatus, ErrorDto> {
     df_facade::project_status(std::path::Path::new(&project_dir)).map_err(ErrorDto::from)
+}
+
+// --- The reconstruction pipeline -----------------------------------------
+//
+// Until now the shell could create a project and run the optional analyses,
+// but not the work the product exists for: a non-technical user had to drop
+// to the CLI to actually reconstruct anything. Each command below is the same
+// facade call the CLI makes, run off the UI thread because these are long.
+
+/// Inventory the sources into an immutable snapshot. Reads only.
+#[tauri::command]
+async fn scan_project(project_dir: String) -> Result<ScanOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::scan_project(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Give every scanned file its content identity (BLAKE3 + SHA-256).
+#[tauri::command]
+async fn hash_project(project_dir: String) -> Result<HashOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::hash_project(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Materialise the exact-duplicate evidence of the hashed snapshot.
+#[tauri::command]
+async fn analyze_project(project_dir: String) -> Result<AnalyzeOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::analyze_project(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Propose the reconstruction. `REPORT_ONLY` is the only policy the guided
+/// flow offers: duplicates are reported, never consolidated, so nothing the
+/// user owns can be dropped by a decision they did not make.
+#[tauri::command]
+async fn create_plan(project_dir: String) -> Result<PlanOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::create_plan(
+            std::path::Path::new(&project_dir),
+            Actor::Desktop,
+            DuplicatePolicy::ReportOnly,
+        )
+    })
+    .await
+}
+
+/// Freeze the plan into the immutable execution manifest.
+#[tauri::command]
+async fn approve_plan(project_dir: String) -> Result<ApproveOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::approve_plan(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Execute the approved manifest: verified copy, resumable, never replacing.
+#[tauri::command]
+async fn execute_plan(project_dir: String) -> Result<ExecuteOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::execute_plan(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Re-check the output from primary evidence, independently of the executor.
+#[tauri::command]
+async fn verify_project(project_dir: String) -> Result<VerifyOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::verify_project_output(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -172,6 +249,13 @@ pub fn run() {
             create_project,
             open_project,
             project_status,
+            scan_project,
+            hash_project,
+            analyze_project,
+            create_plan,
+            approve_plan,
+            execute_plan,
+            verify_project,
             analyze_similarity,
             analyze_media,
             extract_content,
