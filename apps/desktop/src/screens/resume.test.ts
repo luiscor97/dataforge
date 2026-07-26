@@ -55,7 +55,10 @@ describe("resumeFrom", () => {
   test("each finished stage is skipped, and no earlier one is re-run", () => {
     expect(resumeFrom("SCANNED")).toMatchObject({ scan: false, hash: true });
     expect(resumeFrom("HASHED")).toMatchObject({ hash: false, analyze: true });
-    expect(resumeFrom("ANALYZED")).toMatchObject({ analyze: false, plan: true });
+    expect(resumeFrom("ANALYZED")).toMatchObject({
+      analyze: false,
+      plan: true,
+    });
     expect(resumeFrom("PLAN_READY")).toMatchObject({ plan: false });
   });
 

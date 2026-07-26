@@ -943,7 +943,9 @@ summary:focus-visible {
 .dropfield input {
   border: 2px dashed var(--border-strong);
   padding: 0.9rem 0.7rem;
-  transition: border-color 120ms ease, background-color 120ms ease;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
 }
 
 .dropfield input:hover {
@@ -983,8 +985,12 @@ summary:focus-visible {
 }
 
 @keyframes sweep {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(320%); }
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

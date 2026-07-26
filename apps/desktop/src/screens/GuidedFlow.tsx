@@ -38,7 +38,11 @@ type Stage =
   | { kind: "setup" }
   | { kind: "working"; label: string; detail: string }
   | { kind: "review"; findings: Findings }
-  | { kind: "resumeCopy"; resume: Resume & { kind: "copy" }; outputRoot: string }
+  | {
+      kind: "resumeCopy";
+      resume: Resume & { kind: "copy" };
+      outputRoot: string;
+    }
   | { kind: "finished"; state: string }
   | { kind: "manual"; state: string }
   | { kind: "done"; result: Result };
@@ -75,7 +79,9 @@ function humanCount(n: number): string {
   const [whole, fraction] = Math.abs(n).toFixed(0).split(".");
   const grouped = (whole ?? "0").replace(/\B(?=(\d{3})+(?!\d))/g, ".");
   const sign = n < 0 ? "-" : "";
-  return fraction === undefined ? `${sign}${grouped}` : `${sign}${grouped},${fraction}`;
+  return fraction === undefined
+    ? `${sign}${grouped}`
+    : `${sign}${grouped},${fraction}`;
 }
 
 /** Human-readable size; the engine speaks bytes, people do not. */
@@ -91,7 +97,8 @@ function humanBytes(bytes: number): string {
   const rounded = Math.round(value * 10) / 10;
   const whole = Math.trunc(rounded);
   const decimal = Math.round((rounded - whole) * 10);
-  const shown = decimal === 0 ? humanCount(whole) : `${humanCount(whole)},${decimal}`;
+  const shown =
+    decimal === 0 ? humanCount(whole) : `${humanCount(whole)},${decimal}`;
   return `${shown} ${units[unit]}`;
 }
 
@@ -112,7 +119,10 @@ function folderName(path: string): string {
  */
 function samePath(a: string, b: string): boolean {
   const normalise = (p: string): string =>
-    p.replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+    p
+      .replace(/[\\/]+/g, "\\")
+      .replace(/\\+$/, "")
+      .toLowerCase();
   return normalise(a) === normalise(b);
 }
 
@@ -121,7 +131,10 @@ interface Props {
   onExit: () => void;
 }
 
-export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element {
+export function GuidedFlow({
+  onOpenAdvanced,
+  onExit,
+}: Props): React.JSX.Element {
   const [stage, setStage] = useState<Stage>({ kind: "setup" });
   const [source, setSource] = useState("");
   const [destination, setDestination] = useState("");
@@ -130,9 +143,12 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
     null,
   );
   const projectDir = useRef<string>("");
-  // Which field a drop should fill. A ref because the webview listener is
-  // registered once and would otherwise capture a stale value.
+  // Which field a drop fills when the pointer is over neither box — the last
+  // one the user touched. Refs because the webview listener is registered once
+  // and would otherwise capture stale values.
   const activeField = useRef<"source" | "destination">("source");
+  const sourceBox = useRef<HTMLLabelElement | null>(null);
+  const destinationBox = useRef<HTMLLabelElement | null>(null);
 
   // Dropping a folder onto the window beats typing a path from memory, and
   // Tauri gives us this without any extra dependency. Everything here is
@@ -140,19 +156,46 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
   // runtime is present (a browser preview, a test harness): drag and drop is
   // a convenience, and losing it must never take the screen down with it.
   useEffect(() => {
+    // The drag events carry a position in physical pixels, while the DOM
+    // measures in CSS pixels; on a scaled display those differ. Hit-testing
+    // the two boxes is what makes the folder land where the user aimed it
+    // rather than in whichever field happened to be focused.
+    const fieldUnder = (position: {
+      x: number;
+      y: number;
+    }): "source" | "destination" | null => {
+      const ratio = window.devicePixelRatio || 1;
+      const x = position.x / ratio;
+      const y = position.y / ratio;
+      const hit = (box: HTMLLabelElement | null): boolean => {
+        if (box === null) return false;
+        const rect = box.getBoundingClientRect();
+        return (
+          x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+        );
+      };
+      if (hit(sourceBox.current)) return "source";
+      if (hit(destinationBox.current)) return "destination";
+      return null;
+    };
+
     let unlisten: (() => void) | undefined;
     try {
       void getCurrentWebview()
         .onDragDropEvent((event) => {
           if (event.payload.type === "enter" || event.payload.type === "over") {
-            setDropTarget(activeField.current);
+            setDropTarget(
+              fieldUnder(event.payload.position) ?? activeField.current,
+            );
             return;
           }
           setDropTarget(null);
           if (event.payload.type === "drop") {
             const dropped = event.payload.paths.at(0);
             if (dropped !== undefined) {
-              if (activeField.current === "source") {
+              const field =
+                fieldUnder(event.payload.position) ?? activeField.current;
+              if (field === "source") {
                 setSource(dropped);
               } else {
                 setDestination(dropped);
@@ -197,13 +240,16 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
       out: string,
     ): Promise<{ status: ProjectStatus; resumed: boolean }> => {
       try {
-        return { status: await createProject({
-          name: folderName(src),
-          project_dir: dir,
-          output_root: out,
-          profile: "generic",
-          source_roots: [src],
-        }), resumed: false };
+        return {
+          status: await createProject({
+            name: folderName(src),
+            project_dir: dir,
+            output_root: out,
+            profile: "generic",
+            source_roots: [src],
+          }),
+          resumed: false,
+        };
       } catch (createFailure) {
         let existing: ProjectStatus;
         try {
@@ -242,7 +288,11 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
    * throw away work the engine took care to make resumable.
    */
   const startReview = useCallback(
-    async (plan: Resume & { kind: "review" }, resumed: boolean, out: string) => {
+    async (
+      plan: Resume & { kind: "review" },
+      resumed: boolean,
+      out: string,
+    ) => {
       const dir = projectDir.current;
       let scanErrors: number | null = null;
       let duplicateSets: number | null = null;
@@ -446,6 +496,7 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
             }}
           >
             <label
+              ref={sourceBox}
               className={`dropfield${dropTarget === "source" ? " dropfield-active" : ""}`}
             >
               Carpeta que quieres ordenar
@@ -465,6 +516,7 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
             </label>
 
             <label
+              ref={destinationBox}
               className={`dropfield${dropTarget === "destination" ? " dropfield-active" : ""}`}
             >
               Dónde guardar el resultado
@@ -510,8 +562,8 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
           <h2>Esto he encontrado</h2>
           {stage.findings.resumed && (
             <p className="notice notice-info">
-              Había trabajo a medias sobre estas carpetas y lo hemos
-              continuado en lugar de empezar de cero.
+              Había trabajo a medias sobre estas carpetas y lo hemos continuado
+              en lugar de empezar de cero.
             </p>
           )}
           <div className="tiles">
@@ -641,10 +693,10 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
         <>
           <h2>Hay un trabajo interrumpido</h2>
           <p className="notice notice-warning">
-            Sobre estas carpetas quedó un trabajo parado en un punto
-            (<code>{stage.state}</code>) que no puedo continuar por mi cuenta
-            sin arriesgarme a hacer algo que no has pedido. Tus archivos
-            originales están intactos.
+            Sobre estas carpetas quedó un trabajo parado en un punto (
+            <code>{stage.state}</code>) que no puedo continuar por mi cuenta sin
+            arriesgarme a hacer algo que no has pedido. Tus archivos originales
+            están intactos.
           </p>
           <p className="hint">
             Abre el detalle para ver el estado real, o empieza de nuevo con una
@@ -697,8 +749,7 @@ export function GuidedFlow({ onOpenAdvanced, onExit }: Props): React.JSX.Element
           )}
           {stage.result.verdict === "COMPLETED_WITH_WARNINGS" && (
             <p className="notice notice-warning">
-              La copia se completó, pero hay{" "}
-              {humanCount(stage.result.warnings)}{" "}
+              La copia se completó, pero hay {humanCount(stage.result.warnings)}{" "}
               {stage.result.warnings === 1 ? "aviso" : "avisos"} que conviene
               revisar. Tus originales siguen intactos.
             </p>

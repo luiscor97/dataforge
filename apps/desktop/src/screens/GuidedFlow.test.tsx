@@ -65,7 +65,10 @@ function status(
 
 async function fillFoldersAndSubmit(): Promise<void> {
   const user = userEvent.setup();
-  await user.type(screen.getByLabelText(/carpeta que quieres ordenar/i), SOURCE);
+  await user.type(
+    screen.getByLabelText(/carpeta que quieres ordenar/i),
+    SOURCE,
+  );
   await user.type(
     screen.getByLabelText(/dónde guardar el resultado/i),
     DESTINATION,
@@ -179,7 +182,9 @@ describe("GuidedFlow", () => {
 
     // A run with warnings must not be announced as a clean success.
     expect(
-      await screen.findByRole("heading", { name: /copia terminada, con avisos/i }),
+      await screen.findByRole("heading", {
+        name: /copia terminada, con avisos/i,
+      }),
     ).toBeDefined();
     expect(screen.getByText(/tus originales siguen intactos/i)).toBeDefined();
   });
@@ -234,7 +239,10 @@ describe("GuidedFlow", () => {
   });
 
   test("a plan left from an earlier session is re-validated, not trusted", async () => {
-    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
     vi.mocked(openProject).mockResolvedValue(status("PLAN_READY") as never);
     vi.mocked(validatePlan).mockResolvedValue({
       ok: true,
@@ -257,7 +265,10 @@ describe("GuidedFlow", () => {
   });
 
   test("a stale plan is refused rather than offered for approval", async () => {
-    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
     vi.mocked(openProject).mockResolvedValue(status("PLAN_READY") as never);
     vi.mocked(validatePlan).mockResolvedValue({
       ok: false,
@@ -276,7 +287,10 @@ describe("GuidedFlow", () => {
   // The approved manifest already records the user's consent (§26.4). Asking
   // again would be asking twice for one decision.
   test("a half-done copy resumes without asking for approval twice", async () => {
-    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
     vi.mocked(openProject).mockResolvedValue(
       status("EXECUTION_PAUSED") as never,
     );
@@ -306,7 +320,10 @@ describe("GuidedFlow", () => {
   });
 
   test("a finished destination is reported, not copied over", async () => {
-    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
     vi.mocked(openProject).mockResolvedValue(status("COMPLETED") as never);
 
     renderFlow();
@@ -319,7 +336,10 @@ describe("GuidedFlow", () => {
   });
 
   test("a state the engine cannot continue is handed over, not guessed at", async () => {
-    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
     vi.mocked(openProject).mockResolvedValue(status("VERIFYING") as never);
 
     renderFlow();
