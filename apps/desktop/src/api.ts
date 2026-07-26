@@ -9,6 +9,7 @@ import {
   type ContentSearchOutcome,
   type ContentSearchRequest,
   type CreateProjectRequest,
+  type DestinationGuarantees,
   type ErrorDto,
   type ExecuteOutcome,
   type HashOutcome,
@@ -77,8 +78,28 @@ export function approvePlan(projectDir: string): Promise<ApproveOutcome> {
   return call<ApproveOutcome>("approve_plan", { projectDir });
 }
 
+export function destinationGuarantees(
+  projectDir: string,
+): Promise<DestinationGuarantees> {
+  return call<DestinationGuarantees>("destination_guarantees", { projectDir });
+}
+
 export function executePlan(projectDir: string): Promise<ExecuteOutcome> {
   return call<ExecuteOutcome>("execute_plan", { projectDir });
+}
+
+/**
+ * Copy towards a volume without physical identity guarantees (ADR-0036).
+ *
+ * A separate function rather than a flag: the acknowledgement is a decision
+ * the user has to have made, so it must be visible at every call site.
+ */
+export function executePlanOnDegradedDestination(
+  projectDir: string,
+): Promise<ExecuteOutcome> {
+  return call<ExecuteOutcome>("execute_plan_on_degraded_destination", {
+    projectDir,
+  });
 }
 
 export function verifyProject(projectDir: string): Promise<VerifyOutcome> {

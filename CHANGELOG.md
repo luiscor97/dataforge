@@ -5,7 +5,52 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
-_Nada pendiente; el trabajo post-1.0 se anotará aquí._
+Endurecimiento del asistente guiado y del motor antes de la primera prueba
+en entorno real. Nada de esto cambia las garantías de reconstrucción.
+
+#### Añadido
+
+- **El asistente guiado retoma un trabajo interrumpido** en lugar de
+  negarse. Una pasada sobre un archivo real dura de minutos a horas, así
+  que la interrupción es lo normal: hasta ahora una segunda ejecución
+  moría con «el directorio del proyecto ya existe» y tiraba todo el
+  hashing hecho. La decisión vive en una tabla pura (`resume.ts`), una
+  entrada por estado, cada una calcada de una guarda que existe de verdad
+  en el motor. Los estados que ningún stage acepta (`SCANNING`, `HASHING`,
+  `ANALYSIS_PAUSED`, `VERIFYING`, `ARCHIVED`) y cualquier estado
+  desconocido degradan a «abre el detalle», nunca a una suposición.
+- **La pantalla avanzada ejecuta el pipeline.** «Prefiero configurarlo yo»
+  creaba un proyecto y ahí se acababa: no había botón para scan, hash,
+  analyze, plan, approve, execute ni verify en ninguna parte, de modo que
+  las dos razones para usar el modo avanzado — varias raíces de origen y
+  el perfil jurídico — no llevaban a ningún sitio. Ofrece un solo botón,
+  el del único stage que el motor aceptaría, derivado de la misma tabla.
+- `ExecuteOutcome.out_of_space` y el comando de escritorio `validate_plan`
+  (lectura; re-ejecuta los invariantes §26.5 sobre el plan almacenado).
+
+#### Corregido
+
+- **Un destino lleno detiene la ejecución** en vez de intentar todas las
+  operaciones restantes. Cada una repetía el mismo trabajo condenado —
+  lease, parcial, bytes hasta ENOSPC, limpieza, dos commits SQLite —: en
+  un plan de un millón de archivos, horas de fallo garantizado que
+  entierran el único dato útil bajo un millón de filas `NO_SPACE`
+  idénticas. Lo pendiente queda `PENDING`, la operación que topó queda
+  `FAILED_RETRYABLE`, y el proyecto pausa: justo el estado del que parte
+  reanudar tras liberar espacio. ENOSPC no tenía cobertura en ningún
+  punto del repositorio pese a ser el fallo más probable en producción.
+- **Soltar una carpeta cae donde apuntas.** El manejador de arrastre
+  llenaba el campo que tuviera el foco e ignoraba la posición del puntero
+  que Tauri le pasa; soltar sobre la segunda caja y verlo aparecer en la
+  primera se lee, para un usuario, como que la aplicación está rota.
+- Los tests de endurecimiento que no podían ejecutarse imprimían `SKIP` y
+  pasaban, así que el job de CI de endurecimiento en Windows podía dar
+  verde sin haber probado nada de lo que promete. `DF_REQUIRE_HARDENING=1`
+  (que ese job ahora fija) convierte cualquier skip en fallo.
+- El asistente ya no continúa un proyecto que describe otras carpetas: el
+  directorio del proyecto se deriva del destino, así que reutilizar un
+  destino con otro origen habría seguido silenciosamente el trabajo ajeno
+  contra la fuente equivocada.
 
 ## [1.0.0] — 2026-07-24 — Milestone 1.0 "Stable Reconstruction Platform"
 

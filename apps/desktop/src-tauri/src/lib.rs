@@ -8,9 +8,9 @@ use df_error::DfError;
 use df_facade::{
     AnalyzeOutcome, ApproveOutcome, ContentArtifactBuildOutcome, ContentExtractionOptions,
     ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest,
-    ExecuteOutcome, HashOutcome, MediaOutcome, PlanOutcome, PlanValidationReport, ProjectStatus,
-    QueryOptions, ScanOutcome, SearchRequest, SimilarityOutcome, SnapshotBuildOptions,
-    VerifyOutcome,
+    DestinationGuarantees, ExecuteOptions, ExecuteOutcome, HashOutcome, MediaOutcome, PlanOutcome,
+    PlanValidationReport, ProjectStatus, QueryOptions, ScanOutcome, SearchRequest,
+    SimilarityOutcome, SnapshotBuildOptions, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -138,11 +138,40 @@ async fn approve_plan(project_dir: String) -> Result<ApproveOutcome, ErrorDto> {
     .await
 }
 
+/// What the destination volume can guarantee, so the UI can ask before the
+/// copy rather than fail after it (ADR-0036).
+#[tauri::command]
+fn destination_guarantees(project_dir: String) -> Result<DestinationGuarantees, ErrorDto> {
+    df_facade::destination_guarantees(std::path::Path::new(&project_dir)).map_err(ErrorDto::from)
+}
+
 /// Execute the approved manifest: verified copy, resumable, never replacing.
 #[tauri::command]
 async fn execute_plan(project_dir: String) -> Result<ExecuteOutcome, ErrorDto> {
     run_blocking_command(move || {
         df_facade::execute_plan(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Execute towards a destination without physical identity guarantees.
+///
+/// Separate command rather than a flag, so the acknowledgement ADR-0036
+/// requires is visible at the call site and cannot be passed by accident: a
+/// UI that wants this has to have asked for it.
+#[tauri::command]
+async fn execute_plan_on_degraded_destination(
+    project_dir: String,
+) -> Result<ExecuteOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::execute_plan_with_options(
+            std::path::Path::new(&project_dir),
+            Actor::Desktop,
+            &ExecuteOptions {
+                allow_degraded_destination: true,
+                ..Default::default()
+            },
+        )
     })
     .await
 }
@@ -267,7 +296,9 @@ pub fn run() {
             create_plan,
             validate_plan,
             approve_plan,
+            destination_guarantees,
             execute_plan,
+            execute_plan_on_degraded_destination,
             verify_project,
             analyze_similarity,
             analyze_media,

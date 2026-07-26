@@ -7,7 +7,9 @@ import {
   approvePlan,
   createPlan,
   createProject,
+  destinationGuarantees,
   executePlan,
+  executePlanOnDegradedDestination,
   hashProject,
   openProject,
   projectStatus,
@@ -22,7 +24,9 @@ vi.mock("../api", () => ({
   approvePlan: vi.fn(),
   createPlan: vi.fn(),
   createProject: vi.fn(),
+  destinationGuarantees: vi.fn(),
   executePlan: vi.fn(),
+  executePlanOnDegradedDestination: vi.fn(),
   hashProject: vi.fn(),
   openProject: vi.fn(),
   projectStatus: vi.fn(),
@@ -30,6 +34,14 @@ vi.mock("../api", () => ({
   validatePlan: vi.fn(),
   verifyProject: vi.fn(),
 }));
+
+/** An ordinary NTFS destination, unless a test says otherwise. */
+function mockHealthyDestination(): void {
+  vi.mocked(destinationGuarantees).mockResolvedValue({
+    filesystem: "NTFS",
+    has_physical_identity: true,
+  });
+}
 
 // The webview module is only resolvable inside Tauri. Leaving it unmocked is
 // deliberate in the first test below, which pins that the screen survives it.
@@ -161,6 +173,7 @@ describe("GuidedFlow", () => {
 
   test("announces the verified result without overstating it", async () => {
     mockFreshReview({ files: 2, folders: 1, scan_errors: 0 });
+    mockHealthyDestination();
     vi.mocked(createPlan).mockResolvedValue({ operations: 3 } as never);
     vi.mocked(approvePlan).mockResolvedValue({} as never);
     vi.mocked(executePlan).mockResolvedValue({
@@ -294,6 +307,7 @@ describe("GuidedFlow", () => {
     vi.mocked(openProject).mockResolvedValue(
       status("EXECUTION_PAUSED") as never,
     );
+    mockHealthyDestination();
     vi.mocked(executePlan).mockResolvedValue({
       completed: 5,
       bytes_copied: 1024,
@@ -328,6 +342,7 @@ describe("GuidedFlow", () => {
       message: "x",
     });
     vi.mocked(openProject).mockResolvedValue(status("PLAN_APPROVED") as never);
+    mockHealthyDestination();
     vi.mocked(executePlan).mockResolvedValue({
       completed: 900,
       bytes_copied: 4096,
@@ -349,6 +364,74 @@ describe("GuidedFlow", () => {
     expect(
       screen.getByText(/tus archivos originales siguen intactos/i),
     ).toBeDefined();
+  });
+
+  // A USB stick formatted exFAT or a folder on the office NAS is an ordinary
+  // choice. The engine refuses it without an explicit acknowledgement
+  // (ADR-0036), and learning that after an hour of copying would be the worst
+  // possible moment, so the question comes first.
+  test("a destination without identity guarantees is questioned before copying", async () => {
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
+    vi.mocked(openProject).mockResolvedValue(status("PLAN_APPROVED") as never);
+    vi.mocked(destinationGuarantees).mockResolvedValue({
+      filesystem: "EXFAT",
+      has_physical_identity: false,
+    });
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+    await screen.findByRole("heading", { name: /copia a medias/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: /continuar la copia/i }),
+    );
+
+    await screen.findByRole("heading", { name: /menos garantías/i });
+    // Nothing was written while the question was open.
+    expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
+    expect(vi.mocked(executePlanOnDegradedDestination)).not.toHaveBeenCalled();
+    expect(screen.getByText(/EXFAT/)).toBeDefined();
+  });
+
+  test("accepting the degraded destination copies through the audited path", async () => {
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
+    vi.mocked(openProject).mockResolvedValue(status("PLAN_APPROVED") as never);
+    vi.mocked(destinationGuarantees).mockResolvedValue({
+      filesystem: "NETWORK",
+      has_physical_identity: false,
+    });
+    vi.mocked(executePlanOnDegradedDestination).mockResolvedValue({
+      completed: 7,
+      bytes_copied: 100,
+      pending: 0,
+      out_of_space: false,
+    } as never);
+    vi.mocked(verifyProject).mockResolvedValue({
+      verdict: "COMPLETED",
+      problems: 0,
+      warnings: 0,
+    } as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+    await screen.findByRole("heading", { name: /copia a medias/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: /continuar la copia/i }),
+    );
+    await screen.findByRole("heading", { name: /menos garantías/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: /entiendo el riesgo/i }),
+    );
+
+    await screen.findByRole("heading", { name: /copia está verificada/i });
+    // The grant has to travel with the call: the plain path would be refused.
+    expect(vi.mocked(executePlanOnDegradedDestination)).toHaveBeenCalledOnce();
+    expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
   });
 
   test("a finished destination is reported, not copied over", async () => {

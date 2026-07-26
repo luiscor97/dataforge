@@ -6,7 +6,9 @@ import {
   approvePlan,
   createPlan,
   createProject,
+  destinationGuarantees,
   executePlan,
+  executePlanOnDegradedDestination,
   hashProject,
   openProject,
   projectStatus,
@@ -48,6 +50,14 @@ type Stage =
       copied: number;
       bytes: number;
       pending: number;
+      outputRoot: string;
+      /** Carried so continuing does not ask for the ADR-0036 grant twice. */
+      degraded: boolean;
+    }
+  | {
+      kind: "degraded";
+      filesystem: string;
+      resume: Resume & { kind: "copy" };
       outputRoot: string;
     }
   | { kind: "finished"; state: string }
@@ -385,12 +395,36 @@ export function GuidedFlow({
     [],
   );
 
-  /** Stages 5-7: freeze the plan, copy, and check the copy independently. */
+  /**
+   * Stages 5-7: freeze the plan, copy, and check the copy independently.
+   *
+   * `degraded` carries the user's explicit acknowledgement that the
+   * destination cannot offer physical identity (ADR-0036). It is a parameter
+   * rather than state because the engine refuses without it, and a refusal
+   * discovered after an hour of copying is a worse way to learn this than a
+   * question asked beforehand.
+   */
   const startCopy = useCallback(
-    async (plan: Resume & { kind: "copy" }, out: string) => {
+    async (plan: Resume & { kind: "copy" }, out: string, degraded = false) => {
       setError(null);
       const dir = projectDir.current;
       try {
+        // Ask before committing, not after. A USB stick formatted exFAT or a
+        // folder on the office NAS is an ordinary choice, and finding out it
+        // is refused only at the end would waste the whole run.
+        if (plan.execute && !degraded) {
+          const guarantees = await destinationGuarantees(dir);
+          if (!guarantees.has_physical_identity) {
+            setStage({
+              kind: "degraded",
+              filesystem: guarantees.filesystem,
+              resume: plan,
+              outputRoot: out,
+            });
+            return;
+          }
+        }
+
         setStage({
           kind: "working",
           label: "Copiando tus archivos…",
@@ -404,7 +438,9 @@ export function GuidedFlow({
         let copied: number | null = null;
         let bytes: number | null = null;
         if (plan.execute) {
-          const executed = await executePlan(dir);
+          const executed = degraded
+            ? await executePlanOnDegradedDestination(dir)
+            : await executePlan(dir);
           copied = executed.completed;
           bytes = executed.bytes_copied;
           if (executed.out_of_space) {
@@ -417,6 +453,7 @@ export function GuidedFlow({
               bytes: executed.bytes_copied,
               pending: executed.pending,
               outputRoot: out,
+              degraded,
             });
             return;
           }
@@ -676,6 +713,49 @@ export function GuidedFlow({
         </>
       )}
 
+      {stage.kind === "degraded" && (
+        <>
+          <h2>Ese destino da menos garantías</h2>
+          <p className="notice notice-warning">
+            <code>{stage.outputRoot}</code> está en{" "}
+            {stage.filesystem === "NETWORK"
+              ? "una carpeta de red"
+              : `un disco con formato ${stage.filesystem}`}
+            . Ahí el sistema no nos deja identificar cada archivo de forma
+            inequívoca, así que no podemos detectar con la misma seguridad que
+            algo se sustituya por debajo mientras copiamos.
+          </p>
+          <p>
+            Lo que <strong>sí</strong> seguimos garantizando: cada archivo se
+            copia y se comprueba por su contenido, no se sobrescribe nada que ya
+            exista, y tus originales no se tocan. Lo que se debilita es la
+            detección de sustituciones durante la copia.
+          </p>
+          <p className="hint">
+            Lo más seguro es copiar primero a un disco local (NTFS) y mover el
+            resultado después. Si prefieres seguir, quedará anotado en el
+            registro del proyecto que lo aceptaste.
+          </p>
+          <div className="actions">
+            <button
+              type="button"
+              className="primary"
+              onClick={() => setStage({ kind: "setup" })}
+            >
+              Elegir otro destino
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                void startCopy(stage.resume, stage.outputRoot, true)
+              }
+            >
+              Entiendo el riesgo, copiar igualmente
+            </button>
+          </div>
+        </>
+      )}
+
       {stage.kind === "outOfSpace" && (
         <>
           <h2>No queda espacio en el destino</h2>
@@ -711,6 +791,7 @@ export function GuidedFlow({
                 void startCopy(
                   { kind: "copy", approve: false, execute: true },
                   stage.outputRoot,
+                  stage.degraded,
                 )
               }
             >

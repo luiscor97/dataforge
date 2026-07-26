@@ -337,6 +337,13 @@ export interface PlanOutcome {
   state: string;
 }
 
+export interface DestinationGuarantees {
+  /** `NTFS`, `REFS`, `FAT32`, `EXFAT`, `NETWORK` or `UNKNOWN`. */
+  filesystem: string;
+  /** False on network shares and FAT variants: degraded guarantees. */
+  has_physical_identity: boolean;
+}
+
 export interface PlanValidationReport {
   plan_id: string;
   version: number;
