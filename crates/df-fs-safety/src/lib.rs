@@ -363,6 +363,22 @@ impl SafeOutputRoot {
     /// Fails on platforms without a safe implementation, so a caller can never
     /// execute believing it is protected when it is not.
     pub fn validate(path: &Path) -> FsResult<Self> {
+        Self::validate_inner(path, true)
+    }
+
+    /// Validate a root that must already exist, **creating nothing**.
+    ///
+    /// [`validate`] materialises the directory, which is right for an output
+    /// root the run is about to write into — and wrong for a source root,
+    /// where it would leave an empty tree behind and quietly mask that the
+    /// origin moved or its drive went away. Callers that only read must use
+    /// this: "the origin is only ever read" has to hold for the root itself,
+    /// not just for the file handles under it.
+    pub fn validate_existing(path: &Path) -> FsResult<Self> {
+        Self::validate_inner(path, false)
+    }
+
+    fn validate_inner(path: &Path, create_missing: bool) -> FsResult<Self> {
         if !cfg!(windows) {
             return Err(FsSafetyError::UnsupportedPlatform {
                 platform: std::env::consts::OS,
@@ -371,10 +387,20 @@ impl SafeOutputRoot {
         if !path.is_absolute() {
             return Err(FsSafetyError::InvalidRelativePath {
                 path: path.to_path_buf(),
-                reason: "the output root must be absolute".to_string(),
+                reason: "the root must be absolute".to_string(),
             });
         }
-        std::fs::create_dir_all(path).map_err(|e| FsSafetyError::io(path, e))?;
+        if create_missing {
+            std::fs::create_dir_all(path).map_err(|e| FsSafetyError::io(path, e))?;
+        } else if !path.is_dir() {
+            return Err(FsSafetyError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the root does not exist or is not a directory",
+                ),
+            ));
+        }
         if is_reparse_point(path)? {
             return Err(FsSafetyError::ReparsePoint {
                 path: path.to_path_buf(),
@@ -1429,6 +1455,27 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source root is only ever read, and that has to include the root
+    /// itself: validating a vanished origin must report it, not recreate an
+    /// empty tree that hides the drive going away.
+    #[cfg(windows)]
+    #[test]
+    fn validating_an_absent_root_read_only_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("origen-que-ya-no-esta");
+
+        let refused = SafeOutputRoot::validate_existing(&missing);
+
+        assert!(refused.is_err(), "an absent root must be reported");
+        assert!(
+            !missing.exists(),
+            "read-only validation must not materialise the origin"
+        );
+        // The writable variant is what an output root wants, and it does create.
+        SafeOutputRoot::validate(&missing).unwrap();
+        assert!(missing.is_dir());
+    }
 
     #[test]
     fn relative_paths_reject_traversal_and_absolutes() {
