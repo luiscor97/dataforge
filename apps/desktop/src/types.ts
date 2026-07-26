@@ -337,6 +337,15 @@ export interface PlanOutcome {
   state: string;
 }
 
+export interface PlanValidationReport {
+  plan_id: string;
+  version: number;
+  status: string;
+  operations: number;
+  ok: boolean;
+  problems: string[];
+}
+
 export interface ApproveOutcome {
   plan_id: string;
   state: string;

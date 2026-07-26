@@ -14,6 +14,7 @@ import {
   type HashOutcome,
   type MediaOutcome,
   type PlanOutcome,
+  type PlanValidationReport,
   type ProjectStatus,
   type ScanOutcome,
   type SimilarityOutcome,
@@ -64,6 +65,12 @@ export function analyzeProject(projectDir: string): Promise<AnalyzeOutcome> {
 
 export function createPlan(projectDir: string): Promise<PlanOutcome> {
   return call<PlanOutcome>("create_plan", { projectDir });
+}
+
+export function validatePlan(
+  projectDir: string,
+): Promise<PlanValidationReport> {
+  return call<PlanValidationReport>("validate_plan", { projectDir });
 }
 
 export function approvePlan(projectDir: string): Promise<ApproveOutcome> {

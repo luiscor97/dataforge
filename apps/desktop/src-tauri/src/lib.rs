@@ -8,8 +8,9 @@ use df_error::DfError;
 use df_facade::{
     AnalyzeOutcome, ApproveOutcome, ContentArtifactBuildOutcome, ContentExtractionOptions,
     ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest,
-    ExecuteOutcome, HashOutcome, MediaOutcome, PlanOutcome, ProjectStatus, QueryOptions,
-    ScanOutcome, SearchRequest, SimilarityOutcome, SnapshotBuildOptions, VerifyOutcome,
+    ExecuteOutcome, HashOutcome, MediaOutcome, PlanOutcome, PlanValidationReport, ProjectStatus,
+    QueryOptions, ScanOutcome, SearchRequest, SimilarityOutcome, SnapshotBuildOptions,
+    VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -115,6 +116,17 @@ async fn create_plan(project_dir: String) -> Result<PlanOutcome, ErrorDto> {
         )
     })
     .await
+}
+
+/// Re-run the §26.5 invariants against the stored plan.
+///
+/// The guided flow uses this when it resumes a project that was planned in an
+/// earlier session: the operation count it shows must come from the plan on
+/// disk, and a plan the user is about to approve is worth re-validating rather
+/// than trusting because it was valid once.
+#[tauri::command]
+async fn validate_plan(project_dir: String) -> Result<PlanValidationReport, ErrorDto> {
+    run_blocking_command(move || df_facade::validate_plan(std::path::Path::new(&project_dir))).await
 }
 
 /// Freeze the plan into the immutable execution manifest.
@@ -253,6 +265,7 @@ pub fn run() {
             hash_project,
             analyze_project,
             create_plan,
+            validate_plan,
             approve_plan,
             execute_plan,
             verify_project,

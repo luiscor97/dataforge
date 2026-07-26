@@ -9,7 +9,10 @@ import {
   createProject,
   executePlan,
   hashProject,
+  openProject,
+  projectStatus,
   scanProject,
+  validatePlan,
   verifyProject,
 } from "../api";
 import { GuidedFlow } from "./GuidedFlow";
@@ -21,7 +24,10 @@ vi.mock("../api", () => ({
   createProject: vi.fn(),
   executePlan: vi.fn(),
   hashProject: vi.fn(),
+  openProject: vi.fn(),
+  projectStatus: vi.fn(),
   scanProject: vi.fn(),
+  validatePlan: vi.fn(),
   verifyProject: vi.fn(),
 }));
 
@@ -33,35 +39,63 @@ vi.mock("@tauri-apps/api/webview", () => ({
   },
 }));
 
+const SOURCE = "D:\\origen";
+const DESTINATION = "D:\\salida";
+const PROJECT_DIR = "D:\\salida-dataforge";
+
 const noop = (): void => {};
 
 function renderFlow(): void {
   render(<GuidedFlow onOpenAdvanced={noop} onExit={noop} />);
 }
 
+/** A `ProjectStatus` with only the fields this screen reads. */
+function status(
+  state: string,
+  inventory?: { files: number; folders: number; scan_errors: number },
+): unknown {
+  return {
+    project_dir: PROJECT_DIR,
+    state,
+    output_root: DESTINATION,
+    source_roots: [{ absolute_path: SOURCE }],
+    inventory: inventory ?? null,
+  };
+}
+
 async function fillFoldersAndSubmit(): Promise<void> {
   const user = userEvent.setup();
-  await user.type(
-    screen.getByLabelText(/carpeta que quieres ordenar/i),
-    "D:\\origen",
-  );
+  await user.type(screen.getByLabelText(/carpeta que quieres ordenar/i), SOURCE);
   await user.type(
     screen.getByLabelText(/dónde guardar el resultado/i),
-    "D:\\salida",
+    DESTINATION,
   );
-  await user.click(screen.getByRole("button", { name: /examinar mis archivos/i }));
+  await user.click(
+    screen.getByRole("button", { name: /examinar mis archivos/i }),
+  );
+}
+
+/** The happy path: a brand new project that inspects cleanly. */
+function mockFreshReview(inventory: {
+  files: number;
+  folders: number;
+  scan_errors: number;
+}): void {
+  vi.mocked(createProject).mockResolvedValue(status("CREATED") as never);
+  vi.mocked(scanProject).mockResolvedValue({
+    errors: inventory.scan_errors,
+  } as never);
+  vi.mocked(hashProject).mockResolvedValue({} as never);
+  vi.mocked(analyzeProject).mockResolvedValue({ duplicate_sets: 89 } as never);
+  vi.mocked(createPlan).mockResolvedValue({ operations: 1290 } as never);
+  vi.mocked(projectStatus).mockResolvedValue(
+    status("PLAN_READY", inventory) as never,
+  );
 }
 
 describe("GuidedFlow", () => {
   beforeEach(() => {
-    vi.mocked(createProject).mockReset();
-    vi.mocked(scanProject).mockReset();
-    vi.mocked(hashProject).mockReset();
-    vi.mocked(analyzeProject).mockReset();
-    vi.mocked(createPlan).mockReset();
-    vi.mocked(approvePlan).mockReset();
-    vi.mocked(executePlan).mockReset();
-    vi.mocked(verifyProject).mockReset();
+    vi.resetAllMocks();
   });
 
   // Typecheck, lint and build all passed while this screen crashed on mount,
@@ -83,17 +117,7 @@ describe("GuidedFlow", () => {
   });
 
   test("reports findings in plain language and never claims a deletion", async () => {
-    vi.mocked(createProject).mockResolvedValue({
-      project_dir: "D:\\salida-dataforge",
-    } as never);
-    vi.mocked(scanProject).mockResolvedValue({
-      files: 1234,
-      folders: 56,
-      errors: 0,
-    } as never);
-    vi.mocked(hashProject).mockResolvedValue({} as never);
-    vi.mocked(analyzeProject).mockResolvedValue({ duplicate_sets: 89 } as never);
-    vi.mocked(createPlan).mockResolvedValue({ operations: 1290 } as never);
+    mockFreshReview({ files: 1234, folders: 56, scan_errors: 0 });
 
     renderFlow();
     await fillFoldersAndSubmit();
@@ -116,27 +140,24 @@ describe("GuidedFlow", () => {
       code: "validation",
       message: "las carpetas se solapan",
     });
+    vi.mocked(openProject).mockRejectedValue({
+      code: "not_found",
+      message: "no project here",
+    });
 
     renderFlow();
     await fillFoldersAndSubmit();
 
     const alert = await screen.findByRole("alert");
+    // The creation failure is the one that explains the problem; the failed
+    // attempt to reopen must not mask it.
     expect(alert.textContent).toContain("las carpetas se solapan");
     // The user keeps their input and can correct it.
     expect(screen.getByLabelText(/carpeta que quieres ordenar/i)).toBeDefined();
   });
 
   test("announces the verified result without overstating it", async () => {
-    vi.mocked(createProject).mockResolvedValue({
-      project_dir: "D:\\salida-dataforge",
-    } as never);
-    vi.mocked(scanProject).mockResolvedValue({
-      files: 2,
-      folders: 1,
-      errors: 0,
-    } as never);
-    vi.mocked(hashProject).mockResolvedValue({} as never);
-    vi.mocked(analyzeProject).mockResolvedValue({ duplicate_sets: 0 } as never);
+    mockFreshReview({ files: 2, folders: 1, scan_errors: 0 });
     vi.mocked(createPlan).mockResolvedValue({ operations: 3 } as never);
     vi.mocked(approvePlan).mockResolvedValue({} as never);
     vi.mocked(executePlan).mockResolvedValue({
@@ -152,12 +173,160 @@ describe("GuidedFlow", () => {
     renderFlow();
     await fillFoldersAndSubmit();
     await screen.findByRole("heading", { name: /esto he encontrado/i });
-    await userEvent.click(screen.getByRole("button", { name: /hacer la copia/i }));
+    await userEvent.click(
+      screen.getByRole("button", { name: /hacer la copia/i }),
+    );
 
     // A run with warnings must not be announced as a clean success.
     expect(
       await screen.findByRole("heading", { name: /copia terminada, con avisos/i }),
     ).toBeDefined();
     expect(screen.getByText(/tus originales siguen intactos/i)).toBeDefined();
+  });
+
+  // --- Resuming an interrupted run ---------------------------------------
+
+  test("an interrupted run continues instead of re-hashing everything", async () => {
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "the project directory already exists",
+    });
+    vi.mocked(openProject).mockResolvedValue(status("HASHED") as never);
+    vi.mocked(analyzeProject).mockResolvedValue({ duplicate_sets: 4 } as never);
+    vi.mocked(createPlan).mockResolvedValue({ operations: 12 } as never);
+    vi.mocked(projectStatus).mockResolvedValue(
+      status("PLAN_READY", { files: 40, folders: 3, scan_errors: 0 }) as never,
+    );
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    await screen.findByRole("heading", { name: /esto he encontrado/i });
+    expect(vi.mocked(scanProject)).not.toHaveBeenCalled();
+    expect(vi.mocked(hashProject)).not.toHaveBeenCalled();
+    expect(vi.mocked(analyzeProject)).toHaveBeenCalledOnce();
+    expect(screen.getByText(/lo hemos\s+continuado/i)).toBeDefined();
+  });
+
+  // A project directory is derived from the destination, so reusing a
+  // destination with a different origin would otherwise silently continue
+  // somebody else's work against the wrong source.
+  test("refuses to resume a project that describes different folders", async () => {
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "the project directory already exists",
+    });
+    vi.mocked(openProject).mockResolvedValue({
+      project_dir: PROJECT_DIR,
+      state: "HASHED",
+      output_root: DESTINATION,
+      source_roots: [{ absolute_path: "E:\\otra-cosa" }],
+      inventory: null,
+    } as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("E:\\otra-cosa");
+    expect(vi.mocked(hashProject)).not.toHaveBeenCalled();
+    expect(vi.mocked(analyzeProject)).not.toHaveBeenCalled();
+  });
+
+  test("a plan left from an earlier session is re-validated, not trusted", async () => {
+    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(openProject).mockResolvedValue(status("PLAN_READY") as never);
+    vi.mocked(validatePlan).mockResolvedValue({
+      ok: true,
+      operations: 77,
+      problems: [],
+    } as never);
+    vi.mocked(projectStatus).mockResolvedValue(
+      status("PLAN_READY", { files: 80, folders: 5, scan_errors: 0 }) as never,
+    );
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    await screen.findByRole("heading", { name: /esto he encontrado/i });
+    expect(vi.mocked(createPlan)).not.toHaveBeenCalled();
+    // The count comes from the stored plan, never from a placeholder.
+    expect(screen.getByText("77")).toBeDefined();
+    // Nothing was analysed in this run, so no duplicate count is claimed.
+    expect(screen.queryByText(/grupos de copias repetidas/i)).toBeNull();
+  });
+
+  test("a stale plan is refused rather than offered for approval", async () => {
+    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(openProject).mockResolvedValue(status("PLAN_READY") as never);
+    vi.mocked(validatePlan).mockResolvedValue({
+      ok: false,
+      operations: 77,
+      problems: ["destination collision"],
+    } as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("destination collision");
+    expect(vi.mocked(approvePlan)).not.toHaveBeenCalled();
+  });
+
+  // The approved manifest already records the user's consent (§26.4). Asking
+  // again would be asking twice for one decision.
+  test("a half-done copy resumes without asking for approval twice", async () => {
+    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(openProject).mockResolvedValue(
+      status("EXECUTION_PAUSED") as never,
+    );
+    vi.mocked(executePlan).mockResolvedValue({
+      completed: 5,
+      bytes_copied: 1024,
+    } as never);
+    vi.mocked(verifyProject).mockResolvedValue({
+      verdict: "COMPLETED",
+      problems: 0,
+      warnings: 0,
+    } as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    await screen.findByRole("heading", { name: /copia a medias/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: /continuar la copia/i }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: /copia está verificada/i }),
+    ).toBeDefined();
+    expect(vi.mocked(approvePlan)).not.toHaveBeenCalled();
+    expect(vi.mocked(executePlan)).toHaveBeenCalledOnce();
+  });
+
+  test("a finished destination is reported, not copied over", async () => {
+    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(openProject).mockResolvedValue(status("COMPLETED") as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    await screen.findByRole("heading", { name: /ya está hecha/i });
+    expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
+    expect(vi.mocked(approvePlan)).not.toHaveBeenCalled();
+    expect(screen.getByText(/no tocaremos esta/i)).toBeDefined();
+  });
+
+  test("a state the engine cannot continue is handed over, not guessed at", async () => {
+    vi.mocked(createProject).mockRejectedValue({ code: "conflict", message: "x" });
+    vi.mocked(openProject).mockResolvedValue(status("VERIFYING") as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    await screen.findByRole("heading", { name: /trabajo interrumpido/i });
+    expect(screen.getByText("VERIFYING")).toBeDefined();
+    expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
   });
 });

@@ -1046,6 +1046,12 @@ summary:focus-visible {
   border-left-color: var(--danger);
 }
 
+/* Neutral information — "we picked up where you left off" — which is neither
+ * good news nor a warning and must not be dressed as either. */
+.notice-info {
+  border-left-color: var(--accent);
+}
+
 .guided code {
   padding: 0.1rem 0.35rem;
   border-radius: 5px;
