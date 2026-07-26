@@ -14,6 +14,9 @@ apps/desktop/src-tauri/gen/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+# Agent scratch: launch config and throwaway worktrees, one of which is an
+# embedded git repository that `git add -A` would otherwise stage as a gitlink.
+.claude/
 
 # OS noise
 Thumbs.db
