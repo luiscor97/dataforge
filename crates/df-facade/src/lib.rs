@@ -1617,7 +1617,10 @@ fn read_verified_source(
 ) -> DfResult<VerifiedSource> {
     let relative = raw_source_relative(source)?;
     let safe_relative = df_fs_safety::SafeRelativePath::parse(&relative)?;
-    let safe_root = df_fs_safety::SafeOutputRoot::validate(&source.root_path)?;
+    // Read-only validation: this is a *source* root. `validate` would create
+    // the directory, leaving an empty tree where the origin used to be and
+    // hiding the fact that it moved or its drive is gone.
+    let safe_root = df_fs_safety::SafeOutputRoot::validate_existing(&source.root_path)?;
     let lease = safe_root.lease_existing_file(&safe_relative)?;
     let path = lease.path().to_path_buf();
     let stored = FileFingerprint::parse(&source.fingerprint)?;
