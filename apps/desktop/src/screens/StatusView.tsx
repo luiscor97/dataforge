@@ -4,6 +4,7 @@ import type {
   SimilarityRelationView,
 } from "../types";
 import { ContentIntelligenceView } from "./ContentIntelligenceView";
+import { type Stage, nextStage } from "./resume";
 
 const COUNT_FORMAT = new Intl.NumberFormat("es-ES");
 const SIZE_FORMAT = new Intl.NumberFormat("es-ES", {
@@ -39,7 +40,7 @@ function formatBytes(value: number): string {
   return `${SIZE_FORMAT.format(scaled)} ${SIZE_UNITS[unit]}`;
 }
 
-type NextAction = "refresh" | "similarity" | "media" | null;
+type NextAction = "refresh" | "similarity" | "media" | Stage | null;
 
 interface NextStep {
   message: string;
@@ -47,9 +48,57 @@ interface NextStep {
 }
 
 /**
+ * What each pipeline stage does, and the button that runs it. The engine's own
+ * verbs (scan, hash, plan…) are not words a user has to learn to use this
+ * screen, so they appear only in the state badge above.
+ */
+const STAGE_STEPS: Record<Stage, { message: string; label: string }> = {
+  scan: {
+    message:
+      "Aún no se han recorrido tus carpetas. El recorrido solo lee: no modifica ni mueve nada.",
+    label: "Recorrer las carpetas",
+  },
+  hash: {
+    message:
+      "Las carpetas están recorridas. Falta calcular la huella de cada archivo, que es lo que permite reconocerlos y compararlos.",
+    label: "Calcular las huellas",
+  },
+  analyze: {
+    message:
+      "Las huellas están calculadas. Ahora se puede analizar la estructura y encontrar las copias exactas.",
+    label: "Analizar la estructura",
+  },
+  plan: {
+    message:
+      "El análisis ha terminado. Se puede proponer qué copiar y a dónde; nada se copia todavía.",
+    label: "Preparar la propuesta",
+  },
+  approve: {
+    message:
+      "Hay una propuesta esperando tu aprobación. Al aprobarla queda congelada e inmutable, y solo entonces empieza la copia.",
+    label: "Aprobar la propuesta",
+  },
+  execute: {
+    message:
+      "La propuesta está aprobada. La copia es reanudable y nunca sobrescribe nada que ya exista en el destino.",
+    label: "Ejecutar la copia",
+  },
+  verify: {
+    message:
+      "La copia ha terminado. Falta comprobarla releyendo el destino y contrastándolo con el original, sin fiarse de lo que acaba de hacerse.",
+    label: "Comprobar la copia",
+  },
+};
+
+/**
  * Derives the suggested next step from the same DTO conditions that the
  * sections below already present. It only points at actions the facade
  * offers; the shell never decides on its own.
+ *
+ * Reconstruction comes first: while the pipeline has a stage left, that stage
+ * is the next step. The optional analyses below it operate on evidence the
+ * pipeline produces, so offering them earlier would be offering something the
+ * engine would refuse.
  */
 function deriveNextStep(status: ProjectStatus): NextStep {
   if (status.integrity !== null && status.integrity.problems.length > 0) {
@@ -58,6 +107,10 @@ function deriveNextStep(status: ProjectStatus): NextStep {
         "La comprobación de integridad ha encontrado problemas. Revísalos más arriba antes de continuar.",
       action: null,
     };
+  }
+  const stage = nextStage(status.state);
+  if (stage !== null) {
+    return { message: STAGE_STEPS[stage].message, action: stage };
   }
   if (status.latest_snapshot_id === null) {
     return {
@@ -101,6 +154,8 @@ interface StatusViewProps {
   onRefresh: () => void;
   onAnalyzeSimilarity?: () => void;
   onAnalyzeMedia?: () => void;
+  /** Runs one stage of the reconstruction pipeline. */
+  onRunStage?: (stage: Stage) => void;
   onBack: () => void;
 }
 
@@ -110,6 +165,7 @@ export function StatusView({
   onRefresh,
   onAnalyzeSimilarity,
   onAnalyzeMedia,
+  onRunStage,
   onBack,
 }: StatusViewProps): React.JSX.Element {
   const diagnostics = status.structural_diagnostics ?? null;
@@ -179,6 +235,21 @@ export function StatusView({
       <div className="next-step">
         <h3>Siguiente paso</h3>
         <p>{nextStep.message}</p>
+        {nextStep.action !== null &&
+          nextStep.action in STAGE_STEPS &&
+          (() => {
+            const stage = nextStep.action as Stage;
+            return (
+              <button
+                type="button"
+                className="primary"
+                onClick={() => onRunStage?.(stage)}
+                disabled={busy || onRunStage === undefined}
+              >
+                {busy ? "Trabajando…" : STAGE_STEPS[stage].label}
+              </button>
+            );
+          })()}
         {nextStep.action === "refresh" && (
           <button
             type="button"

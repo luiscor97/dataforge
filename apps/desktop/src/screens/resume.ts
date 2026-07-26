@@ -100,3 +100,35 @@ const TABLE: Record<string, Resume> = {
 export function resumeFrom(state: string): Resume {
   return TABLE[state] ?? { kind: "manual", state };
 }
+
+/** One stage of the engine's pipeline, named as the facade names it. */
+export type Stage =
+  "scan" | "hash" | "analyze" | "plan" | "approve" | "execute" | "verify";
+
+/**
+ * The single stage that can run next on a project in `state`, or `null` when
+ * there is none — the project is finished, or stopped somewhere no stage
+ * accepts.
+ *
+ * The advanced screen offers this one button rather than all seven: a stage
+ * the engine would refuse is not a choice, and showing it greyed out with no
+ * explanation is worse than not showing it. Derived from the same table as
+ * `resumeFrom` so the two screens can never disagree about what comes next.
+ */
+export function nextStage(state: string): Stage | null {
+  const resume = resumeFrom(state);
+  switch (resume.kind) {
+    case "review":
+      if (resume.scan) return "scan";
+      if (resume.hash) return "hash";
+      if (resume.analyze) return "analyze";
+      if (resume.plan) return "plan";
+      return "approve";
+    case "copy":
+      if (resume.approve) return "approve";
+      if (resume.execute) return "execute";
+      return "verify";
+    default:
+      return null;
+  }
+}
