@@ -319,6 +319,38 @@ describe("GuidedFlow", () => {
     expect(vi.mocked(executePlan)).toHaveBeenCalledOnce();
   });
 
+  // Verifying after a stop for lack of space would fail with an engine message
+  // about the project's state, which explains nothing to the person staring at
+  // a full drive.
+  test("a full destination is explained, not reported as a verify failure", async () => {
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
+    vi.mocked(openProject).mockResolvedValue(status("PLAN_APPROVED") as never);
+    vi.mocked(executePlan).mockResolvedValue({
+      completed: 900,
+      bytes_copied: 4096,
+      pending: 100,
+      out_of_space: true,
+    } as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+    await screen.findByRole("heading", { name: /copia a medias/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: /continuar la copia/i }),
+    );
+
+    await screen.findByRole("heading", { name: /no queda espacio/i });
+    expect(vi.mocked(verifyProject)).not.toHaveBeenCalled();
+    expect(screen.getByText("900")).toBeDefined();
+    expect(screen.getByText("100")).toBeDefined();
+    expect(
+      screen.getByText(/tus archivos originales siguen intactos/i),
+    ).toBeDefined();
+  });
+
   test("a finished destination is reported, not copied over", async () => {
     vi.mocked(createProject).mockRejectedValue({
       code: "conflict",

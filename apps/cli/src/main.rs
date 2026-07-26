@@ -1265,7 +1265,13 @@ fn print_execute(outcome: &ExecuteOutcome) {
     println!("Pending         : {}", outcome.pending);
     println!("Bytes copied    : {}", outcome.bytes_copied);
     println!("State           : {}", outcome.state);
-    if outcome.cancelled || outcome.pending > 0 || outcome.failed_retryable > 0 {
+    if outcome.out_of_space {
+        // The one thing worth saying loudly: the remaining operations were not
+        // attempted, so the pile of pending work is not a symptom of anything
+        // else and re-running before freeing space will stop in the same place.
+        println!("Stopped         : the destination volume is full");
+        println!("Next            : free space, then run `dataforge execute` again to resume");
+    } else if outcome.cancelled || outcome.pending > 0 || outcome.failed_retryable > 0 {
         println!("Next            : run `dataforge execute` again to resume");
     }
 }

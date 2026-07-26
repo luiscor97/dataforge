@@ -43,6 +43,13 @@ type Stage =
       resume: Resume & { kind: "copy" };
       outputRoot: string;
     }
+  | {
+      kind: "outOfSpace";
+      copied: number;
+      bytes: number;
+      pending: number;
+      outputRoot: string;
+    }
   | { kind: "finished"; state: string }
   | { kind: "manual"; state: string }
   | { kind: "done"; result: Result };
@@ -400,6 +407,19 @@ export function GuidedFlow({
           const executed = await executePlan(dir);
           copied = executed.completed;
           bytes = executed.bytes_copied;
+          if (executed.out_of_space) {
+            // Verifying now would fail with an engine message about the
+            // project's state, which explains nothing. The one useful fact is
+            // that the destination drive is full and the work is not lost.
+            setStage({
+              kind: "outOfSpace",
+              copied: executed.completed,
+              bytes: executed.bytes_copied,
+              pending: executed.pending,
+              outputRoot: out,
+            });
+            return;
+          }
         }
 
         setStage({
@@ -642,6 +662,59 @@ export function GuidedFlow({
               onClick={() => void startCopy(stage.resume, stage.outputRoot)}
             >
               Continuar la copia
+            </button>
+            <button
+              type="button"
+              onClick={() => onOpenAdvanced(projectDir.current)}
+            >
+              Ver el detalle
+            </button>
+            <button type="button" onClick={onExit}>
+              Ahora no
+            </button>
+          </div>
+        </>
+      )}
+
+      {stage.kind === "outOfSpace" && (
+        <>
+          <h2>No queda espacio en el destino</h2>
+          <p className="notice notice-warning">
+            El disco donde está <code>{stage.outputRoot}</code> se ha llenado,
+            así que la copia se ha detenido ahí mismo en lugar de seguir
+            intentándolo archivo por archivo. Nada de lo ya copiado se pierde, y{" "}
+            <strong>tus archivos originales siguen intactos</strong>.
+          </p>
+          <div className="tiles">
+            <div className="tile">
+              <span className="tile-label">Copiado hasta ahora</span>
+              <strong>{humanCount(stage.copied)}</strong>
+            </div>
+            <div className="tile">
+              <span className="tile-label">Tamaño</span>
+              <strong>{humanBytes(stage.bytes)}</strong>
+            </div>
+            <div className="tile">
+              <span className="tile-label">Queda por copiar</span>
+              <strong>{humanCount(stage.pending)}</strong>
+            </div>
+          </div>
+          <p>
+            Libera espacio en ese disco (o vacía la papelera) y continúa: se
+            retomará justo donde se quedó, sin repetir lo hecho.
+          </p>
+          <div className="actions">
+            <button
+              type="button"
+              className="primary"
+              onClick={() =>
+                void startCopy(
+                  { kind: "copy", approve: false, execute: true },
+                  stage.outputRoot,
+                )
+              }
+            >
+              Ya he liberado espacio, continuar
             </button>
             <button
               type="button"

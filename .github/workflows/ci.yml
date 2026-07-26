@@ -140,6 +140,13 @@ jobs:
   hardening:
     name: Filesystem hardening (Windows)
     runs-on: windows-latest
+    # These tests plant real junctions with `mklink /J` and deny read access
+    # with `icacls`. Where that is forbidden they used to print SKIP and pass,
+    # so this job could go green having proved nothing at all — a result that
+    # looks like evidence and is not. This turns any such skip into a failure,
+    # which is the only thing that makes the green mean what it claims.
+    env:
+      DF_REQUIRE_HARDENING: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -148,9 +155,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # These tests plant real junctions with `mklink /J` and deny read access
-      # with `icacls`. They skip loudly (never silently) when the environment
-      # forbids it, so a green run here is meaningful evidence.
       - name: Filesystem safety boundary
         run: cargo test -p df-fs-safety -- --nocapture
 

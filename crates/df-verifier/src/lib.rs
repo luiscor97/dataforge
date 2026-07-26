@@ -487,6 +487,21 @@ mod tests {
         output: PathBuf,
     }
 
+    /// Skip a hardening test this environment genuinely cannot run — loudly.
+    ///
+    /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+    /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+    /// reports green having proved none of what these tests exist to prove,
+    /// which is worse than red: it looks like evidence.
+    #[cfg(windows)]
+    fn skip_hardening(reason: &str) {
+        assert!(
+            std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+            "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+        );
+        eprintln!("SKIP: {reason}");
+    }
+
     /// Create a directory junction with `mklink /J`; false when the
     /// environment forbids it, so a test skips *loudly* rather than silently.
     #[cfg(windows)]
@@ -682,7 +697,7 @@ mod tests {
         // Plant salida\origen\atajo -> fuera, after a clean execution.
         let planted = fx.output.join("origen").join("atajo");
         if !make_junction(&planted, &outside) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -743,14 +758,14 @@ mod tests {
         let sub = fx.output.join("origen").join("sub");
 
         if !set_read_denied(&sub, true) {
-            eprintln!("SKIP: icacls could not deny read access in this environment");
+            skip_hardening("icacls could not deny read access in this environment");
             return;
         }
         // Confirm the denial actually bites; if not, we would be asserting on
         // a test that proves nothing.
         if std::fs::read_dir(&sub).is_ok() {
             let _ = set_read_denied(&sub, false);
-            eprintln!("SKIP: the read denial had no effect (elevated session?)");
+            skip_hardening("the read denial had no effect (elevated session?)");
             return;
         }
 

@@ -359,6 +359,8 @@ export interface ExecuteOutcome {
   pending: number;
   bytes_copied: number;
   cancelled: boolean;
+  /** The run stopped because the destination volume filled up. */
+  out_of_space: boolean;
   state: string;
 }
 

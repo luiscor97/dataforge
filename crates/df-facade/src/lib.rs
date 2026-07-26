@@ -2583,6 +2583,21 @@ mod tests {
             .collect()
     }
 
+    /// Skip a hardening test this environment genuinely cannot run — loudly.
+    ///
+    /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+    /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+    /// reports green having proved none of what these tests exist to prove,
+    /// which is worse than red: it looks like evidence.
+    #[cfg(windows)]
+    fn skip_hardening(reason: &str) {
+        assert!(
+            std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+            "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+        );
+        eprintln!("SKIP: {reason}");
+    }
+
     #[cfg(windows)]
     fn make_junction(link: &Path, target: &Path) -> bool {
         let status = std::process::Command::new("cmd")
@@ -2662,7 +2677,7 @@ mod tests {
         std::fs::create_dir(&output).unwrap();
         std::fs::write(output.join("origen.txt"), b"source bytes").unwrap();
         if !make_junction(&source_alias, &output) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
