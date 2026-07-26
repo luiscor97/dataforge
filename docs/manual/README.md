@@ -252,7 +252,13 @@ Un id de perfil desconocido se rechaza al crear/abrir/analizar; nunca cae a
   (scan con errores, hash pendiente, ejecución con retryables, verificación
   no COMPLETED) · `4` integridad/ledger comprometidos.
 
-## 10. Qué DataForge nunca hace
+## 10. Antes de una prueba en entorno real
+
+`docs/release/field-test-readiness.md` recoge qué está probado con evidencia,
+qué **no** lo está, qué mirar durante la prueba y qué recoger si algo falla.
+Vale la pena leerlo antes de apuntar DataForge a un archivo que importa.
+
+## 11. Qué DataForge nunca hace
 
 - No borra ni modifica el origen.
 - No sobrescribe un destino existente.
