@@ -1730,7 +1730,7 @@ mod tests {
             let link = tmp.path().join("link");
             std::fs::create_dir(&real).unwrap();
             if !make_junction(&link, &real) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
 
@@ -1883,7 +1883,7 @@ mod tests {
             let root = SafeOutputRoot::validate(&output).unwrap();
             let planted = output.join("claimed.tmp");
             if !make_junction(&planted, &outside) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
             let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
@@ -1985,7 +1985,7 @@ mod tests {
             let root = SafeOutputRoot::validate(&output).unwrap();
             let planted = output.join("leased.tmp");
             if !make_junction(&planted, &outside) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
 
@@ -2008,7 +2008,7 @@ mod tests {
             let link = tmp.path().join("link");
             std::fs::create_dir(&real).unwrap();
             if !make_junction(&link, &real) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
             let err = SafeOutputRoot::validate(&link).unwrap_err();
@@ -2027,7 +2027,7 @@ mod tests {
             // out/clientes -> outside   (the attack from the threat model)
             let planted = out_dir.join("clientes");
             if !make_junction(&planted, &outside) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
 
@@ -2057,6 +2057,21 @@ mod tests {
             assert!(info[0].exists && info[0].is_dir && !info[0].is_reparse_point);
             assert!(!info[1].exists);
             assert!(!info[2].exists);
+        }
+
+        /// Skip a hardening test this environment genuinely cannot run — loudly.
+        ///
+        /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+        /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+        /// reports green having proved none of what these tests exist to prove,
+        /// which is worse than red: it looks like evidence.
+        #[cfg(windows)]
+        fn skip_hardening(reason: &str) {
+            assert!(
+                std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+                "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+            );
+            eprintln!("SKIP: {reason}");
         }
 
         /// Create a directory junction with the `mklink /J` shell builtin.

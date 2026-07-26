@@ -68,6 +68,13 @@ pub struct ExecuteOutcome {
     pub pending: u64,
     pub bytes_copied: u64,
     pub cancelled: bool,
+    /// The run stopped because the destination volume filled up.
+    ///
+    /// Distinguishable from an ordinary pause so a caller can say what
+    /// happened instead of reporting an unexplained pile of retryable
+    /// failures. The operations left untouched stay `PENDING`, and the one
+    /// that hit the wall stays `FAILED_RETRYABLE`: free space and re-run.
+    pub out_of_space: bool,
     /// Project state after the run: `EXECUTED` when every operation reached
     /// a terminal state, `EXECUTION_PAUSED` when work remains.
     pub state: String,
@@ -144,6 +151,7 @@ pub fn execute_plan(
     let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut bytes_copied: u64 = 0;
     let mut cancelled = false;
+    let mut out_of_space = false;
     'run: loop {
         let batch = plans::executable_operations(db, plan.id, options.operation_batch)?;
         // Operations already attempted in this run stay for the *next* run.
@@ -168,6 +176,10 @@ pub fn execute_plan(
                 if let Err(failure) = reclaim_interrupted_partial(&safe_root, &operation) {
                     let outcome = failure.into_outcome(chrono::Utc::now());
                     plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+                    if outcome.error_code == Some(OperationErrorCode::NoSpace) {
+                        out_of_space = true;
+                        break 'run;
+                    }
                     continue;
                 }
             }
@@ -190,6 +202,17 @@ pub fn execute_plan(
             );
             bytes_copied += outcome.bytes_copied;
             plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
+            // A full destination is not this operation's problem, it is the
+            // run's. Carrying on would attempt every remaining copy — at
+            // millions of files, hours of guaranteed failure that writes two
+            // SQLite rows and a doomed partial per file, and buries the one
+            // fact the user needs under a million identical NO_SPACE entries.
+            // Stopping leaves the rest PENDING and this one FAILED_RETRYABLE,
+            // which is exactly what resuming after freeing space picks up.
+            if outcome.error_code == Some(OperationErrorCode::NoSpace) {
+                out_of_space = true;
+                break 'run;
+            }
         }
     }
 
@@ -209,6 +232,7 @@ pub fn execute_plan(
         "pending": progress.pending,
         "bytes_copied": bytes_copied,
         "cancelled": cancelled,
+        "out_of_space": out_of_space,
     });
     // Only the zero-work recovery path can represent the legacy crash window
     // between a terminal milestone and the old separate state transition.
@@ -234,6 +258,7 @@ pub fn execute_plan(
         pending: progress.pending + progress.running,
         bytes_copied,
         cancelled,
+        out_of_space,
         state: project.state.as_str().to_string(),
     })
 }
@@ -909,6 +934,48 @@ struct StreamedCopy {
     blake3: String,
 }
 
+/// Test-only fault injection for a full destination volume.
+///
+/// ENOSPC is the likeliest failure in production and the executor now stops
+/// the whole run on it, so that rule needs a test that drives the real loop —
+/// not one that only checks the error mapping. Filling a real volume is not
+/// something a unit test can do portably, so the write is made to fail here
+/// instead. Thread-local, so tests running in parallel cannot see each other's
+/// injection.
+///
+/// Gated on `windows` to match the test module below: off Windows the executor
+/// refuses to run at all (ADR-0017), so nothing would call this and it would
+/// be dead code under `-D warnings`.
+#[cfg(all(test, windows))]
+mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COPIES_UNTIL_DISK_FULL: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let `copies` copies through, then fail every later write with ENOSPC.
+    pub(super) fn fill_disk_after(copies: usize) {
+        COPIES_UNTIL_DISK_FULL.with(|cell| cell.set(Some(copies)));
+    }
+
+    pub(super) fn clear() {
+        COPIES_UNTIL_DISK_FULL.with(|cell| cell.set(None));
+    }
+
+    /// True once the injected budget is spent. Consumes one copy otherwise.
+    pub(super) fn disk_is_full() -> bool {
+        COPIES_UNTIL_DISK_FULL.with(|cell| match cell.get() {
+            None => false,
+            Some(0) => true,
+            Some(remaining) => {
+                cell.set(Some(remaining - 1));
+                false
+            }
+        })
+    }
+}
+
 /// Stream the source into an already-opened partial, hashing as we go.
 ///
 /// The writer arrives from `df-fs-safety::create_partial_secure`, so this
@@ -919,6 +986,13 @@ fn stream_copy(
     mut writer: std::fs::File,
     buffer_bytes: usize,
 ) -> std::io::Result<StreamedCopy> {
+    #[cfg(all(test, windows))]
+    if fault::disk_is_full() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "injected: no space left on device",
+        ));
+    }
     let mut reader = std::fs::File::open(source)?;
     let mut sha = sha2::Sha256::new();
     let mut blake = blake3::Hasher::new();
@@ -1099,6 +1173,21 @@ mod tests {
         (partial, identity)
     }
 
+    /// Skip a hardening test this environment genuinely cannot run — loudly.
+    ///
+    /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+    /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+    /// reports green having proved none of what these tests exist to prove,
+    /// which is worse than red: it looks like evidence.
+    #[cfg(windows)]
+    fn skip_hardening(reason: &str) {
+        assert!(
+            std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+            "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+        );
+        eprintln!("SKIP: {reason}");
+    }
+
     /// Create a directory junction with `mklink /J`. Returns false when the
     /// environment forbids it, so a test can skip *loudly* (the encargo
     /// forbids silent passes).
@@ -1129,7 +1218,7 @@ mod tests {
         std::fs::create_dir_all(&fx.output).unwrap();
         let planted = fx.output.join("origen");
         if !make_junction(&planted, &outside) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -1173,7 +1262,7 @@ mod tests {
         std::fs::rename(&fx.origin, &saved_origin).unwrap();
         std::fs::create_dir_all(&fx.output).unwrap();
         if !make_junction(&fx.origin, &fx.output) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -1905,7 +1994,7 @@ mod tests {
         let outside = tmp.path().join("outside-partial-target");
         std::fs::create_dir(&outside).unwrap();
         if !make_junction(&planted, &outside) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -2003,5 +2092,89 @@ mod tests {
         assert!(types.contains(&"PLAN_APPROVED"));
         assert!(types.contains(&"EXECUTION_COMPLETED"));
         df_ledger::verify_chain(&events).expect("ledger stays valid");
+    }
+
+    // --- A full destination volume (ENOSPC) --------------------------------
+    //
+    // The likeliest failure when copying a real archive, and until now the
+    // least covered: the mapping existed but nothing exercised it, and the run
+    // loop treated a full disk as one operation's bad luck.
+
+    #[test]
+    fn a_full_destination_maps_to_a_retryable_no_space_failure() {
+        let failure = OperationFailure::from_io(
+            &std::io::Error::new(std::io::ErrorKind::StorageFull, "disk full"),
+            "copying",
+        );
+        assert_eq!(failure.code, OperationErrorCode::NoSpace);
+        // Retryable, not final: freeing space and re-running is the fix, and a
+        // FAILED_FINAL operation would never be attempted again.
+        assert_eq!(failure.state, ExecutionState::FailedRetryable);
+        assert!(!failure.retain_partial_lease);
+    }
+
+    #[test]
+    fn a_full_destination_stops_the_run_instead_of_grinding_through_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        fault::fill_disk_after(1);
+        let outcome = execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None);
+        fault::clear();
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.out_of_space, "the run must report why it stopped");
+        assert_eq!(outcome.state, "EXECUTION_PAUSED");
+        // Exactly one copy hit the wall. The remaining copies were never
+        // attempted, which is the whole point: at a million files, attempting
+        // them costs hours and teaches nobody anything.
+        assert_eq!(outcome.failed_retryable, 1);
+        assert!(
+            outcome.pending > 0,
+            "later operations must be left PENDING, not failed"
+        );
+        // Exactly the one copy that ran before the wall is on disk. The
+        // fixture has three; the other two were never attempted.
+        let copied = ["a.txt", "sub/b.txt", "c.txt"]
+            .into_iter()
+            .filter(|relative| fx.output.join("origen").join(relative).exists())
+            .count();
+        assert_eq!(copied, 1, "only the copy before the wall may exist");
+        // Space is not made worse: the doomed partial is cleaned up.
+        assert!(no_partials_left(&fx.output));
+    }
+
+    #[test]
+    fn freeing_space_and_running_again_finishes_the_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        fault::fill_disk_after(1);
+        let stopped = execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None);
+        fault::clear();
+        assert!(stopped.unwrap().out_of_space);
+
+        // "Free space and try again" has to actually work, including for the
+        // operation that failed: it is FAILED_RETRYABLE, so it comes back.
+        let resumed =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert!(!resumed.out_of_space);
+        assert_eq!(resumed.state, "EXECUTED");
+        assert_eq!(resumed.failed_retryable, 0);
+        assert_eq!(
+            std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
+            b"same bytes"
+        );
+        assert!(no_partials_left(&fx.output));
+    }
+
+    #[test]
+    fn a_run_that_never_fills_the_disk_does_not_claim_it_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert!(!outcome.out_of_space);
+        assert_eq!(outcome.state, "EXECUTED");
     }
 }

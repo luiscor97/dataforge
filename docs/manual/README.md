@@ -6,8 +6,10 @@ contenido por hash, analiza estructura y contexto, propone un plan y ejecuta
 copias verificadas hacia una salida nueva. Nunca modifica ni borra el
 origen, y cada paso queda en un ledger append-only.
 
-Este manual cubre la CLI (`dataforge`). El escritorio (Tauri) y la CLI
+Este manual cubre el escritorio (§3) y la CLI (§4 en adelante). Ambos
 consumen el mismo motor (`df-facade`): la interfaz presenta, el motor decide.
+Nada de lo que hace la CLI puede hacerlo el escritorio de otra forma, ni al
+revés.
 
 ## 1. Garantías que puedes dar por hechas
 
@@ -26,17 +28,91 @@ consumen el mismo motor (`df-facade`): la interfaz presenta, el motor decide.
 
 ## 2. Instalación (Windows)
 
+La vía normal es descargar los binarios de la release. Lo firmado con
+Sigstore (`.sig` + `.pem`) son `SHA256SUMS.txt` y el SBOM, que cubren los
+binarios de forma transitiva: verifica primero la firma de `SHA256SUMS.txt`
+con `cosign verify-blob` y después el checksum de cada binario contra ese
+fichero. Las instrucciones exactas acompañan a cada release; el porqué está
+en [ADR-0039](../adr/ADR-0039-keyless-release-signing.md).
+
+Para compilar desde el código:
+
 ```powershell
-# Compilar el motor y la CLI
+# Motor y CLI
 cargo build --release --workspace --exclude dataforge-desktop
 # El binario queda en target\release\dataforge.exe
+
+# Escritorio (requiere pnpm; deja el instalador en src-tauri\target\release)
+pnpm install
+pnpm --filter dataforge-desktop tauri build
 ```
 
 El pipeline seguro de escritura está endurecido en Windows (NTFS/ReFS). En
 Linux/macOS la ejecución de copias es experimental y falla cerrado hasta que
 exista un backend equivalente; el resto del análisis funciona.
 
-## 3. El flujo completo
+## 3. El escritorio: el asistente guiado
+
+El escritorio existe para quien quiere sus documentos ordenados sin aprender
+un pipeline. Encadena las siete etapas y habla de lo que significan, no de
+cómo se llaman.
+
+### 3.1 Las tres decisiones
+
+1. **Elegir las dos carpetas.** La que quieres ordenar y dónde quieres el
+   resultado. Puedes **arrastrar cada carpeta desde el explorador hasta su
+   caja** — cae en la caja sobre la que sueltas, no en la que tenga el foco —
+   o escribir la ruta. El proyecto se crea junto al destino, con el sufijo
+   `-dataforge`.
+2. **Mirar lo encontrado y decir que sí.** El asistente examina, calcula
+   huellas, busca duplicados y prepara la propuesta; entonces te enseña
+   cuántos archivos hay y cuántos elementos va a copiar. Hasta que pulsas
+   «Hacer la copia» no se ha escrito nada en el destino.
+3. **Recoger el resultado verificado.** La copia se comprueba releyendo el
+   destino y contrastándolo con el original.
+
+La política de duplicados del asistente es siempre `REPORT_ONLY`: se copian
+todas las apariciones y las repeticiones quedan señaladas. El asistente
+nunca borra nada tuyo, ni en el origen ni en el destino.
+
+### 3.2 Barras de progreso: por qué no hay porcentaje
+
+El motor no informa de un porcentaje, así que el asistente muestra una barra
+indeterminada y dice qué está haciendo. Una barra que avanzara por un
+temporizador sería una mentira contada justo cuando más necesitas la verdad.
+La etapa de huellas avisa de que puede tardar.
+
+### 3.3 Si se interrumpe
+
+Cerrar la ventana, reiniciar o quedarse sin batería no pierde el trabajo
+hecho. Al volver a apuntar el asistente a las mismas dos carpetas retoma
+desde donde estaba: no vuelve a escanear ni a re-hashear lo ya hecho, y si
+la copia ya estaba aprobada la continúa sin volver a pedirte permiso.
+
+Tres casos que verás por escrito en vez de como un error:
+
+- **«No queda espacio en el destino».** La copia se detiene en cuanto el
+  disco se llena, en lugar de intentar el resto archivo por archivo. Libera
+  espacio y pulsa continuar: se retoma donde se quedó.
+- **«Esta carpeta ya está hecha».** El destino contiene una copia terminada
+  y comprobada. No se toca; si quieres empezar de nuevo, elige otro destino.
+- **«Hay un trabajo interrumpido».** El proyecto quedó parado en un punto
+  que el asistente no continúa por su cuenta. Abre el detalle para verlo.
+
+Si el destino ya guarda un proyecto de **otro** origen, el asistente se
+niega y te pide otra carpeta: el nombre del proyecto sale del destino, así
+que continuar sería seguir el trabajo equivocado.
+
+### 3.4 Modo avanzado
+
+«Prefiero configurarlo yo» da control sobre lo que el asistente decide por
+ti: el nombre, el perfil (`generic` o `legal`) y **varias** carpetas de
+origen. La pantalla de estado ejecuta después el pipeline etapa a etapa,
+ofreciendo en cada momento el único paso que el motor aceptaría, y da acceso
+a la evidencia completa: diagnóstico estructural, similitud, multimedia y
+búsqueda de contenido.
+
+## 4. El flujo completo (CLI)
 
 ```powershell
 # 1. Crear el proyecto (uno o más orígenes de solo lectura + salida)
@@ -79,7 +155,7 @@ de control reabribles: puedes re-escanear para un nuevo ciclo. Un plan en
 vuelo (de `PLAN_READY` a `EXECUTED`) fija su snapshot hasta ejecutarse y
 verificarse.
 
-## 4. Informes (evidencia, nunca acción)
+## 5. Informes (evidencia, nunca acción)
 
 ```powershell
 dataforge report duplicates      --path <p>   # conjuntos de duplicados exactos
@@ -92,7 +168,7 @@ dataforge report media           --path <p>   # relaciones perceptuales (M0.5)
 dataforge report plugins         --path <p>   # findings de plugins (M0.6)
 ```
 
-## 5. Revisión humana
+## 6. Revisión humana
 
 Las anomalías ambiguas y las reglas `COPY_REVIEW` generan items de revisión.
 Nada se consolida automáticamente sin decisión; las decisiones son
@@ -103,7 +179,7 @@ dataforge review list   --path <p>
 dataforge review decide --path <p> --item <id> --decision COPY_SEPARATED --reason "..."
 ```
 
-## 6. Capacidades de análisis
+## 7. Capacidades de análisis
 
 ### Similitud y versiones (M0.3)
 ```powershell
@@ -159,7 +235,7 @@ ejecutar, planificar ni aprobar nada. Cada envío exige consentimiento
 explícito sobre el manifiesto de divulgación (con rutas/emails/teléfonos
 redactados) y queda auditado.
 
-## 7. Perfiles
+## 8. Perfiles
 
 - `generic`: contenedores de bajo valor y reglas seguras genéricas.
 - `legal`: además declara fronteras protegidas (expediente, pericial,
@@ -169,14 +245,20 @@ redactados) y queda auditado.
 Un id de perfil desconocido se rechaza al crear/abrir/analizar; nunca cae a
 `generic` en silencio.
 
-## 8. Códigos de salida de la CLI
+## 9. Códigos de salida de la CLI
 
 - `0` éxito · `1` error genérico (p. ej. proyecto inexistente) ·
   `2` validación de plan fallida · `3` resultado con fallos/pendientes
   (scan con errores, hash pendiente, ejecución con retryables, verificación
   no COMPLETED) · `4` integridad/ledger comprometidos.
 
-## 9. Qué DataForge nunca hace
+## 10. Antes de una prueba en entorno real
+
+`docs/release/field-test-readiness.md` recoge qué está probado con evidencia,
+qué **no** lo está, qué mirar durante la prueba y qué recoger si algo falla.
+Vale la pena leerlo antes de apuntar DataForge a un archivo que importa.
+
+## 11. Qué DataForge nunca hace
 
 - No borra ni modifica el origen.
 - No sobrescribe un destino existente.

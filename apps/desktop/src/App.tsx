@@ -2,16 +2,40 @@ import { useCallback, useEffect, useState } from "react";
 
 import {
   analyzeMedia,
+  analyzeProject,
   analyzeSimilarity,
+  approvePlan,
+  createPlan,
   createProject,
   engineVersion,
+  executePlan,
+  hashProject,
   openProject,
   projectStatus,
+  scanProject,
+  verifyProject,
 } from "./api";
 import { ErrorAlert } from "./components/ErrorAlert";
 import { GuidedFlow } from "./screens/GuidedFlow";
 import { StatusView } from "./screens/StatusView";
+import type { Stage } from "./screens/resume";
 import { type ErrorDto, type ProjectStatus, isErrorDto } from "./types";
+
+/**
+ * The advanced screen runs the pipeline one stage at a time. Each entry is the
+ * facade command for that stage; the screen decides *which* stage the project
+ * can run next, and never invents one the engine would refuse.
+ */
+const STAGE_COMMANDS: Record<Stage, (projectDir: string) => Promise<unknown>> =
+  {
+    scan: scanProject,
+    hash: hashProject,
+    analyze: analyzeProject,
+    plan: createPlan,
+    approve: approvePlan,
+    execute: executePlan,
+    verify: verifyProject,
+  };
 
 type Screen = "home" | "guided" | "create" | "open" | "status";
 type BuiltInProfile = "generic" | "legal";
@@ -123,6 +147,31 @@ export default function App(): React.JSX.Element {
       setBusy(false);
     }
   }, [status, handleFailure]);
+
+  const runStage = useCallback(
+    async (stage: Stage) => {
+      if (status === null) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      try {
+        await STAGE_COMMANDS[stage](status.project_dir);
+      } catch (failure) {
+        handleFailure(failure);
+      } finally {
+        // The state moved even when the stage failed part way — a paused scan,
+        // a partial execution — so the screen must show where it actually is.
+        try {
+          setStatus(await projectStatus(status.project_dir));
+        } catch (failure) {
+          handleFailure(failure);
+        }
+        setBusy(false);
+      }
+    },
+    [status, handleFailure],
+  );
 
   const runMedia = useCallback(async () => {
     if (status === null) {
@@ -322,9 +371,8 @@ export default function App(): React.JSX.Element {
                   aria-describedby="output-root-help"
                 />
                 <span id="output-root-help" className="field-help">
-                  Aquí escribirá DataForge los resultados en fases futuras;
-                  nunca toca tus originales. No puede estar dentro de las otras
-                  carpetas.
+                  Aquí escribirá DataForge la copia reconstruida; nunca toca tus
+                  originales. No puede estar dentro de las otras carpetas.
                 </span>
               </label>
               <label>
@@ -401,6 +449,7 @@ export default function App(): React.JSX.Element {
           onRefresh={() => void refreshStatus()}
           onAnalyzeSimilarity={() => void runSimilarity()}
           onAnalyzeMedia={() => void runMedia()}
+          onRunStage={(stage) => void runStage(stage)}
           onBack={goHome}
         />
       )}

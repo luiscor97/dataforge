@@ -2117,6 +2117,34 @@ pub fn approve_plan(project_dir: &Path, actor: Actor) -> DfResult<ApproveOutcome
     df_planner::approve_plan(&mut db, actor)
 }
 
+/// What the project's destination filesystem can and cannot guarantee.
+///
+/// A caller that offers to execute needs this *before* asking the user to
+/// commit: on a network share or a FAT variant the executor refuses without
+/// an explicit acknowledgement (ADR-0036), and discovering that only after
+/// the copy has run for an hour is a worse way to learn it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DestinationGuarantees {
+    /// `NTFS`, `REFS`, `FAT32`, `EXFAT`, `NETWORK` or `UNKNOWN`.
+    pub filesystem: String,
+    /// False when the volume offers no physical identity, so substitution
+    /// detection and the strong-identity leases are degraded (ADR-0036).
+    pub has_physical_identity: bool,
+}
+
+/// Classify the project's output root (read-only; touches no state).
+pub fn destination_guarantees(project_dir: &Path) -> DfResult<DestinationGuarantees> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let kind = df_fs_safety::classify_filesystem(&project.output_root);
+    Ok(DestinationGuarantees {
+        filesystem: kind.as_str().to_string(),
+        has_physical_identity: kind.has_physical_identity(),
+    })
+}
+
 /// Execute the approved plan (§27). Resumable; ends in `EXECUTED` or
 /// `EXECUTION_PAUSED` when work remains.
 pub fn execute_plan(project_dir: &Path, actor: Actor) -> DfResult<ExecuteOutcome> {
@@ -2583,6 +2611,21 @@ mod tests {
             .collect()
     }
 
+    /// Skip a hardening test this environment genuinely cannot run — loudly.
+    ///
+    /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+    /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+    /// reports green having proved none of what these tests exist to prove,
+    /// which is worse than red: it looks like evidence.
+    #[cfg(windows)]
+    fn skip_hardening(reason: &str) {
+        assert!(
+            std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+            "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+        );
+        eprintln!("SKIP: {reason}");
+    }
+
     #[cfg(windows)]
     fn make_junction(link: &Path, target: &Path) -> bool {
         let status = std::process::Command::new("cmd")
@@ -2662,7 +2705,7 @@ mod tests {
         std::fs::create_dir(&output).unwrap();
         std::fs::write(output.join("origen.txt"), b"source bytes").unwrap();
         if !make_junction(&source_alias, &output) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
