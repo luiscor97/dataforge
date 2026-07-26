@@ -934,11 +934,6 @@ struct StreamedCopy {
     blake3: String,
 }
 
-/// Stream the source into an already-opened partial, hashing as we go.
-///
-/// The writer arrives from `df-fs-safety::create_partial_secure`, so this
-/// function never opens a destination path itself — that is the whole point of
-/// the boundary (ADR-0017). The source is opened read-only (rule 1).
 /// Test-only fault injection for a full destination volume.
 ///
 /// ENOSPC is the likeliest failure in production and the executor now stops
@@ -947,7 +942,11 @@ struct StreamedCopy {
 /// something a unit test can do portably, so the write is made to fail here
 /// instead. Thread-local, so tests running in parallel cannot see each other's
 /// injection.
-#[cfg(test)]
+///
+/// Gated on `windows` to match the test module below: off Windows the executor
+/// refuses to run at all (ADR-0017), so nothing would call this and it would
+/// be dead code under `-D warnings`.
+#[cfg(all(test, windows))]
 mod fault {
     use std::cell::Cell;
 
@@ -977,12 +976,17 @@ mod fault {
     }
 }
 
+/// Stream the source into an already-opened partial, hashing as we go.
+///
+/// The writer arrives from `df-fs-safety::create_partial_secure`, so this
+/// function never opens a destination path itself — that is the whole point of
+/// the boundary (ADR-0017). The source is opened read-only (rule 1).
 fn stream_copy(
     source: &Path,
     mut writer: std::fs::File,
     buffer_bytes: usize,
 ) -> std::io::Result<StreamedCopy> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     if fault::disk_is_full() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
