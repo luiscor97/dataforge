@@ -132,13 +132,19 @@ jobs:
       - name: Build desktop installer
         run: pnpm --filter dataforge-desktop tauri build
 
-      - name: Collect installer and checksum
+      # Only the installer itself is uploaded. Its checksum is *not* written to
+      # a separate file here: a second, unsigned sums file would leave the one
+      # artifact a non-technical user actually double-clicks as the only one
+      # nobody can verify, while the published instructions — which speak of
+      # SHA256SUMS.txt — silently would not cover it. `draft-release` folds the
+      # installer into that same file before it is signed.
+      - name: Collect installer
         shell: bash
         run: |
           mkdir -p dist
           find . -path '*/bundle/nsis/*-setup.exe' -exec cp {} dist/ \;
           test -n "$(ls -A dist)" || { echo "no NSIS installer produced"; exit 1; }
-          cd dist && sha256sum *.exe > INSTALLER-SHA256SUMS.txt && cat INSTALLER-SHA256SUMS.txt
+          ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -163,6 +169,20 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
+      # Fold the installer into the same checksum file *before* signing, so one
+      # signature covers every artefact in the release and `sha256sum -c
+      # SHA256SUMS.txt` — the command the release notes give — verifies the
+      # installer too. The paths are stripped because a user downloads every
+      # asset into one directory.
+      - name: Add the installer to the signed checksums
+        shell: bash
+        run: |
+          cd artifacts/desktop-installer
+          sha256sum *.exe >> ../windows-binaries/SHA256SUMS.txt
+          cd ..
+          sort -k2 -o windows-binaries/SHA256SUMS.txt windows-binaries/SHA256SUMS.txt
+          cat windows-binaries/SHA256SUMS.txt
+
       - name: Sign checksums and SBOM (keyless)
         run: |
           cosign sign-blob --yes \
@@ -181,7 +201,17 @@ jobs:
           {
             echo "Draft — review the artifacts and the CHANGELOG entry, then publish deliberately."
             echo
+            echo '## Qué descargar'
+            echo
+            echo '- **`DataForge Desktop_*-setup.exe`** — el instalador. Es lo que'
+            echo '  necesita alguien que solo quiera usar la aplicación; Windows ya'
+            echo '  trae el runtime WebView2.'
+            echo '- `dataforge.exe` y compañía — la CLI y los procesos auxiliares.'
+            echo
             echo '## Verificación'
+            echo
+            echo '`SHA256SUMS.txt` cubre **todos** los binarios de esta release, el'
+            echo 'instalador incluido, y su firma Sigstore lo cubre a él:'
             echo '```'
             echo 'sha256sum -c SHA256SUMS.txt'
             echo 'cosign verify-blob \'

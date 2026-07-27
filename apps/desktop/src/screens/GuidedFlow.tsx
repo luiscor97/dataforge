@@ -340,6 +340,7 @@ export function GuidedFlow({
   // failed poll (a momentary DB lock, or no Tauri runtime) simply skips a tick.
   const pollScanProgress = useCallback((dir: string): (() => void) => {
     let stopped = false;
+    let warned = false;
     const tick = async (): Promise<void> => {
       try {
         const { files } = await scanProgress(dir);
@@ -347,13 +348,23 @@ export function GuidedFlow({
           setStage({
             kind: "working",
             label: "Mirando qué archivos tienes…",
-            detail: `Solo los leemos. Nada se modifica. · ${files.toLocaleString(
-              "es-ES",
-            )} archivos vistos`,
+            // `humanCount`, not `toLocaleString`: the latter reads the
+            // runtime's locale data, so the same build shows "1.234" in the
+            // webview and "1234" under the test runner. See its doc comment.
+            detail: `Solo los leemos. Nada se modifica. · ${humanCount(files)} archivos vistos`,
           });
         }
       } catch {
-        // Skip this tick.
+        // A tick can fail for two very different reasons: a momentary database
+        // lock (skip it, the next one will do) or a wiring mistake such as the
+        // command not being registered. Swallowing both silently is how this
+        // feature could look alive in tests while doing nothing, so say so
+        // once — the console is where a developer looks, and the user still
+        // gets the stage text either way.
+        if (!warned) {
+          warned = true;
+          console.warn("scan progress unavailable; the counter stays hidden");
+        }
       }
     };
     void tick();
@@ -457,7 +468,7 @@ export function GuidedFlow({
         },
       });
     },
-    [],
+    [pollScanProgress],
   );
 
   /**
@@ -657,7 +668,10 @@ export function GuidedFlow({
                   placeholder="Arrastra una carpeta vacía, o escribe su ruta"
                   required
                 />
-                <button type="button" onClick={() => void browse("destination")}>
+                <button
+                  type="button"
+                  onClick={() => void browse("destination")}
+                >
                   Explorar…
                 </button>
               </div>
