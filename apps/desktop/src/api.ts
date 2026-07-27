@@ -56,6 +56,17 @@ export function scanProject(projectDir: string): Promise<ScanOutcome> {
   return call<ScanOutcome>("scan_project", { projectDir });
 }
 
+/** Live scan counters, cheap to poll while scanProject runs. */
+export interface ScanProgress {
+  files: number;
+  folders: number;
+  bytes: number;
+}
+
+export function scanProgress(projectDir: string): Promise<ScanProgress> {
+  return call<ScanProgress>("scan_progress", { projectDir });
+}
+
 export function hashProject(projectDir: string): Promise<HashOutcome> {
   return call<HashOutcome>("hash_project", { projectDir });
 }

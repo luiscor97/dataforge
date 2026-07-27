@@ -14,6 +14,7 @@ import {
   openProject,
   projectStatus,
   scanProject,
+  scanProgress,
   validatePlan,
   verifyProject,
 } from "../api";
@@ -334,6 +335,35 @@ export function GuidedFlow({
    * scratch — or refusing outright, which is what this used to do — would
    * throw away work the engine took care to make resumable.
    */
+  // While the scan runs, show the engine's real file count climbing so the user
+  // can tell work is happening — never a fabricated percentage. Best-effort: a
+  // failed poll (a momentary DB lock, or no Tauri runtime) simply skips a tick.
+  const pollScanProgress = useCallback((dir: string): (() => void) => {
+    let stopped = false;
+    const tick = async (): Promise<void> => {
+      try {
+        const { files } = await scanProgress(dir);
+        if (!stopped && files > 0) {
+          setStage({
+            kind: "working",
+            label: "Mirando qué archivos tienes…",
+            detail: `Solo los leemos. Nada se modifica. · ${files.toLocaleString(
+              "es-ES",
+            )} archivos vistos`,
+          });
+        }
+      } catch {
+        // Skip this tick.
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 400);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const startReview = useCallback(
     async (
       plan: Resume & { kind: "review" },
@@ -353,7 +383,12 @@ export function GuidedFlow({
           label: "Mirando qué archivos tienes…",
           detail: "Solo los leemos. Nada se modifica.",
         });
-        scanErrors = (await scanProject(dir)).errors;
+        const stopPoll = pollScanProgress(dir);
+        try {
+          scanErrors = (await scanProject(dir)).errors;
+        } finally {
+          stopPoll();
+        }
       }
 
       if (plan.hash) {

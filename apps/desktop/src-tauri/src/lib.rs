@@ -283,6 +283,26 @@ fn engine_version() -> String {
     df_facade::APP_VERSION.to_string()
 }
 
+/// Live scan counters for a progress readout. Read-only and cheap: safe to
+/// poll while `scan_project` runs (the engine commits counters per batch).
+#[derive(Serialize)]
+struct ScanProgress {
+    files: u64,
+    folders: u64,
+    bytes: u64,
+}
+
+#[tauri::command]
+fn scan_progress(project_dir: String) -> Result<ScanProgress, ErrorDto> {
+    let (files, folders, bytes) =
+        df_facade::scan_progress(std::path::Path::new(&project_dir)).map_err(ErrorDto::from)?;
+    Ok(ScanProgress {
+        files,
+        folders,
+        bytes,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -292,6 +312,7 @@ pub fn run() {
             open_project,
             project_status,
             scan_project,
+            scan_progress,
             hash_project,
             analyze_project,
             create_plan,
