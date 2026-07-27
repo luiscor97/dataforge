@@ -102,10 +102,54 @@ jobs:
           path: docs/sbom/dataforge.cdx.json
           if-no-files-found: error
 
+  desktop-installer:
+    name: Desktop installer (Windows NSIS)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Bundles the guided-flow desktop into a self-contained NSIS installer so
+      # end users never need the toolchain: they run the .exe (Windows ships the
+      # WebView2 runtime). Building the Tauri shell needs MSVC, which this runner
+      # has and a user's machine may not — that is the whole point of doing it
+      # here. On workflow_dispatch the installer is downloadable as an artifact
+      # without tagging a release.
+      - name: Build desktop installer
+        run: pnpm --filter dataforge-desktop tauri build
+
+      - name: Collect installer and checksum
+        shell: bash
+        run: |
+          mkdir -p dist
+          find . -path '*/bundle/nsis/*-setup.exe' -exec cp {} dist/ \;
+          test -n "$(ls -A dist)" || { echo "no NSIS installer produced"; exit 1; }
+          cd dist && sha256sum *.exe > INSTALLER-SHA256SUMS.txt && cat INSTALLER-SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-installer
+          path: dist/
+          if-no-files-found: error
+
   draft-release:
     name: Draft GitHub release
     runs-on: ubuntu-latest
-    needs: [windows-binaries, reproducibility, sbom]
+    needs: [windows-binaries, reproducibility, sbom, desktop-installer]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v4
@@ -153,6 +197,7 @@ jobs:
             --title "DataForge ${{ github.ref_name }}" \
             --notes-file release-notes.md \
             artifacts/windows-binaries/* \
+            artifacts/desktop-installer/* \
             artifacts/sbom/dataforge.cdx.json \
             artifacts/sbom/dataforge.cdx.json.sig \
             artifacts/sbom/dataforge.cdx.json.pem
