@@ -25,3 +25,4 @@ serde_json = { workspace = true }
 df-error = { workspace = true }
 df-domain = { workspace = true }
 df-facade = { workspace = true }
+tauri-plugin-dialog = "2.7.2"

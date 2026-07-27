@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { invoke } from "@tauri-apps/api/core";
 
 import {
   analyzeProject,
@@ -166,6 +167,35 @@ export function GuidedFlow({
   const activeField = useRef<"source" | "destination">("source");
   const sourceBox = useRef<HTMLLabelElement | null>(null);
   const destinationBox = useRef<HTMLLabelElement | null>(null);
+
+  // A native folder picker, offered next to drag-and-drop and typing. Like the
+  // drag listener below it is best-effort: `invoke` rejects when no Tauri
+  // runtime is present (browser preview, tests), and a missing picker must
+  // never take the screen down — the text field and drag still work.
+  const browse = useCallback(async (field: "source" | "destination") => {
+    activeField.current = field;
+    try {
+      const picked = await invoke<string | string[] | null>(
+        "plugin:dialog|open",
+        {
+          options: {
+            directory: true,
+            multiple: false,
+            title:
+              field === "source"
+                ? "Elige la carpeta que quieres ordenar"
+                : "Elige dónde guardar el resultado",
+          },
+        },
+      );
+      if (typeof picked === "string") {
+        if (field === "source") setSource(picked);
+        else setDestination(picked);
+      }
+    } catch {
+      // Picker unavailable; drag-and-drop and manual entry remain.
+    }
+  }, []);
 
   // Dropping a folder onto the window beats typing a path from memory, and
   // Tauri gives us this without any extra dependency. Everything here is
@@ -557,15 +587,20 @@ export function GuidedFlow({
               className={`dropfield${dropTarget === "source" ? " dropfield-active" : ""}`}
             >
               Carpeta que quieres ordenar
-              <input
-                value={source}
-                onChange={(e) => setSource(e.target.value)}
-                onFocus={() => {
-                  activeField.current = "source";
-                }}
-                placeholder="Arrastra la carpeta aquí, o escribe su ruta"
-                required
-              />
+              <div className="input-action">
+                <input
+                  value={source}
+                  onChange={(e) => setSource(e.target.value)}
+                  onFocus={() => {
+                    activeField.current = "source";
+                  }}
+                  placeholder="Arrastra la carpeta aquí, o escribe su ruta"
+                  required
+                />
+                <button type="button" onClick={() => void browse("source")}>
+                  Explorar…
+                </button>
+              </div>
               <span className="field-help">
                 Puedes arrastrar la carpeta desde el explorador hasta esta
                 ventana. Solo la leeremos.
@@ -577,15 +612,20 @@ export function GuidedFlow({
               className={`dropfield${dropTarget === "destination" ? " dropfield-active" : ""}`}
             >
               Dónde guardar el resultado
-              <input
-                value={destination}
-                onChange={(e) => setDestination(e.target.value)}
-                onFocus={() => {
-                  activeField.current = "destination";
-                }}
-                placeholder="Arrastra una carpeta vacía, o escribe su ruta"
-                required
-              />
+              <div className="input-action">
+                <input
+                  value={destination}
+                  onChange={(e) => setDestination(e.target.value)}
+                  onFocus={() => {
+                    activeField.current = "destination";
+                  }}
+                  placeholder="Arrastra una carpeta vacía, o escribe su ruta"
+                  required
+                />
+                <button type="button" onClick={() => void browse("destination")}>
+                  Explorar…
+                </button>
+              </div>
               <span className="field-help">
                 Debe ser una carpeta distinta de la anterior. Ahí aparecerá tu
                 copia ordenada.
