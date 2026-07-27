@@ -48,7 +48,7 @@ jobs:
           done
           cd dist && sha256sum *.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-binaries
           path: dist/
@@ -96,7 +96,7 @@ jobs:
           diff docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json
           echo "SBOM is current"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: docs/sbom/dataforge.cdx.json
