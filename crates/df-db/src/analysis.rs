@@ -2552,6 +2552,52 @@ mod tests {
         );
     }
 
+    /// A batch appends one chained event per decision inside a single
+    /// transaction. Each `append_event` reads the previous link through that
+    /// same transaction, so event N+1 must hang off event N — if they all took
+    /// their parent from the state before the batch, every event after the
+    /// first would carry the wrong `previous_hash` and the audit trail of a
+    /// bulk review would be worthless. Nothing else asserts this, and the
+    /// whole point of the batch is that it stays as strong a record as
+    /// appending one at a time.
+    #[test]
+    fn a_batch_leaves_the_ledger_chain_verifiable() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        for item in ["item-a", "item-b", "item-c", "item-d"] {
+            seed_review_item(&db, snapshot, &occurrence, item);
+        }
+
+        let decisions: Vec<ReviewDecisionInput> = ["item-a", "item-b", "item-c", "item-d"]
+            .into_iter()
+            .map(|item| ReviewDecisionInput {
+                item_id: item.to_string(),
+                decision: RuleAction::CopyActive,
+                rationale: format!("revisado: {item}"),
+            })
+            .collect();
+        assert_eq!(
+            decide_review_items(&mut db, project, &decisions, Actor::Agent).unwrap(),
+            4
+        );
+
+        let events = crate::repository::list_events(&db, project).unwrap();
+        df_ledger::verify_chain(&events).expect("a batch must not break the chain");
+
+        // One event per decision, each carrying its own rationale — the batch
+        // is transport, not a single lumped record.
+        let decided: Vec<&df_domain::AuditEvent> = events
+            .iter()
+            .filter(|e| e.event_type == EVENT_REVIEW_DECIDED)
+            .collect();
+        assert_eq!(decided.len(), 4);
+        for (event, input) in decided.iter().zip(&decisions) {
+            let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+            assert_eq!(payload["review_item_id"], input.item_id);
+            assert_eq!(payload["rationale"], input.rationale);
+        }
+    }
+
     #[test]
     fn structural_review_tables_are_append_only() {
         let db = Db::open_in_memory().unwrap();

@@ -467,21 +467,48 @@ mod tests {
     }
 
     /// Resuming must not throw away hashes the dead run already committed:
-    /// the queue is the record, and it is picked up where it stopped.
+    /// the queue is the record, and it is picked up where it stopped. Over a
+    /// million files interrupted near the end, re-queueing the done ones would
+    /// mean redoing hours of work that is already on disk and correct.
+    ///
+    /// The partial state is built directly rather than through cancellation:
+    /// `hash_project` runs to completion on the calling thread, so a flag
+    /// flipped from that same thread is either already true (nothing done) or
+    /// never true (everything done) — never the half-done case this is about.
+    /// Committing one job by hand reproduces exactly what a kill leaves.
     #[test]
     fn resuming_an_interrupted_run_keeps_the_work_already_committed() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut db, _origin) = scanned_project(tmp.path());
+        let snapshot = df_db::inventory::latest_complete_snapshot(
+            &db,
+            repository::load_project(&db).unwrap().id,
+        )
+        .unwrap()
+        .unwrap()
+        .id;
 
-        // One job done, then interrupted mid-run.
-        let cancel = AtomicBool::new(false);
-        let options = HashOptions {
-            job_batch: 1,
-            ..HashOptions::default()
-        };
-        cancel.store(true, Ordering::Relaxed);
-        hash_project(&mut db, Actor::Test, &options, Some(&cancel)).unwrap();
+        // A run that started, hashed exactly one file, and died.
         repository::update_project_state(&mut db, ProjectState::Hashing, Actor::Test).unwrap();
+        inventory::enqueue_hash_jobs(&mut db, snapshot, Actor::Test).unwrap();
+        let one = inventory::pending_hash_jobs(&db, snapshot, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        let mut buffer = vec![0u8; 1024];
+        let done = vec![inventory::HashJobResult {
+            job: &one[0],
+            outcome: hash_one(&one[0], &mut buffer),
+        }];
+        inventory::record_hash_results(&mut db, &done).unwrap();
+
+        // Two left, and that is what the resume must find: the finished one
+        // keeps its job row, so `enqueue_hash_jobs` cannot resurrect it.
+        assert_eq!(
+            inventory::pending_hash_jobs(&db, snapshot, u32::MAX)
+                .unwrap()
+                .len(),
+            2,
+            "the committed hash must not return to the queue"
+        );
 
         let outcome = hash_project(
             &mut db,
@@ -495,6 +522,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.state, "HASHED");
         assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.pending, 0);
     }
 
     // Windows: NTFS provides every v2 field, so identity carries.
