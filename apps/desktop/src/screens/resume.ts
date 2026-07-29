@@ -11,7 +11,7 @@
  *
  *   scan     `df-scan`     CREATED, VALIDATING, READY, SCAN_PAUSED and the
  *                          stable checkpoints HASHED/ANALYZED/COMPLETED
- *   hash     `df-hash`     SCANNED, HASH_PAUSED
+ *   hash     `df-hash`     SCANNED, HASH_PAUSED, HASHING (recoverable)
  *   analyze  `df-planner`  HASHED, ANALYZING, (ANALYZED = already done)
  *   plan     `df-planner`  ANALYZED, PLANNING
  *   approve  `df-planner`  PLAN_READY, PLAN_REVIEW
@@ -66,6 +66,10 @@ const TABLE: Record<string, Resume> = {
   SCAN_PAUSED: REVIEW(true, true, true, true),
   SCANNED: REVIEW(false, true, true, true),
   HASH_PAUSED: REVIEW(false, true, true, true),
+  // A hash run killed before its cancellation path leaves HASHING durable,
+  // with the queue intact. Same shape as EXECUTING below: ADR-0029 excludes
+  // concurrent writers, so the state means "a run died", not "a run is live".
+  HASHING: REVIEW(false, true, true, true),
   HASHED: REVIEW(false, false, true, true),
   // The analysis marker commits just before the state transition; re-running
   // analyze from ANALYZING only finishes that transition.
@@ -92,10 +96,10 @@ const TABLE: Record<string, Resume> = {
 /**
  * What to do with a project found in `state`.
  *
- * `SCANNING`, `HASHING`, `ANALYSIS_PAUSED`, `VERIFYING` and `ARCHIVED` are
- * absent from the table on purpose: no engine stage accepts them, so they fall
- * through to `manual`. Unknown strings do the same — a newer engine state must
- * degrade to "open the detail view", never to a wrong guess.
+ * `SCANNING`, `ANALYSIS_PAUSED`, `VERIFYING` and `ARCHIVED` are absent from the
+ * table on purpose: no engine stage accepts them, so they fall through to
+ * `manual`. Unknown strings do the same — a newer engine state must degrade to
+ * "open the detail view", never to a wrong guess.
  */
 export function resumeFrom(state: string): Resume {
   return TABLE[state] ?? { kind: "manual", state };

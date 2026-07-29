@@ -1615,18 +1615,100 @@ pub fn occurrence_guidance(
     Ok(guidance)
 }
 
-/// Append a human decision. Re-deciding appends another row; the latest row
-/// wins for future plans while the complete history remains auditable.
-pub fn decide_review_item(
+/// One decision of a batch.
+#[derive(Debug, Clone)]
+pub struct ReviewDecisionInput {
+    pub item_id: String,
+    pub decision: RuleAction,
+    pub rationale: String,
+}
+
+/// Append many decisions as one unit.
+///
+/// Every decision is still validated on its own and still gets its own
+/// ledger event, exactly as if it had been appended alone: a batch is a
+/// transport convenience, never a weaker record. What it adds is atomicity —
+/// a queue of thousands must not be left half-decided by a failure in the
+/// middle, because "some of them" is not a state a reviewer can reason about.
+pub fn decide_review_items(
     db: &mut Db,
     project_id: ProjectId,
-    item_id: &str,
-    decision: RuleAction,
-    rationale: &str,
+    decisions: &[ReviewDecisionInput],
     actor: Actor,
+) -> DfResult<u64> {
+    if decisions.is_empty() {
+        return Err(DfError::Validation(
+            "a review batch needs at least one decision".to_string(),
+        ));
+    }
+    // Two decisions for one item in a single batch have no defined order, so
+    // the result would depend on input order rather than on intent.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for input in decisions {
+        if !seen.insert(input.item_id.as_str()) {
+            return Err(DfError::Validation(format!(
+                "review item `{}` appears more than once in the same batch",
+                input.item_id
+            )));
+        }
+    }
+    // Validate the whole batch before writing any of it: a rejection must
+    // leave the queue exactly as it was.
+    for input in decisions {
+        validate_review_decision(db, project_id, &input.item_id, &input.rationale)?;
+    }
+
+    let now = to_stored_timestamp(chrono::Utc::now());
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for input in decisions {
+        let rationale = input.rationale.trim();
+        let sequence: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1
+                 FROM review_decisions WHERE review_item_id = ?1",
+                [input.item_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO review_decisions
+                (id, review_item_id, sequence, decision, rationale, actor, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                input.item_id,
+                sequence,
+                input.decision.as_str(),
+                rationale,
+                actor.as_str(),
+                now,
+            ],
+        )
+        .map_err(db_err)?;
+        append_event(
+            &tx,
+            project_id,
+            EVENT_REVIEW_DECIDED,
+            &serde_json::json!({
+                "review_item_id": input.item_id,
+                "decision": input.decision.as_str(),
+                "rationale": rationale,
+            }),
+            actor,
+        )?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(decisions.len() as u64)
+}
+
+/// Reject a decision that could not be honoured, before anything is written.
+fn validate_review_decision(
+    db: &Db,
+    project_id: ProjectId,
+    item_id: &str,
+    rationale: &str,
 ) -> DfResult<()> {
-    let rationale = rationale.trim();
-    if rationale.is_empty() {
+    if rationale.trim().is_empty() {
         return Err(DfError::Validation(
             "a review decision requires a rationale".to_string(),
         ));
@@ -1666,45 +1748,32 @@ pub fn decide_review_item(
             "review item `{item_id}` describes unreadable source evidence; copy-bucket decisions cannot materialize it — repair access and rescan"
         )));
     }
+    Ok(())
+}
 
-    let now = to_stored_timestamp(chrono::Utc::now());
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
-    let sequence: i64 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1
-             FROM review_decisions WHERE review_item_id = ?1",
-            [item_id],
-            |row| row.get(0),
-        )
-        .map_err(db_err)?;
-    let decision_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO review_decisions
-            (id, review_item_id, sequence, decision, rationale, actor, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            decision_id,
-            item_id,
-            sequence,
-            decision.as_str(),
-            rationale,
-            actor.as_str(),
-            now,
-        ],
-    )
-    .map_err(db_err)?;
-    append_event(
-        &tx,
+/// Append a human decision. Re-deciding appends another row; the latest row
+/// wins for future plans while the complete history remains auditable.
+///
+/// A batch of one, so the single and bulk paths cannot drift apart.
+pub fn decide_review_item(
+    db: &mut Db,
+    project_id: ProjectId,
+    item_id: &str,
+    decision: RuleAction,
+    rationale: &str,
+    actor: Actor,
+) -> DfResult<()> {
+    decide_review_items(
+        db,
         project_id,
-        EVENT_REVIEW_DECIDED,
-        &serde_json::json!({
-            "review_item_id": item_id,
-            "decision": decision.as_str(),
-            "rationale": rationale,
-        }),
+        &[ReviewDecisionInput {
+            item_id: item_id.to_string(),
+            decision,
+            rationale: rationale.to_string(),
+        }],
         actor,
-    )?;
-    tx.commit().map_err(db_err)
+    )
+    .map(|_| ())
 }
 
 pub fn review_queue(db: &Db, snapshot_id: SnapshotId) -> DfResult<ReviewQueue> {
@@ -2318,6 +2387,168 @@ mod tests {
         assert!(
             matches!(&error, DfError::Validation(message) if message.contains("repair access and rescan")),
             "unexpected error: {error:?}"
+        );
+    }
+
+    /// Add a plain review item that a decision can legitimately resolve.
+    fn seed_review_item(db: &Db, snapshot: SnapshotId, occurrence: &str, id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO structural_anomalies
+                    (id, snapshot_id, analysis_version, occurrence_id, folder_a,
+                     folder_b, kind, severity, requires_review, summary,
+                     evidence_json, created_at)
+                 VALUES (?4, ?1, ?2, ?3, NULL, NULL, 'EMBEDDED_TREE', 'INFO',
+                         1, 'test', '{}', 't')",
+                params![
+                    snapshot.to_string(),
+                    ANALYSIS_VERSION as i64,
+                    occurrence,
+                    format!("anomaly-{id}"),
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO review_items
+                    (id, snapshot_id, analysis_version, anomaly_id,
+                     rule_match_id, occurrence_id, recommended_action, risk,
+                     reason, created_at)
+                 VALUES (?4, ?1, ?2, ?5, NULL, ?3, 'COPY_REVIEW', 'LOW',
+                         'test', 't')",
+                params![
+                    snapshot.to_string(),
+                    ANALYSIS_VERSION as i64,
+                    occurrence,
+                    id,
+                    format!("anomaly-{id}"),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// An agent may answer the queue, but the ledger has to say it was an
+    /// agent: an archive that cannot separate a human decision from a model's
+    /// has no audit trail worth the name.
+    #[test]
+    fn a_batch_records_every_decision_under_the_declared_actor() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        seed_review_item(&db, snapshot, &occurrence, "item-a");
+        seed_review_item(&db, snapshot, &occurrence, "item-b");
+
+        let decided = decide_review_items(
+            &mut db,
+            project,
+            &[
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "árbol embebido revisado".to_string(),
+                },
+                ReviewDecisionInput {
+                    item_id: "item-b".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "misma clase que el anterior".to_string(),
+                },
+            ],
+            Actor::Agent,
+        )
+        .unwrap();
+        assert_eq!(decided, 2);
+
+        let actors: Vec<String> = db
+            .conn()
+            .prepare("SELECT actor FROM review_decisions ORDER BY review_item_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(actors, vec!["agent".to_string(), "agent".to_string()]);
+
+        // A batch is transport only: each decision still gets its own event,
+        // with its own rationale, exactly as a single append would.
+        let events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = ?1",
+                [EVENT_REVIEW_DECIDED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 2);
+    }
+
+    /// Half a decided queue is a state nobody can reason about, so one bad
+    /// row must leave the queue exactly as it was.
+    #[test]
+    fn a_batch_with_one_bad_item_writes_nothing() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        seed_review_item(&db, snapshot, &occurrence, "item-a");
+
+        let error = decide_review_items(
+            &mut db,
+            project,
+            &[
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "válida".to_string(),
+                },
+                ReviewDecisionInput {
+                    item_id: "no-existe".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "inválida".to_string(),
+                },
+            ],
+            Actor::Agent,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(m) if m.contains("does not exist")),
+            "{error:?}"
+        );
+
+        let written: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM review_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(written, 0, "a rejected batch must not write partially");
+    }
+
+    /// Two decisions for one item in one batch have no defined winner, so
+    /// the result would depend on input order rather than on intent.
+    #[test]
+    fn a_batch_rejects_the_same_item_twice() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        seed_review_item(&db, snapshot, &occurrence, "item-a");
+
+        let error = decide_review_items(
+            &mut db,
+            project,
+            &[
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "una".to_string(),
+                },
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyTemporary,
+                    rationale: "otra".to_string(),
+                },
+            ],
+            Actor::Agent,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(m) if m.contains("more than once")),
+            "{error:?}"
         );
     }
 

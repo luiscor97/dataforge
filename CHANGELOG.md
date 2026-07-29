@@ -10,6 +10,44 @@ en entorno real. Nada de esto cambia las garantías de reconstrucción.
 
 #### Añadido
 
+- **El ledger distingue una decisión humana de una de un agente.** El actor
+  `agent` es el LLM que conduce el motor por cuenta de una persona, y se
+  registra aparte de `cli`. El conjunto de acciones seguras es idéntico para
+  ambos: la atribución dice *quién*, nunca concede *más*. Sin esto, un modelo
+  respondiendo la cola de revisión quedaba anotado como si fuera el usuario, y
+  un archivo probatorio cuyo rastro no separa ambas cosas no tiene rastro.
+  La CLI expone `--actor`, que solo admite `cli` o `agent`: `system` es del
+  motor y `test` del código de test, y dejar que un llamante los reclamase
+  sería dejarle disfrazar sus propias decisiones. No hubo migración; la
+  columna `actor` nunca tuvo restricción de valores.
+- **Decisiones de revisión por lotes** (`review decide-batch`), leídas como
+  JSON desde stdin o fichero. Una cola sobre un archivo real ronda los miles
+  de elementos, la mayoría repeticiones de un puñado de preguntas, y los
+  identificadores por sí solos desbordan una línea de órdenes; resolverlos a
+  un proceso por elemento no es un flujo de trabajo. Cada decisión conserva su
+  propia justificación y su propio evento encadenado —el lote es transporte,
+  nunca un registro más débil— y todas entran o no entra ninguna: media cola
+  decidida no es un estado sobre el que nadie pueda razonar.
+- **`dataforge plan tree`**: el árbol de salida que produciría el plan, antes
+  de aprobarlo. El plan ya guardaba la ruta de destino de cada aparición, pero
+  no había forma de verla, y aprobar congela un manifiesto inmutable: era
+  pedir una firma a ciegas. La profundidad es una vista y nunca un filtro, así
+  que los totales no cambian al ampliarla. Una copia sin destino registrado se
+  reporta con código de salida propio en vez de descontarse en silencio, que
+  es justamente el defecto que esta vista existe para destapar. La app de
+  escritorio la muestra encima del botón de aprobar, no en otra pantalla.
+- **Un hashing interrumpido se puede continuar** (`--resume-interrupted`).
+  `HASH_PAUSED` solo lo escribía la ruta cooperativa de cancelación, así que
+  una muerte abrupta —un cierre de ventana, un corte de luz— dejaba el
+  proyecto en `HASHING` con la cola intacta pero inalcanzable, un estado que
+  ninguna etapa acepta. El executor ya trataba su caso equivalente; el hash
+  era el olvidado. Nunca se infiere: el motor no puede distinguir un run
+  muerto de uno vivo sobre la misma base, así que el opt-in es el operador
+  afirmando que no hay otro activo. El run interrumpido se cierra con su
+  propio evento `HASH_PAUSED` antes de arrancar el nuevo, de modo que el
+  ledger explique por qué se permitió reiniciar. La app de escritorio lo
+  reanuda sola, simétrica ya con la ejecución (ADR-0029).
+
 - **El asistente guiado retoma un trabajo interrumpido** en lugar de
   negarse. Una pasada sobre un archivo real dura de minutos a horas, así
   que la interrupción es lo normal: hasta ahora una segunda ejecución

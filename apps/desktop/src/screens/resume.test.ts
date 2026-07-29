@@ -67,6 +67,17 @@ describe("resumeFrom", () => {
     expect(resumeFrom("HASH_PAUSED")).toMatchObject({ hash: true });
   });
 
+  // A killed run leaves the durable in-progress state behind with its queue
+  // intact. Both stages that own a resumable queue continue from it rather
+  // than stranding the work; ADR-0029 excludes a second live writer.
+  test("a run killed mid-stage is continued, not stranded", () => {
+    expect(resumeFrom("HASHING")).toMatchObject({ kind: "review", hash: true });
+    expect(resumeFrom("EXECUTING")).toMatchObject({
+      kind: "copy",
+      execute: true,
+    });
+  });
+
   // The user's consent lives in the approved manifest. Re-approving would
   // either fail or, worse, look like the flow asking twice for one decision.
   test("an approved plan is never approved again", () => {
@@ -98,7 +109,6 @@ describe("resumeFrom", () => {
   test("states the engine cannot continue are handed to the user", () => {
     for (const state of [
       "SCANNING",
-      "HASHING",
       "ANALYSIS_PAUSED",
       "VERIFYING",
       "ARCHIVED",

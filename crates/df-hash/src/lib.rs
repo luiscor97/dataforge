@@ -37,6 +37,19 @@ pub struct HashOptions {
     /// the recommendation for evidential profiles, so reuse is an explicit
     /// per-run decision, and every reused binding records its provenance.
     pub incremental: bool,
+    /// Accept a project left in `HASHING` by a run that died without
+    /// reaching its cancellation path (a kill, a power cut, a closed
+    /// window). `HASH_PAUSED` is only ever written by the cooperative
+    /// `cancel` check below, so an abrupt death strands the project in a
+    /// state no stage accepts, with the queue intact but unreachable.
+    ///
+    /// Off by default and never inferred: DataForge cannot tell a dead run
+    /// from a live one holding the same database, and silently joining a
+    /// live run would have two processes hashing one queue. Setting this is
+    /// the operator asserting no other run is active. The interrupted run is
+    /// closed with its own `HASH_PAUSED` event before the new one starts, so
+    /// the ledger shows why a `HASHING` project was allowed to restart.
+    pub resume_interrupted: bool,
 }
 
 impl Default for HashOptions {
@@ -45,6 +58,7 @@ impl Default for HashOptions {
             read_buffer_bytes: 1024 * 1024,
             job_batch: 256,
             incremental: false,
+            resume_interrupted: false,
         }
     }
 }
@@ -81,8 +95,20 @@ pub fn hash_project(
     }
 
     let project = repository::load_project(db)?;
+    let resuming_interrupted =
+        matches!(project.state, ProjectState::Hashing) && options.resume_interrupted;
     match project.state {
         ProjectState::Scanned | ProjectState::HashPaused => {}
+        ProjectState::Hashing if options.resume_interrupted => {}
+        ProjectState::Hashing => {
+            return Err(DfError::Validation(
+                "the project is in state HASHING: either a hash run is active, or one \
+                 died without pausing. If no run is active, re-run with \
+                 `resume_interrupted` (CLI: `--resume-interrupted`) to close the \
+                 interrupted run and continue the queue"
+                    .to_string(),
+            ));
+        }
         other => {
             return Err(DfError::Validation(format!(
                 "cannot hash a project in state {other} (expected SCANNED or HASH_PAUSED)"
@@ -92,6 +118,24 @@ pub fn hash_project(
     let snapshot = inventory::latest_complete_snapshot(db, project.id)?.ok_or_else(|| {
         DfError::Validation("the project has no complete snapshot to hash".to_string())
     })?;
+
+    // Close the dead run on the record before opening a new one. `HASHING ->
+    // HASHING` is not a legal transition (§11) and skipping the pause would
+    // leave the interrupted run with a `HASH_STARTED` that no event ever
+    // answers.
+    if resuming_interrupted {
+        let interrupted = inventory::inventory_summary(db, snapshot.id)?;
+        inventory::record_hash_outcome(
+            db,
+            project.id,
+            snapshot.id,
+            inventory::EVENT_HASH_PAUSED,
+            &interrupted,
+            0,
+            actor,
+        )?;
+        repository::update_project_state(db, ProjectState::HashPaused, actor)?;
+    }
 
     repository::update_project_state(db, ProjectState::Hashing, actor)?;
     inventory::enqueue_hash_jobs(db, snapshot.id, actor)?;
@@ -388,6 +432,69 @@ mod tests {
         assert_eq!(outcome.state, "HASHED");
         assert_eq!(outcome.hashed, 3);
         assert_eq!(outcome.pending, 0);
+    }
+
+    /// A run that dies without reaching its cancellation path leaves the
+    /// project in `HASHING`. The queue survives, but no stage accepts that
+    /// state, so without an explicit opt-in the work is stranded.
+    #[test]
+    fn an_interrupted_run_is_refused_by_default_and_resumed_on_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+
+        // Simulate the abrupt death: the state the engine writes when a run
+        // starts, with nothing that ever answers it.
+        repository::update_project_state(&mut db, ProjectState::Hashing, Actor::Test).unwrap();
+
+        let refused = hash_project(&mut db, Actor::Test, &HashOptions::default(), None);
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("HASHING"), "{message}");
+        assert!(message.contains("--resume-interrupted"), "{message}");
+
+        let outcome = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                resume_interrupted: true,
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.state, "HASHED");
+        assert_eq!(outcome.hashed, 3);
+        assert_eq!(outcome.pending, 0);
+    }
+
+    /// Resuming must not throw away hashes the dead run already committed:
+    /// the queue is the record, and it is picked up where it stopped.
+    #[test]
+    fn resuming_an_interrupted_run_keeps_the_work_already_committed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+
+        // One job done, then interrupted mid-run.
+        let cancel = AtomicBool::new(false);
+        let options = HashOptions {
+            job_batch: 1,
+            ..HashOptions::default()
+        };
+        cancel.store(true, Ordering::Relaxed);
+        hash_project(&mut db, Actor::Test, &options, Some(&cancel)).unwrap();
+        repository::update_project_state(&mut db, ProjectState::Hashing, Actor::Test).unwrap();
+
+        let outcome = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                resume_interrupted: true,
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.state, "HASHED");
+        assert_eq!(outcome.hashed, 3);
     }
 
     // Windows: NTFS provides every v2 field, so identity carries.

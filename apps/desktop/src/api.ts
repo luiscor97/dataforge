@@ -14,6 +14,7 @@ import {
   type ExecuteOutcome,
   type HashOutcome,
   type MediaOutcome,
+  type PlanDestinationTree,
   type PlanOutcome,
   type PlanValidationReport,
   type ProjectStatus,
@@ -72,6 +73,17 @@ export function validatePlan(
   projectDir: string,
 ): Promise<PlanValidationReport> {
   return call<PlanValidationReport>("validate_plan", { projectDir });
+}
+
+/** Where the plan would put everything, `depth` levels under the output root. */
+export function planDestinationTree(
+  projectDir: string,
+  depth = 1,
+): Promise<PlanDestinationTree> {
+  return call<PlanDestinationTree>("plan_destination_tree", {
+    projectDir,
+    depth,
+  });
 }
 
 export function approvePlan(projectDir: string): Promise<ApproveOutcome> {

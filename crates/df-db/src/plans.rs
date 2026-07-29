@@ -1125,6 +1125,149 @@ pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
     Ok(progress)
 }
 
+/// One node of the projected output tree: a destination prefix with what
+/// the plan would put under it.
+#[derive(Debug, Clone, Default)]
+pub struct DestinationNode {
+    /// Destination prefix relative to the output root, e.g.
+    /// `90_DataForge_Review\Discolocal`. Empty for files planned at the root.
+    pub prefix: String,
+    /// How many path components `prefix` has (1 for a top-level root).
+    pub depth: u32,
+    /// Copy operations landing anywhere under this prefix.
+    pub files: u64,
+    /// Directory creations under this prefix.
+    pub directories: u64,
+    /// Bytes those copies would write. Directories contribute nothing.
+    pub bytes: u64,
+    /// Copy operations by operation type, most frequent first.
+    pub by_operation: Vec<(String, u64)>,
+    /// One real destination path from this subtree — a plan is easier to
+    /// judge from an example than from a count.
+    pub sample: Option<String>,
+}
+
+/// What the approved-or-pending plan would actually produce on disk.
+#[derive(Debug, Clone, Default)]
+pub struct DestinationTree {
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    /// Copy operations whose destination is not recorded. Reported rather
+    /// than hidden: a plan that cannot say where something lands is exactly
+    /// what this view exists to surface.
+    pub without_destination: u64,
+    /// Nodes from depth 1 up to the requested depth, ordered by prefix.
+    pub nodes: Vec<DestinationNode>,
+}
+
+/// Aggregate the plan's destinations into a tree, `depth` levels deep.
+///
+/// Pure read over `plan_operations`: it neither validates nor changes the
+/// plan. Sizes come from the content object each copy carries, so the total
+/// is what the executor would write, not what the source occupies.
+pub fn destination_tree(db: &Db, plan_id: PlanId, depth: u32) -> DfResult<DestinationTree> {
+    if depth == 0 {
+        return Err(DfError::Validation(
+            "destination tree depth must be at least 1".to_string(),
+        ));
+    }
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT po.operation_type, po.destination_relative_path,
+                    COALESCE(co.size_bytes, 0)
+             FROM plan_operations po
+             LEFT JOIN content_objects co ON co.id = po.content_id
+             WHERE po.plan_id = ?1",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([plan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(db_err)?;
+
+    let mut tree = DestinationTree::default();
+    // Keyed by prefix; `by_operation` accumulates in a map and is flattened
+    // once at the end so the hot loop stays a single lookup per level.
+    let mut nodes: std::collections::BTreeMap<String, DestinationNode> =
+        std::collections::BTreeMap::new();
+    let mut counters: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        let (operation_type, destination, size) = row.map_err(db_err)?;
+        let is_directory = operation_type == "CREATE_DIRECTORY";
+        let Some(destination) = destination else {
+            if !is_directory {
+                tree.without_destination += 1;
+            }
+            continue;
+        };
+        let size = size.max(0) as u64;
+        if is_directory {
+            tree.directories += 1;
+        } else {
+            tree.files += 1;
+            tree.bytes += size;
+        }
+
+        // Walk the prefixes of this destination and credit each level, so a
+        // parent always totals its children.
+        let components: Vec<&str> = destination
+            .split(['\\', '/'])
+            .filter(|c| !c.is_empty())
+            .collect();
+        // The last component is the file name itself for copies; a directory
+        // operation names the directory, so it counts at its own level.
+        let levels = if is_directory {
+            components.len()
+        } else {
+            components.len().saturating_sub(1)
+        };
+        let levels = levels.min(depth as usize);
+        for level in 1..=levels {
+            let prefix = components[..level].join("\\");
+            let node = nodes
+                .entry(prefix.clone())
+                .or_insert_with(|| DestinationNode {
+                    prefix: prefix.clone(),
+                    depth: level as u32,
+                    ..DestinationNode::default()
+                });
+            if is_directory {
+                node.directories += 1;
+            } else {
+                node.files += 1;
+                node.bytes += size;
+                if node.sample.is_none() {
+                    node.sample = Some(destination.clone());
+                }
+                *counters
+                    .entry(prefix)
+                    .or_default()
+                    .entry(operation_type.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    for (prefix, ops) in counters {
+        if let Some(node) = nodes.get_mut(&prefix) {
+            let mut flat: Vec<(String, u64)> = ops.into_iter().collect();
+            flat.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            node.by_operation = flat;
+        }
+    }
+    tree.nodes = nodes.into_values().collect();
+    Ok(tree)
+}
+
 /// A completed materialisation, as the verifier re-checks it (§28).
 #[derive(Debug, Clone)]
 pub struct VerifiableArtefact {
@@ -1352,6 +1495,115 @@ mod tests {
                 [plan.id.to_string()],
             )
             .expect("execution progress stays writable");
+    }
+
+    /// Insert one copy operation with a content object of `size` bytes.
+    fn add_copy(db: &mut Db, plan: &Plan, seq: i64, op: &str, dest: &str, size: i64) {
+        let content = ContentId::new();
+        db.conn()
+            .execute(
+                "INSERT INTO content_objects
+                    (id, size_bytes, sha256, blake3, first_seen_snapshot,
+                     hash_state, created_at)
+                 VALUES (?1, ?2, NULL, NULL, ?3, 'HASHED', 't')",
+                params![content.to_string(), size, plan.snapshot_id.to_string()],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type, content_id,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, 'LOW', 'PENDING',
+                         'PENDING', ?7, 'test', ?8, ?8)",
+                params![
+                    OperationId::new().to_string(),
+                    plan.id.to_string(),
+                    seq,
+                    op,
+                    content.to_string(),
+                    dest,
+                    format!("{seq:064}"),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// The counts in a plan outcome say how much will be copied; only the
+    /// destination tree says *where*, which is what an approval commits to.
+    #[test]
+    fn destination_tree_reports_where_the_plan_would_write() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+
+        add_copy(&mut db, &plan, 2, "COPY_ACTIVE", r"origen\a.txt", 100);
+        add_copy(&mut db, &plan, 3, "COPY_ACTIVE", r"origen\sub\b.txt", 200);
+        add_copy(
+            &mut db,
+            &plan,
+            4,
+            "COPY_REVIEW",
+            r"90_Review\origen\c.txt",
+            400,
+        );
+
+        let tree = destination_tree(&db, plan.id, 2).unwrap();
+        assert_eq!(tree.files, 3);
+        assert_eq!(tree.directories, 1);
+        assert_eq!(tree.bytes, 700);
+        assert_eq!(tree.without_destination, 0);
+
+        let root = |p: &str| tree.nodes.iter().find(|n| n.prefix == p).unwrap();
+        // A parent totals its children: `origen` carries the two copies below
+        // it, not the third one, which lives under a different root.
+        assert_eq!(root("origen").files, 2);
+        assert_eq!(root("origen").bytes, 300);
+        assert_eq!(root("origen").directories, 1);
+        assert_eq!(root(r"origen\sub").files, 1);
+        assert_eq!(root("90_Review").files, 1);
+        assert_eq!(root("90_Review").bytes, 400);
+        assert_eq!(
+            root("90_Review").by_operation,
+            vec![("COPY_REVIEW".to_string(), 1)]
+        );
+        assert!(root("90_Review").sample.is_some());
+
+        // Depth is a view, never a filter: the totals do not change.
+        let shallow = destination_tree(&db, plan.id, 1).unwrap();
+        assert_eq!(shallow.files, 3);
+        assert_eq!(shallow.bytes, 700);
+        assert!(shallow.nodes.iter().all(|n| n.depth == 1));
+        assert!(destination_tree(&db, plan.id, 0).is_err());
+    }
+
+    /// A copy with nowhere to land is reported, not silently dropped from
+    /// the totals: that is precisely the defect this view should expose.
+    #[test]
+    fn destination_tree_surfaces_copies_without_a_destination() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, 9, 'COPY_ACTIVE', NULL, 1.0, 'LOW', 'PENDING',
+                         'PENDING', ?3, 'test', ?4, ?4)",
+                params![
+                    OperationId::new().to_string(),
+                    plan.id.to_string(),
+                    "9".repeat(64),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+
+        let tree = destination_tree(&db, plan.id, 2).unwrap();
+        assert_eq!(tree.without_destination, 1);
+        assert_eq!(tree.files, 0);
     }
 
     #[test]

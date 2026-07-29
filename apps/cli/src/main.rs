@@ -15,11 +15,11 @@ use df_facade::{
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
     DuplicateReport, ExecuteOutcome, ExtractionLimits, HashOutcome, MediaOutcome,
-    MediaProjectOptions, MediaReport, MediaSidecars, PlanOutcome, PlanValidationReport,
-    PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus, QueryOptions,
-    RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest,
-    SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, TreeCloneReport,
-    TreeRelationReport, VerifyOutcome,
+    MediaProjectOptions, MediaReport, MediaSidecars, PlanDestinationTree, PlanOutcome,
+    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
+    QueryOptions, RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions,
+    SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions,
+    TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -36,6 +36,66 @@ struct Cli {
     /// Emit machine-readable JSON instead of human text.
     #[arg(long, global = true)]
     json: bool,
+    /// Who is driving: `cli` (a person, the default) or `agent` (an LLM
+    /// operator acting on a person's behalf).
+    ///
+    /// Recorded verbatim in the append-only ledger. It changes nothing about
+    /// what is permitted — the safe action set is identical — but an archive
+    /// whose audit trail cannot distinguish a human decision from a model's
+    /// is not an audit trail. An agent driving DataForge must say so.
+    #[arg(long, global = true, default_value = "cli", value_parser = parse_cli_actor)]
+    actor: Actor,
+}
+
+/// One decision as it arrives on the wire.
+#[derive(serde::Deserialize)]
+struct DecisionRow {
+    item: String,
+    decision: String,
+    reason: String,
+}
+
+/// Read a decision batch from a file or stdin.
+///
+/// Parsing is strict and happens before anything touches the project: an
+/// unknown field or a bad action is a caller mistake, and reporting it while
+/// the queue is still untouched is the only useful moment to do so.
+fn read_decision_batch(from: &str) -> DfResult<Vec<df_facade::ReviewDecisionInput>> {
+    let raw = if from == "-" {
+        std::io::read_to_string(std::io::stdin())
+            .map_err(|e| DfError::Validation(format!("cannot read decisions from stdin: {e}")))?
+    } else {
+        std::fs::read_to_string(from)
+            .map_err(|e| DfError::Validation(format!("cannot read `{from}`: {e}")))?
+    };
+    let rows: Vec<DecisionRow> = serde_json::from_str(&raw).map_err(|e| {
+        DfError::Validation(format!(
+            "decision batch must be a JSON array of \
+             {{\"item\", \"decision\", \"reason\"}} objects: {e}"
+        ))
+    })?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(df_facade::ReviewDecisionInput {
+                item_id: row.item,
+                decision: df_facade::RuleAction::parse(&row.decision)?,
+                rationale: row.reason,
+            })
+        })
+        .collect()
+}
+
+/// Only the two actors a caller may legitimately claim. `system` belongs to
+/// the engine and `test` to test code; letting a caller assert either would
+/// let it disguise its own decisions as something else.
+fn parse_cli_actor(value: &str) -> Result<Actor, String> {
+    match value {
+        "cli" => Ok(Actor::Cli),
+        "agent" => Ok(Actor::Agent),
+        other => Err(format!(
+            "unknown actor `{other}` (expected `cli` or `agent`)"
+        )),
+    }
 }
 
 #[derive(Subcommand)]
@@ -61,6 +121,13 @@ enum Command {
         /// mode remains the default and the evidential recommendation.
         #[arg(long)]
         incremental: bool,
+        /// Continue a project stranded in `HASHING` by a run that died
+        /// without pausing (a kill, a power cut, a closed window). Only
+        /// pass this when no other hash run is active: DataForge cannot
+        /// tell a dead run from a live one. The interrupted run is closed
+        /// with its own `HASH_PAUSED` event before the queue continues.
+        #[arg(long)]
+        resume_interrupted: bool,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -339,6 +406,15 @@ enum PlanCommand {
         #[arg(long, value_name = "POLICY", default_value = "REPORT_ONLY")]
         duplicate_policy: String,
     },
+    /// Show the output tree the plan would produce, before approving it.
+    Tree {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// How many path levels to show under the output root.
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
+    },
     /// Re-check the plan invariants (destinations, collisions, coverage).
     Validate {
         /// Project directory.
@@ -524,6 +600,24 @@ enum ReviewCommand {
         #[arg(long)]
         reason: String,
     },
+    /// Append many decisions at once, read as JSON from a file or stdin.
+    ///
+    /// A queue over a real archive holds thousands of items, most of them
+    /// repetitions of a handful of questions. Deciding them one process at a
+    /// time is not a workflow, and the identifiers alone overflow a command
+    /// line, so the batch arrives as data:
+    ///
+    ///   [{"item": "<id>", "decision": "COPY_ACTIVE", "reason": "…"}, …]
+    ///
+    /// All of them commit together or none does.
+    DecideBatch {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// JSON file with the decisions, or `-` to read stdin.
+        #[arg(long, default_value = "-")]
+        from: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -551,6 +645,7 @@ enum Output {
     ContentSearch(ContentSearchOutcome),
     ContentQuery(ContentQueryOutcome),
     Plan(PlanOutcome),
+    PlanTree(PlanDestinationTree),
     PlanValidation(PlanValidationReport),
     Approve(ApproveOutcome),
     Execute(ExecuteOutcome),
@@ -575,6 +670,10 @@ enum Output {
 }
 
 fn run(cli: &Cli) -> DfResult<Output> {
+    // Whoever the caller declared itself to be. Every mutating command below
+    // records it, so the ledger says which decisions a person made and which
+    // an agent made.
+    let actor = cli.actor;
     match &cli.command {
         Command::Project { command } => match command {
             ProjectCommand::Create {
@@ -593,7 +692,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     source_roots: source.clone(),
                     profile: Some(profile.clone()),
                 };
-                df_facade::create_project(&request, Actor::Cli)
+                df_facade::create_project(&request, actor)
                     .map(Box::new)
                     .map(Output::Status)
             }
@@ -601,19 +700,22 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Box::new)
                 .map(Output::Status),
         },
-        Command::Scan { path } => df_facade::scan_project(path, Actor::Cli).map(Output::Scan),
-        Command::Hash { path, incremental } => df_facade::hash_project_with_options(
+        Command::Scan { path } => df_facade::scan_project(path, actor).map(Output::Scan),
+        Command::Hash {
             path,
-            Actor::Cli,
+            incremental,
+            resume_interrupted,
+        } => df_facade::hash_project_with_options(
+            path,
+            actor,
             &df_facade::HashOptions {
                 incremental: *incremental,
+                resume_interrupted: *resume_interrupted,
                 ..df_facade::HashOptions::default()
             },
         )
         .map(Output::Hash),
-        Command::Analyze { path } => {
-            df_facade::analyze_project(path, Actor::Cli).map(Output::Analyze)
-        }
+        Command::Analyze { path } => df_facade::analyze_project(path, actor).map(Output::Analyze),
         Command::Similarity {
             path,
             threshold,
@@ -622,7 +724,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             max_candidates,
         } => df_facade::analyze_similarity_with_options(
             path,
-            Actor::Cli,
+            actor,
             &SimilarityOptions {
                 threshold: *threshold,
                 min_shared_chunks: *min_shared_chunks,
@@ -650,7 +752,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             df_facade::analyze_media_with_options(
                 path,
-                Actor::Cli,
+                actor,
                 &MediaProjectOptions {
                     max_pairs: *max_pairs,
                     sidecars,
@@ -664,7 +766,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 path,
                 package,
                 component,
-            } => df_facade::register_plugin(path, package, component, Actor::Cli)
+            } => df_facade::register_plugin(path, package, component, actor)
                 .map(Box::new)
                 .map(Output::PluginRegistered),
             PluginCommand::List { path } => df_facade::list_plugins(path).map(Output::PluginList),
@@ -681,8 +783,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                         .granted_capabilities
                         .insert(df_facade::PluginCapability::SubjectText);
                 }
-                df_facade::run_plugins_with_options(path, Actor::Cli, &options)
-                    .map(Output::PluginRuns)
+                df_facade::run_plugins_with_options(path, actor, &options).map(Output::PluginRuns)
             }
         },
         Command::Ai { command } => match command {
@@ -750,7 +851,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     item,
                     &choice,
                     accept_disclosure.as_deref(),
-                    Actor::Cli,
+                    actor,
                 )
                 .map(Box::new)
                 .map(Output::AiAssist)
@@ -792,7 +893,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 };
                 df_facade::extract_project_content(
                     path,
-                    Actor::Cli,
+                    actor,
                     &ContentExtractionOptions {
                         limits,
                         page_size: *page_size,
@@ -802,7 +903,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Output::ContentExtraction)
             }
             ContentCommand::Fail { path, run, reason } => {
-                df_facade::fail_content_extraction(path, run, reason, Actor::Cli)
+                df_facade::fail_content_extraction(path, run, reason, actor)
                     .map(Output::ContentExtraction)
             }
             ContentCommand::Build {
@@ -823,7 +924,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     page_size: *analytical_page_size,
                     zstd_level: *zstd_level,
                 },
-                Actor::Cli,
+                actor,
             )
             .map(Output::ContentArtifacts),
             ContentCommand::Search {
@@ -875,13 +976,16 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 duplicate_policy,
             } => {
                 let policy = df_facade::DuplicatePolicy::parse(duplicate_policy)?;
-                df_facade::create_plan(path, Actor::Cli, policy).map(Output::Plan)
+                df_facade::create_plan(path, actor, policy).map(Output::Plan)
+            }
+            PlanCommand::Tree { path, depth } => {
+                df_facade::plan_destination_tree(path, *depth).map(Output::PlanTree)
             }
             PlanCommand::Validate { path } => {
                 df_facade::validate_plan(path).map(Output::PlanValidation)
             }
             PlanCommand::Approve { path } => {
-                df_facade::approve_plan(path, Actor::Cli).map(Output::Approve)
+                df_facade::approve_plan(path, actor).map(Output::Approve)
             }
         },
         Command::Execute {
@@ -889,7 +993,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             allow_degraded_destination,
         } => df_facade::execute_plan_with_options(
             path,
-            Actor::Cli,
+            actor,
             &df_facade::ExecuteOptions {
                 allow_degraded_destination: *allow_degraded_destination,
                 ..df_facade::ExecuteOptions::default()
@@ -897,7 +1001,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
         )
         .map(Output::Execute),
         Command::Verify { path } => {
-            df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
+            df_facade::verify_project_output(path, actor).map(Output::Verify)
         }
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
@@ -936,7 +1040,12 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 reason,
             } => {
                 let decision = df_facade::RuleAction::parse(decision)?;
-                df_facade::decide_structural_review(path, item, decision, reason, Actor::Cli)
+                df_facade::decide_structural_review(path, item, decision, reason, actor)
+                    .map(Output::Review)
+            }
+            ReviewCommand::DecideBatch { path, from } => {
+                let decisions = read_decision_batch(from)?;
+                df_facade::decide_structural_review_batch(path, &decisions, actor)
                     .map(Output::Review)
             }
         },
@@ -1234,6 +1343,63 @@ fn print_plan(outcome: &PlanOutcome) {
     println!("  blocked     : {}", outcome.blocked);
     println!("State       : {}", outcome.state);
     println!("Next        : review it, then `dataforge plan approve`");
+}
+
+fn print_plan_tree(tree: &PlanDestinationTree) {
+    println!("Plan        : {} (v{})", tree.plan_id, tree.version);
+    println!("Output root : {}", tree.output_root);
+    println!(
+        "Would write : {} file(s), {} directory/ies, {}",
+        tree.files,
+        tree.directories,
+        human_bytes(tree.bytes)
+    );
+    if tree.without_destination > 0 {
+        println!(
+            "WARNING     : {} copy operation(s) have no destination recorded",
+            tree.without_destination
+        );
+    }
+    println!();
+    for node in &tree.nodes {
+        // Two spaces per level so the shape of the output is readable at a
+        // glance; the prefix itself stays absolute-relative for copy/paste.
+        let indent = "  ".repeat((node.depth - 1) as usize);
+        println!(
+            "{indent}{}\\   {} file(s), {}",
+            node.prefix,
+            node.files,
+            human_bytes(node.bytes)
+        );
+        if node.depth == 1 {
+            let breakdown: Vec<String> = node
+                .by_operation
+                .iter()
+                .map(|(op, n)| format!("{op}={n}"))
+                .collect();
+            if !breakdown.is_empty() {
+                println!("{indent}    {}", breakdown.join(", "));
+            }
+            if let Some(sample) = &node.sample {
+                println!("{indent}    e.g. {sample}");
+            }
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn print_plan_validation(report: &PlanValidationReport) {
@@ -1738,6 +1904,7 @@ fn print_human(output: &Output) {
         Output::ContentSearch(outcome) => print_content_search(outcome),
         Output::ContentQuery(outcome) => print_content_query(outcome),
         Output::Plan(outcome) => print_plan(outcome),
+        Output::PlanTree(tree) => print_plan_tree(tree),
         Output::PlanValidation(report) => print_plan_validation(report),
         Output::Approve(outcome) => print_approve(outcome),
         Output::Execute(outcome) => print_execute(outcome),
@@ -1856,6 +2023,15 @@ fn verdict_exit_code(output: &Output) -> i32 {
         Output::ContentArtifacts(_) | Output::ContentSearch(_) | Output::ContentQuery(_) => 0,
         Output::Plan(outcome) => {
             if outcome.blocked > 0 {
+                3
+            } else {
+                0
+            }
+        }
+        // A tree with copies that have nowhere to land is a plan worth
+        // stopping over, not a report that quietly succeeds.
+        Output::PlanTree(tree) => {
+            if tree.without_destination > 0 {
                 3
             } else {
                 0

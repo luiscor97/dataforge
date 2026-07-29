@@ -353,6 +353,37 @@ export interface PlanValidationReport {
   problems: string[];
 }
 
+/** One destination prefix of the projected output tree. */
+export interface PlanDestinationNode {
+  /** Path relative to the output root. */
+  prefix: string;
+  /** Path components in `prefix`; 1 for a top-level root. */
+  depth: number;
+  files: number;
+  directories: number;
+  bytes: number;
+  /** `[operation_type, count]`, most frequent first. */
+  by_operation: [string, number][];
+  sample: string | null;
+}
+
+/**
+ * What the plan would actually write. Approving freezes a manifest, so this
+ * is the last chance to see the shape of the result rather than infer it
+ * from operation counts.
+ */
+export interface PlanDestinationTree {
+  plan_id: string;
+  version: number;
+  output_root: string;
+  files: number;
+  directories: number;
+  bytes: number;
+  /** Copies with no recorded destination: reported, never hidden. */
+  without_destination: number;
+  nodes: PlanDestinationNode[];
+}
+
 export interface ApproveOutcome {
   plan_id: string;
   state: string;

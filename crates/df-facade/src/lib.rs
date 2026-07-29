@@ -30,7 +30,9 @@ pub use df_domain::DuplicatePolicy;
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
-pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
+pub use df_db::analysis::{
+    AnomalyReport, ReviewDecisionInput, ReviewItemView, ReviewQueue, StructuralDiagnostics,
+};
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOptions;
 pub use df_executor::ExecuteOutcome;
@@ -2103,6 +2105,43 @@ pub fn create_plan(
     df_planner::create_plan(&mut db, actor, policy)
 }
 
+/// The output tree the current plan would produce, `depth` levels deep.
+///
+/// Read-only. Answers the question the counts cannot: *where does my data
+/// end up*. Available from `PLAN_READY` onwards, so the tree can be judged
+/// before approving a manifest that freezes it.
+pub fn plan_destination_tree(project_dir: &Path, depth: u32) -> DfResult<PlanDestinationTree> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let tree = df_db::plans::destination_tree(&db, plan.id, depth)?;
+    Ok(PlanDestinationTree {
+        plan_id: plan.id.to_string(),
+        version: plan.version,
+        output_root: project.output_root.display().to_string(),
+        files: tree.files,
+        directories: tree.directories,
+        bytes: tree.bytes,
+        without_destination: tree.without_destination,
+        nodes: tree
+            .nodes
+            .into_iter()
+            .map(|n| PlanDestinationNode {
+                prefix: n.prefix,
+                depth: n.depth,
+                files: n.files,
+                directories: n.directories,
+                bytes: n.bytes,
+                by_operation: n.by_operation,
+                sample: n.sample,
+            })
+            .collect(),
+    })
+}
+
 /// Re-run the §26.5 invariants against the stored current plan.
 pub fn validate_plan(project_dir: &Path) -> DfResult<PlanValidationReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2174,6 +2213,43 @@ pub fn verify_project_output(project_dir: &Path, actor: Actor) -> DfResult<Verif
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
     df_verifier::verify_project(&mut db, actor, &df_verifier::VerifyOptions::default())
+}
+
+/// One prefix of the projected output tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationNode {
+    /// Path relative to the output root.
+    pub prefix: String,
+    /// Path components in `prefix` (1 for a top-level root).
+    pub depth: u32,
+    /// Copies landing anywhere under this prefix.
+    pub files: u64,
+    /// Directories created under this prefix.
+    pub directories: u64,
+    /// Bytes the copies would write.
+    pub bytes: u64,
+    /// Copies by operation type, most frequent first.
+    pub by_operation: Vec<(String, u64)>,
+    /// A real destination path from this subtree.
+    pub sample: Option<String>,
+}
+
+/// What the current plan would produce on disk.
+///
+/// The plan already holds a destination for every occurrence; this only
+/// aggregates it. Reporting the shape of the output before it is frozen is
+/// what lets an approval be informed rather than blind.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationTree {
+    pub plan_id: String,
+    pub version: u32,
+    pub output_root: String,
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    /// Copies with no recorded destination. Surfaced, never hidden.
+    pub without_destination: u64,
+    pub nodes: Vec<PlanDestinationNode>,
 }
 
 /// Exact duplicate report of the latest snapshot (RFC-0001 §15).
@@ -2491,6 +2567,34 @@ pub fn decide_structural_review(
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
     ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     df_db::analysis::decide_review_item(&mut db, project.id, item_id, decision, rationale, actor)?;
+    df_db::analysis::review_queue(&db, snapshot.id)
+}
+
+/// Append many review decisions atomically.
+///
+/// The queue over a real archive runs to thousands of items, most of them
+/// repetitions of a few questions, which is exactly the shape an agent can
+/// answer in one pass. Each decision keeps its own rationale and its own
+/// ledger event; the batch only removes the need for one process per item.
+pub fn decide_structural_review_batch(
+    project_dir: &Path,
+    decisions: &[ReviewDecisionInput],
+    actor: Actor,
+) -> DfResult<ReviewQueue> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    if project.state != ProjectState::Analyzed {
+        return Err(DfError::Validation(format!(
+            "review decisions require ANALYZED state before planning (current {})",
+            project.state
+        )));
+    }
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::decide_review_items(&mut db, project.id, decisions, actor)?;
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
