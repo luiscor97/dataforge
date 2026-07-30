@@ -1,9 +1,9 @@
-//! `dataforge` — command line client of the DataForge engine.
+//! `dataforge` â€” command line client of the DataForge engine.
 //!
 //! The CLI contains no engine logic: inventory, similarity, content
 //! intelligence, planning, execution and audit all go through `df-facade`
 //! (RFC-0001 rules 16/17).
-//! Exit codes follow RFC-0001 §33.
+//! Exit codes follow RFC-0001 Â§33.
 
 use std::path::PathBuf;
 
@@ -17,9 +17,9 @@ use df_facade::{
     DuplicateReport, ExecuteOutcome, ExtractionLimits, HashOutcome, MediaOutcome,
     MediaProjectOptions, MediaReport, MediaSidecars, PlanDestinationTree, PlanOutcome,
     PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
-    QueryOptions, RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions,
-    SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions,
-    TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome,
+    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
+    SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -40,7 +40,7 @@ struct Cli {
     /// operator acting on a person's behalf).
     ///
     /// Recorded verbatim in the append-only ledger. It changes nothing about
-    /// what is permitted — the safe action set is identical — but an archive
+    /// what is permitted â€” the safe action set is identical â€” but an archive
     /// whose audit trail cannot distinguish a human decision from a model's
     /// is not an audit trail. An agent driving DataForge must say so.
     #[arg(long, global = true, default_value = "cli", value_parser = parse_cli_actor)]
@@ -196,7 +196,7 @@ enum Command {
         #[arg(long)]
         path: PathBuf,
         /// Acknowledge a destination filesystem without physical identity
-        /// guarantees (network shares, FAT variants) — ADR-0036.
+        /// guarantees (network shares, FAT variants) â€” ADR-0036.
         #[arg(long)]
         allow_degraded_destination: bool,
     },
@@ -400,7 +400,7 @@ enum PlanCommand {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
-        /// What to do with exact duplicates (RFC-0001 §15.4). The default
+        /// What to do with exact duplicates (RFC-0001 Â§15.4). The default
         /// copies every occurrence. No policy ever consolidates a copy that
         /// lives in a protected context.
         #[arg(long, value_name = "POLICY", default_value = "REPORT_ONLY")]
@@ -449,7 +449,7 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
-    /// Generic low-value folders (Downloads, Backup, copies, …) and penalties.
+    /// Generic low-value folders (Downloads, Backup, copies, â€¦) and penalties.
     Contexts {
         /// Project directory.
         #[arg(long)]
@@ -584,6 +584,16 @@ enum ReviewCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Group the queue by question, with how many decisions each would settle.
+    ///
+    /// The first call to make over a real archive: the flat list is thousands
+    /// of rows that are mostly the same question repeated, and answering it
+    /// once per class is what empties the review bucket.
+    Classes {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Append a human decision before generating the plan.
     Decide {
         /// Project directory.
@@ -607,7 +617,7 @@ enum ReviewCommand {
     /// time is not a workflow, and the identifiers alone overflow a command
     /// line, so the batch arrives as data:
     ///
-    ///   [{"item": "<id>", "decision": "COPY_ACTIVE", "reason": "…"}, …]
+    ///   [{"item": "<id>", "decision": "COPY_ACTIVE", "reason": "â€¦"}, â€¦]
     ///
     /// All of them commit together or none does.
     DecideBatch {
@@ -666,6 +676,7 @@ enum Output {
     AiAssist(Box<AiAssistOutcome>),
     AiAudits(Vec<AssistanceAuditView>),
     Review(ReviewQueue),
+    ReviewClasses(ReviewClassSummary),
     Audit(AuditReport),
 }
 
@@ -1033,6 +1044,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             ReviewCommand::List { path } => {
                 df_facade::structural_review_queue(path).map(Output::Review)
             }
+            ReviewCommand::Classes { path } => {
+                df_facade::structural_review_classes(path).map(Output::ReviewClasses)
+            }
             ReviewCommand::Decide {
                 path,
                 item,
@@ -1125,7 +1139,7 @@ fn print_status(status: &ProjectStatus) {
         );
         if diagnostic.candidate_cap_reached {
             println!(
-                "Relation cap: REACHED — structural relations are conservative but not exhaustive"
+                "Relation cap: REACHED â€” structural relations are conservative but not exhaustive"
             );
         }
     }
@@ -1218,7 +1232,7 @@ fn print_similarity(outcome: &SimilarityOutcome) {
     println!(
         "Candidate cap    : {}",
         if outcome.candidate_cap_reached {
-            "REACHED — results are conservative but not exhaustive"
+            "REACHED â€” results are conservative but not exhaustive"
         } else {
             "not reached"
         }
@@ -1256,7 +1270,7 @@ fn print_content_extraction(outcome: &ContentExtractionOutcome) {
     }
     if outcome.counters.limited > 0 || outcome.counters.failed > 0 {
         println!(
-            "Result         : PARTIAL — inspect LIMITED/FAILED evidence; this command exits 3"
+            "Result         : PARTIAL â€” inspect LIMITED/FAILED evidence; this command exits 3"
         );
     }
 }
@@ -1288,7 +1302,7 @@ fn print_content_search(outcome: &ContentSearchOutcome) {
     println!("Hits           : {}", outcome.hits.len());
     for hit in &outcome.hits {
         println!();
-        println!("  {:.4} — {}", hit.score, hit.representative_path);
+        println!("  {:.4} â€” {}", hit.score, hit.representative_path);
         if let Some(virtual_path) = &hit.virtual_path {
             println!("    virtual : {virtual_path}");
         }
@@ -1452,7 +1466,7 @@ fn print_verify(outcome: &VerifyOutcome) {
         println!("Findings     :");
         for finding in &outcome.findings {
             println!(
-                "  [{}] {} — {}: {}",
+                "  [{}] {} â€” {}: {}",
                 finding.severity, finding.kind, finding.subject, finding.detail
             );
         }
@@ -1469,7 +1483,7 @@ fn print_duplicates(report: &DuplicateReport) {
         println!("  sha256 {} ({} bytes)", set.sha256, set.size_bytes);
         for path in &set.occurrences {
             // The representative is the best canonical location, not a
-            // verdict that the others are dispensable (RFC-0001 §15.5).
+            // verdict that the others are dispensable (RFC-0001 Â§15.5).
             let mark = if set.representative.as_deref() == Some(path.as_str()) {
                 "*"
             } else {
@@ -1494,7 +1508,7 @@ fn print_tree_relations(report: &TreeRelationReport) {
     for relation in &report.relations {
         println!();
         println!(
-            "  {} — {:.0}% shared ({} file(s), {} bytes)",
+            "  {} â€” {:.0}% shared ({} file(s), {} bytes)",
             relation.relationship,
             relation.similarity * 100.0,
             relation.shared_files,
@@ -1522,7 +1536,7 @@ fn print_tree_relations(report: &TreeRelationReport) {
                 ),
                 _ => println!(
                     "    Only in A: {} file(s) | Only in B: {} file(s) \
-                 — dropping either side loses data (RFC-0001 §19.4)",
+                 â€” dropping either side loses data (RFC-0001 Â§19.4)",
                     relation.unique_a_files, relation.unique_b_files
                 ),
             }
@@ -1544,7 +1558,7 @@ fn print_tree_clones(report: &TreeCloneReport) {
     for set in &report.sets {
         println!();
         println!(
-            "  {} — {} file(s), {} bytes",
+            "  {} â€” {} file(s), {} bytes",
             set.relationship.as_str(),
             set.subtree_files,
             set.subtree_bytes
@@ -1571,7 +1585,7 @@ fn print_contexts(report: &ContextReport) {
     println!("Protected bounds : {}", report.protected_folders.len());
     for folder in &report.protected_folders {
         println!(
-            "  ! [{}] {} — {}",
+            "  ! [{}] {} â€” {}",
             folder.marker, folder.path, folder.reason
         );
     }
@@ -1586,7 +1600,7 @@ fn print_anomalies(report: &AnomalyReport) {
     for anomaly in &report.anomalies {
         println!();
         println!(
-            "  [{}] {} — {}",
+            "  [{}] {} â€” {}",
             anomaly.severity, anomaly.kind, anomaly.summary
         );
         println!("    id: {}", anomaly.id);
@@ -1613,7 +1627,7 @@ fn print_ai_assist(outcome: &AiAssistOutcome) {
     for field in &disclosure.fields {
         println!();
         println!(
-            "  [{}] {} — {} byte(s), {} redaction(s)",
+            "  [{}] {} â€” {} byte(s), {} redaction(s)",
             field.evidence_id, field.field_name, field.visible_bytes, field.redactions
         );
         println!("    {}", field.visible_text);
@@ -1623,7 +1637,7 @@ fn print_ai_assist(outcome: &AiAssistOutcome) {
     if !outcome.executed {
         println!();
         println!(
-            "Preview only — nothing was sent. To consent to exactly this \
+            "Preview only â€” nothing was sent. To consent to exactly this \
              disclosure, repeat with --accept-disclosure {}",
             disclosure.disclosure_sha256
         );
@@ -1653,7 +1667,7 @@ fn print_ai_audits(audits: &[AssistanceAuditView]) {
     }
     for audit in audits {
         println!(
-            "{} — {} {} / {} — {}{}",
+            "{} â€” {} {} / {} â€” {}{}",
             audit.created_at,
             audit.purpose,
             audit.provider,
@@ -1694,7 +1708,7 @@ fn print_plugin_runs(outcome: &PluginsOutcome) {
     println!("Snapshot         : {}", outcome.snapshot_id);
     for run in &outcome.runs {
         println!();
-        println!("  {} — {}", run.plugin, run.status);
+        println!("  {} â€” {}", run.plugin, run.status);
         println!("    run       : {}", run.run_id);
         println!(
             "    subjects  : {} total, {} analysed, {} failed{}",
@@ -1702,7 +1716,7 @@ fn print_plugin_runs(outcome: &PluginsOutcome) {
             run.subjects_analyzed,
             run.subjects_failed,
             if run.subject_cap_reached {
-                " (cap REACHED — not exhaustive)"
+                " (cap REACHED â€” not exhaustive)"
             } else {
                 ""
             }
@@ -1717,14 +1731,14 @@ fn print_plugin_findings(report: &PluginReport) {
     println!("Snapshot : {}", report.snapshot_id);
     for run in &report.runs {
         println!(
-            "  {} — {} finding(s) over {} subject(s)",
+            "  {} â€” {} finding(s) over {} subject(s)",
             run.plugin, run.findings_total, run.subjects_total
         );
     }
     for finding in &report.findings {
         println!();
         println!(
-            "  [{}] {} — {}",
+            "  [{}] {} â€” {}",
             finding.severity, finding.code, finding.plugin
         );
         println!("    subject : {}", finding.subject_id);
@@ -1752,7 +1766,7 @@ fn print_media(outcome: &MediaOutcome) {
     println!(
         "Pair cap         : {}",
         if outcome.pair_cap_reached {
-            "REACHED — results are conservative but not exhaustive"
+            "REACHED â€” results are conservative but not exhaustive"
         } else {
             "not reached"
         }
@@ -1767,12 +1781,12 @@ fn print_media_relations(report: &MediaReport) {
     println!("Relations      : {}", status.counters.relations_total);
     println!("Pairs compared : {}", status.counters.pairs_compared);
     if status.pair_cap_reached {
-        println!("Pair cap       : REACHED — the report is not exhaustive");
+        println!("Pair cap       : REACHED â€” the report is not exhaustive");
     }
     for relation in &status.relations {
         println!();
         println!(
-            "  {} — score {:.1}%",
+            "  {} â€” score {:.1}%",
             relation.relation,
             f64::from(relation.score_millionths) / 10_000.0
         );
@@ -1809,12 +1823,12 @@ fn print_similarities(report: &SimilarityReport) {
     println!("Relationships  : {}", status.counters.relations_total);
     println!("Candidates     : {}", status.counters.candidates_total);
     if status.candidate_cap_reached {
-        println!("Candidate cap  : REACHED — the report is not exhaustive");
+        println!("Candidate cap  : REACHED â€” the report is not exhaustive");
     }
     for relation in &status.relationships {
         println!();
         println!(
-            "  {} — {:.1}% exact shared-byte similarity",
+            "  {} â€” {:.1}% exact shared-byte similarity",
             relation.kind,
             relation.similarity * 100.0
         );
@@ -1838,6 +1852,52 @@ fn print_similarities(report: &SimilarityReport) {
     println!("Evidence only: no relation authorizes deletion or consolidation.");
 }
 
+fn print_review_classes(summary: &ReviewClassSummary) {
+    println!("Snapshot : {}", summary.snapshot_id);
+    println!("Items    : {}", summary.items);
+    println!("Pending  : {}", summary.pending);
+    println!("Decided  : {}", summary.decided);
+    if summary.classes.is_empty() {
+        println!("\nThe review queue is empty.");
+        return;
+    }
+    println!(
+        "\n{} class(es), largest pending first:",
+        summary.classes.len()
+    );
+    for class in &summary.classes {
+        println!();
+        println!("  [{}] {} ({})", class.risk, class.kind, class.source);
+        // Report whichever coverage the class actually has: tree-level
+        // findings name folders and no occurrence at all.
+        let coverage = if class.occurrences > 0 {
+            format!("{} occurrence(s)", class.occurrences)
+        } else if class.folders > 0 {
+            format!("{} folder(s)", class.folders)
+        } else {
+            "no recorded target".to_string()
+        };
+        println!(
+            "    pending    : {} of {} item(s), covering {coverage}",
+            class.pending, class.items
+        );
+        println!("    default    : {}", class.recommended_action);
+        if class.blocked {
+            println!(
+                "    BLOCKED    : unreadable source evidence; repair access and \
+                 rescan rather than deciding"
+            );
+        } else if let Some(sample) = &class.sample_item_id {
+            println!("    inspect    : {sample}");
+        }
+        println!("    reason     : {}", class.sample_reason);
+    }
+    println!(
+        "\nOne decision settles a whole class: `review decide-batch` takes the \
+         item ids as JSON."
+    );
+}
+
 fn print_review(queue: &ReviewQueue) {
     println!("Snapshot : {}", queue.snapshot_id);
     println!("Pending  : {}", queue.pending);
@@ -1845,7 +1905,7 @@ fn print_review(queue: &ReviewQueue) {
     for item in &queue.items {
         println!();
         println!(
-            "  [{}] {} {} — {}",
+            "  [{}] {} {} â€” {}",
             item.risk, item.status, item.kind, item.reason
         );
         println!("    id          : {}", item.id);
@@ -1933,11 +1993,12 @@ fn print_human(output: &Output) {
         Output::AiAssist(outcome) => print_ai_assist(outcome),
         Output::AiAudits(audits) => print_ai_audits(audits),
         Output::Review(queue) => print_review(queue),
+        Output::ReviewClasses(summary) => print_review_classes(summary),
         Output::Audit(report) => print_audit(report),
     }
 }
 
-/// RFC-0001 §33 exit code for a *successful* command whose result still
+/// RFC-0001 Â§33 exit code for a *successful* command whose result still
 /// signals a problem (failed integrity, broken ledger, partial hash).
 fn verdict_exit_code(output: &Output) -> i32 {
     match output {
@@ -2069,7 +2130,12 @@ fn verdict_exit_code(output: &Output) -> i32 {
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,
-        Output::Anomalies(_) | Output::Similarities(_) | Output::Review(_) => 0,
+        // A queue with items pending is the normal state of an analysed
+        // archive, not a failure: it is evidence waiting for a decision.
+        Output::Anomalies(_)
+        | Output::Similarities(_)
+        | Output::Review(_)
+        | Output::ReviewClasses(_) => 0,
     }
 }
 
@@ -2344,7 +2410,7 @@ mod tests {
 
         // Write safety is Windows-only in this version: on POSIX, execution
         // must refuse explicitly (fail closed) with the approved plan and a
-        // valid ledger left intact — that refusal is the pinned behavior.
+        // valid ledger left intact â€” that refusal is the pinned behavior.
         // The Windows half continues through copy and verification.
         #[cfg(not(windows))]
         {

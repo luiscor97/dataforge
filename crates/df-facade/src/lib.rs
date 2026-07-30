@@ -31,7 +31,8 @@ use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
 pub use df_db::analysis::{
-    AnomalyReport, ReviewDecisionInput, ReviewItemView, ReviewQueue, StructuralDiagnostics,
+    AnomalyReport, ReviewClass, ReviewClassSummary, ReviewDecisionInput, ReviewItemView,
+    ReviewQueue, StructuralDiagnostics,
 };
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOptions;
@@ -2542,6 +2543,23 @@ pub fn structural_review_queue(project_dir: &Path) -> DfResult<ReviewQueue> {
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
     ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     df_db::analysis::review_queue(&db, snapshot.id)
+}
+
+/// The review queue grouped by question rather than listed by item.
+///
+/// The flat queue is the wrong first call over a real archive: it returns
+/// thousands of rows that are mostly the same question repeated. This returns
+/// one row per class, ordered by how many decisions each would settle, so the
+/// shortest path to an empty review bucket is the first line of output.
+pub fn structural_review_classes(project_dir: &Path) -> DfResult<ReviewClassSummary> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::review_class_summary(&db, snapshot.id)
 }
 
 /// Append a review decision before planning. Decisions after a plan exists
