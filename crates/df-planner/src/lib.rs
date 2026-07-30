@@ -616,6 +616,94 @@ const SEPARATED_BUCKET: &str = "95_DataForge_Separated";
 const TEMPORARY_BUCKET: &str = "98_DataForge_Temporary";
 const PORTABLE_COMPONENT_PREFIX: &str = "~df-portable-";
 
+/// The named destination roots a plan may route into (ADR-0040).
+///
+/// One place that knows every root, rather than constants read separately by
+/// the router and by the source-root namer. Those two had to agree — a root
+/// the router can emit but the namer does not reserve is a container a source
+/// folder could shadow — and nothing but proximity was keeping them in step.
+///
+/// `generic` produces exactly the three operational buckets 1.x hardcoded, so
+/// its output is unchanged byte for byte; the type exists so a profile can
+/// declare a different set without the planner growing a special case.
+#[derive(Debug, Clone, Copy)]
+pub struct DestinationTaxonomy {
+    roots: &'static [DestinationRoot],
+}
+
+/// One declared root: what it is called on disk and what it means.
+#[derive(Debug, Clone, Copy)]
+pub struct DestinationRoot {
+    /// Stable identifier, independent of the folder name.
+    pub id: &'static str,
+    /// Literal directory name created under the output root. `None` routes
+    /// to the output root itself — the working archive.
+    pub folder: Option<&'static str>,
+    /// Whether what lands here is part of the working archive or set aside
+    /// from it. Presentation and reports read this; routing does not.
+    pub set_aside: bool,
+}
+
+/// The 1.x set: an active archive plus the three operational buckets.
+///
+/// A const, not a builder: routing runs once per operation and a plan over a
+/// real archive holds hundreds of thousands of them.
+const OPERATIONAL_ROOTS: &[DestinationRoot] = &[
+    DestinationRoot {
+        id: "active",
+        folder: None,
+        set_aside: false,
+    },
+    DestinationRoot {
+        id: "review",
+        folder: Some(REVIEW_BUCKET),
+        set_aside: false,
+    },
+    DestinationRoot {
+        id: "separated",
+        folder: Some(SEPARATED_BUCKET),
+        set_aside: true,
+    },
+    DestinationRoot {
+        id: "temporary",
+        folder: Some(TEMPORARY_BUCKET),
+        set_aside: true,
+    },
+];
+
+impl DestinationTaxonomy {
+    /// The taxonomy every 1.x profile used, and `generic` still uses.
+    pub const fn operational() -> Self {
+        Self {
+            roots: OPERATIONAL_ROOTS,
+        }
+    }
+
+    /// Folder names that a source root must never be allowed to shadow.
+    ///
+    /// Reserved even when the profile emits nothing into them: a name that
+    /// becomes reachable only once some item lands there is a name that
+    /// collides on the run where it first matters.
+    pub fn reserved_folders(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.roots.iter().filter_map(|root| root.folder)
+    }
+
+    /// The root an operation type routes into, or `None` when it belongs in
+    /// the working archive.
+    pub fn folder_for(&self, operation_type: OperationType) -> Option<&'static str> {
+        let id = match operation_type {
+            OperationType::CopyReview => "review",
+            OperationType::CopySeparated => "separated",
+            OperationType::CopyTemporary => "temporary",
+            _ => "active",
+        };
+        self.roots
+            .iter()
+            .find(|root| root.id == id)
+            .and_then(|root| root.folder)
+    }
+}
+
 /// Turn a source component into a name which is safe to materialise on every
 /// supported Windows filesystem. Safe names stay readable; unsafe or reserved
 /// names receive a deterministic, domain-separated encoding derived from the
@@ -708,10 +796,11 @@ fn portable_relative_path(
 }
 
 fn root_destination_dirs(roots: &[df_domain::SourceRoot]) -> HashMap<SourceRootId, (String, bool)> {
-    // Bucket names are reserved even when a profile currently emits no item
-    // into them, so a source root can never shadow an operational container.
-    let mut used: HashSet<String> = [REVIEW_BUCKET, SEPARATED_BUCKET, TEMPORARY_BUCKET]
-        .into_iter()
+    // Reserved from the declared taxonomy rather than from a second copy of
+    // the same names: the router and this namer must agree about every root,
+    // and a list repeated in two places is a list that eventually diverges.
+    let mut used: HashSet<String> = DestinationTaxonomy::operational()
+        .reserved_folders()
         .map(str::to_ascii_lowercase)
         .collect();
     let mut mapping = HashMap::new();
@@ -741,25 +830,18 @@ fn root_destination_dirs(roots: &[df_domain::SourceRoot]) -> HashMap<SourceRootI
     mapping
 }
 
-fn operational_bucket(operation_type: OperationType) -> Option<&'static str> {
-    match operation_type {
-        OperationType::CopyReview => Some(REVIEW_BUCKET),
-        OperationType::CopySeparated => Some(SEPARATED_BUCKET),
-        OperationType::CopyTemporary => Some(TEMPORARY_BUCKET),
-        _ => None,
-    }
-}
-
 fn route_destination(operation_type: OperationType, active_destination: &str) -> String {
-    operational_bucket(operation_type).map_or_else(
-        || active_destination.to_string(),
-        |bucket| {
-            Path::new(bucket)
-                .join(active_destination)
-                .display()
-                .to_string()
-        },
-    )
+    DestinationTaxonomy::operational()
+        .folder_for(operation_type)
+        .map_or_else(
+            || active_destination.to_string(),
+            |bucket| {
+                Path::new(bucket)
+                    .join(active_destination)
+                    .display()
+                    .to_string()
+            },
+        )
 }
 
 /// Deterministic collision suffix (§27.3, applied at plan time): the first
@@ -1088,8 +1170,8 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                          deterministic §27.3 suffix",
                                         recommendation.reason
                                     )
-                                } else if let Some(bucket) =
-                                    operational_bucket(recommendation.operation_type)
+                                } else if let Some(bucket) = DestinationTaxonomy::operational()
+                                    .folder_for(recommendation.operation_type)
                                 {
                                     format!(
                                         "{}; routed to operational bucket `{bucket}`",
@@ -1286,6 +1368,60 @@ mod tests {
     use df_scan::{scan_project, ScanOptions};
 
     use super::*;
+
+    /// Every folder the router can emit has to be a folder the source-root
+    /// namer refuses to hand out, or an origin called `90_DataForge_Review`
+    /// would end up sharing a directory with the review bucket. Before the
+    /// taxonomy these were two separate lists kept in step by proximity
+    /// alone; this asserts they cannot drift (ADR-0040).
+    #[test]
+    fn every_routable_root_is_reserved_against_source_roots() {
+        let taxonomy = DestinationTaxonomy::operational();
+        let reserved: HashSet<String> = taxonomy
+            .reserved_folders()
+            .map(str::to_ascii_lowercase)
+            .collect();
+
+        for operation_type in [
+            OperationType::CopyActive,
+            OperationType::CopyReview,
+            OperationType::CopySeparated,
+            OperationType::CopyTemporary,
+            OperationType::CopyWithSuffix,
+            OperationType::PreserveAcrossContext,
+            OperationType::CreateDirectory,
+        ] {
+            if let Some(folder) = taxonomy.folder_for(operation_type) {
+                assert!(
+                    reserved.contains(&folder.to_ascii_lowercase()),
+                    "`{folder}` is routable but not reserved"
+                );
+            }
+        }
+    }
+
+    /// 2.0 opens the taxonomy; it must not move anything while doing so.
+    /// A project on `generic` has to keep producing the 1.x layout exactly.
+    #[test]
+    fn the_operational_taxonomy_keeps_the_1_x_layout() {
+        let taxonomy = DestinationTaxonomy::operational();
+        assert_eq!(taxonomy.folder_for(OperationType::CopyActive), None);
+        assert_eq!(
+            taxonomy.folder_for(OperationType::CopyReview),
+            Some("90_DataForge_Review")
+        );
+        assert_eq!(
+            taxonomy.folder_for(OperationType::CopySeparated),
+            Some("95_DataForge_Separated")
+        );
+        assert_eq!(
+            taxonomy.folder_for(OperationType::CopyTemporary),
+            Some("98_DataForge_Temporary")
+        );
+        // A directory creation belongs to the archive it is part of, never
+        // to a bucket of its own.
+        assert_eq!(taxonomy.folder_for(OperationType::CreateDirectory), None);
+    }
 
     fn hashed_project(tmp: &Path) -> Db {
         let origin = tmp.join("origen");
