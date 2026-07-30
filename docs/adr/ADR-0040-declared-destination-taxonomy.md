@@ -2,7 +2,24 @@
 
 **Estado:** Propuesta
 **Fecha:** 2026-07-29
-**Relacionada con:** RFC-0001 §26, §15.4; ADR-0019, ADR-0026, ADR-0037
+**Relacionada con:** RFC-0001 §26, §15.4; RFC-0002 (borrador); ADR-0019,
+ADR-0026, ADR-0037
+
+> **Coordinación pendiente con RFC-0002.** Esta ADR se escribió sin conocer el
+> borrador de RFC-0002 (rama `design/rfc-0002-autonomy`, 2026-07-21), que ya
+> responde a la misma pregunta —dónde aterriza lo dudoso— con un diseño
+> distinto y más concreto: `revisar/` como **espejo del árbol de salida**, con
+> cada elemento en su mejor ubicación estimada, y el motivo como metadato en
+> lugar de carpeta. Ese diseño es mejor para lo que resuelve, porque hace que
+> aceptar una revisión sea mover de `revisar/<ruta>` a `output/<ruta>`.
+>
+> Lo que aporta esta ADR y RFC-0002 no cubre es el **mecanismo**: que el
+> conjunto de raíces sea declarado y cerrado en vez de tres constantes
+> incrustadas en un `match`. Un espejo de revisión también necesita ser una
+> raíz declarada. Antes de aceptar esta ADR hay que decidir si se subsume en
+> RFC-0002 como parte de su paso 1 o si se mantiene aparte; el código ya
+> commiteado es neutro respecto a esa decisión, porque preserva la salida 1.x
+> byte a byte.
 
 ## Contexto
 
