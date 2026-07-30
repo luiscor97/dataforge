@@ -103,6 +103,26 @@ test que lo fija.
 
 Que el motor distinga qué es cada archivo, no solo en qué estado está.
 
+**Es la precondición de la deduplicación, no una mejora de orden.** Medido
+sobre el corpus real: de 28.537 conjuntos de duplicados, solo **625** tienen
+todas sus copias en una misma carpeta. `classify_duplicate_set` solo puede
+afirmar `WithinSameContext` en ese caso; el resto queda `UnknownContext`, y
+§15.2 prohíbe inferir redundancia, así que **ninguna política lo consolida —
+tampoco `CONSOLIDATE_ALL`**.
+
+| | |
+| --- | --- |
+| Redundancia total | 239,7 GB |
+| Alcanzable por cualquier política de la 1.0 | **5,45 GB** |
+| Bloqueada por falta de clasificación | **234,2 GB** |
+
+Con perfil `generic` sobre ese archivo, 36.381 de 36.459 carpetas quedan
+`NEUTRAL` y ninguna es frontera protegida. Sin clasificación de contexto no
+hay deduplicación posible, por diseño y con razón: el motor se niega a suponer
+que una copia que está en otro sitio sobra.
+
+Fijado por `crates/df-planner/tests/consolidation_savings.rs`.
+
 - Recuperación canónica (Modo 1 de RFC-0002): dedup por contenido eligiendo
   representante, y auditoría de árboles injertados. La mayoría se resuelve
   **sin IA**.
@@ -205,3 +225,9 @@ construcción. No se reescribe historia. El perfil `generic` mantiene la salida
 - **Calibración de confianza sin datos.** RFC-0002 deja abierto un modo sombra
   que coloque todo en el espejo y compare con la decisión humana para fijar
   umbrales. Sin eso, los umbrales de auto-colocación son una suposición.
+- **Suponer que la política de duplicados basta.** Se dio por hecho, en esta
+  misma línea de trabajo, que elegir `CONSOLIDATE_ALL` produciría una salida
+  deduplicada de unos 204 GB. Medido, el ahorro alcanzable es de 5,45 GB. La
+  cifra falsa se sostuvo varias conversaciones porque nadie había ejecutado la
+  política contra datos reales. De ahí que M2.3 sea precondición y no adorno,
+  y de ahí que la definición de hecho lleve umbrales verificables.
