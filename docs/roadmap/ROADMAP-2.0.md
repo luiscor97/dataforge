@@ -123,6 +123,17 @@ que una copia que está en otro sitio sobra.
 
 Fijado por `crates/df-planner/tests/consolidation_savings.rs`.
 
+**Y buena parte de la prueba ya existe.** Medido: 118,9 GB de esos 234,2 GB
+están dentro de carpetas que el motor ya ha demostrado que **no tienen nada
+propio** — el lado contenido de una relación `TREE_EMBEDDED`, cuyo `CHECK`
+exige `unique_files = 0`. Son 708 carpetas maximales y 67.648 archivos. Se
+copian igual porque `classify_duplicate_set` mira igualdad de carpeta y no
+consulta `tree_relations`.
+
+Conectar esas dos cosas es [ADR-0045](../adr/ADR-0045-embedded-tree-duplicates.md),
+y es el primer trabajo de este hito porque desbloquea la mitad de la
+redundancia bloqueada sin releer un byte.
+
 - Recuperación canónica (Modo 1 de RFC-0002): dedup por contenido eligiendo
   representante, y auditoría de árboles injertados. La mayoría se resuelve
   **sin IA**.
