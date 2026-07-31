@@ -1,10 +1,22 @@
 # RFC-0002 — Reconstrucción agéntica: de IA asistida a agente autónomo por lotes
 
-**Estado:** Borrador
-**Fecha:** 2026-07-21
-**Autor:** (pendiente)
+**Estado:** Aprobada
+**Fecha:** 2026-07-21 (aprobada 2026-08-01)
+**Autor:** luiscor97
 **Reemplaza / modifica:** complementa RFC-0001 §23 (IA asistida), §25 (reglas
 declarativas) y §45 (roadmap); no modifica ninguna garantía absoluta.
+**Subsume:** ADR-0040 (taxonomía de destino declarada) como mecanismo del paso 1.
+
+> **Qué significa que esté aprobada.** Queda fijada la dirección: la escalera
+> L0 → L1 → L2, el orden obligado del plan de adopción y los dos principios
+> rectores. No quedan fijados los detalles que este documento deja abiertos;
+> cada uno está atado a la ADR y al hito que lo resuelve en «Preguntas
+> abiertas». Aprobar es cerrar la ambigüedad sobre *cuál es el plan*, no
+> declarar que el plan esté completo.
+>
+> Los hitos M2.1–M2.6 de [ROADMAP-2.0](../roadmap/ROADMAP-2.0.md) son la
+> ejecución de este RFC y dan la **2.0**, con la misma nomenclatura que M0.1–M0.9
+> dieron la 1.0.
 
 ## Resumen
 
@@ -206,6 +218,43 @@ la revisión es la más barata posible: **aceptar = mover de `revisar/<ruta>` a
 copia**, sujeto a las mismas garantías (copia-solo, sin sobrescribir, origen
 intacto, ruta preservada bit a bit).
 
+#### El mecanismo: raíces declaradas (subsume ADR-0040)
+
+Este RFC dice qué **forma** tiene la salida; no dice cómo se declara el conjunto
+de carpetas raíz que la componen. Hoy son tres constantes incrustadas en un
+`match` sobre el tipo de operación. [ADR-0040](../adr/ADR-0040-declared-destination-taxonomy.md)
+resuelve exactamente eso y **se adopta aquí como el mecanismo del paso 1**.
+(ADR-0040 y su implementación aterrizan con la PR #45; hasta que se fusione,
+este enlace no resuelve.)
+
+- Las raíces las **declara el perfil**, con id estable y nombre literal, en vez
+  de una constante. El espejo de `revisar/` y sus buckets técnicos son ellos
+  mismos raíces declaradas, no casos especiales del planificador.
+- El **tipo de operación sigue acotando *qué*; la raíz decide *dónde***. El
+  vocabulario de acciones seguras no se amplía: una taxonomía puede mandar un
+  archivo a otra carpeta, nunca inventar una operación que lo borre. Separar los
+  dos ejes es lo que permite enriquecer la salida sin tocar las garantías.
+- **Cada operación registra por qué aterriza donde aterriza.** Esa procedencia
+  de enrutado es la misma que el gate autónomo sella en la transacción del
+  congelado (§«El gate autónomo y su procedencia»); no son dos mecanismos.
+- Los nombres declarados quedan **reservados frente a las raíces de origen**,
+  cálculo que pasa a hacerse sobre el conjunto dinámico. Sin esto, un origen
+  podría ensombrecer el propio espejo de revisión.
+- **Se sube el contrato, no se edita:** schema de perfil `1.1.0` → `2.0.0` y
+  migración append-only para la procedencia, con la expectativa de
+  `frozen_contracts` actualizada en el mismo commit (ADR-0037 §2).
+
+**Lo que no se adopta.** La decisión 5 de ADR-0040 —«lo no clasificable va a la
+raíz de revisión»— trataba `revisar/` como bolsa plana. Queda **reemplazada** por
+el espejo descrito arriba: lo no clasificable va a su mejor ubicación estimada
+dentro del espejo, y solo cae en `revisar/_sin-ubicar/` cuando no hay ni apuesta.
+El resto de ADR-0040 se mantiene íntegro.
+
+Las dos decisiones eran compatibles y se leyeron como conflicto porque se
+escribieron en paralelo sin conocerse: ADR-0040 responde al *mecanismo* y este
+RFC a la *política*. `generic` preserva la salida 1.x byte a byte, así que el
+código ya commiteado es neutro respecto a esta resolución.
+
 ### Robustez para discos viejos y lentos
 
 Estas son reglas duras, no "bonito tener", porque son el caso de uso real:
@@ -347,6 +396,23 @@ Orden obligado (los pasos 1–2 constituyen un L1 seguro y entregable):
 Compatibilidad: puramente aditivo. L0 (asistida) sigue disponible sin cambios.
 
 ## Preguntas abiertas
+
+Aprobar este RFC no las cierra. Cada una queda **atada al hito que no puede
+empezar sin ella** y se resuelve en su ADR, no editando este documento. Ninguna
+bloquea M2.1: el paso 1 es deliberadamente el que no depende de ninguna.
+
+| # | Pregunta | Bloquea | Se resuelve en |
+| --- | --- | --- | --- |
+| 1 | Lenguaje de las reglas | **M2.4** | ADR-0041 |
+| 2 | Calibración de confianza (modo sombra) | **M2.6** (paso 5) | ADR-0044 |
+| 3 | Dominio de arranque de L2 | **M2.6** (paso 5) | ADR-0044 |
+| 4 | Presentación en el escritorio | **M2.6** | ADR propia, aún sin número |
+| 5 | Reproducibilidad con proveedor de nube | **M2.5** | ADR-0042 |
+| 6 | Política de colisión de nombres por defecto | **M2.2** | ADR-0040 (revisión) |
+
+La 1 es la de mayor alcance: condiciona todo M2.4, que es el ~70 % del trabajo
+que hace segura la retirada del humano. Conviene resolverla antes de empezar el
+hito, no durante.
 
 1. **Lenguaje de las reglas.** ¿DSL declarativo propio, tabla de condiciones
    versionada en SQLite, o política en Rust compilada con test de contrato?
