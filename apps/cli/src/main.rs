@@ -1505,6 +1505,21 @@ fn print_tree_relations(report: &TreeRelationReport) {
     println!("Partial clones  : {}", report.partial_clones);
     println!("Embedded trees  : {}", report.embedded);
     println!("Repeated parts  : {}", report.repeated_components);
+    if report.embedded_contained_folders > 0 {
+        // The size of the opportunity, which until now meant querying SQLite
+        // by hand. Stated as a lower bound because it is one, and because a
+        // saving that turns out smaller than promised is how a destination
+        // stops fitting. Still evidence: nothing consolidates on it today.
+        println!(
+            "Contained trees : {} folder(s) carry nothing of their own",
+            report.embedded_contained_folders
+        );
+        println!(
+            "                  {} distinct content(s), at least {} that already exist outside",
+            report.embedded_contained_files,
+            human_bytes(report.embedded_redundant_bytes)
+        );
+    }
     for relation in &report.relations {
         println!();
         println!(

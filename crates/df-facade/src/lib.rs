@@ -2424,6 +2424,66 @@ fn non_overlapping_redundant_bytes(sets: &[TreeCloneSet]) -> u64 {
     redundant_bytes
 }
 
+/// Bytes held by subtrees a `TREE_EMBEDDED` relation proves carry nothing of
+/// their own, counting no nested subtree twice.
+///
+/// An embedded relation requires the contained side to have zero unique files
+/// — the schema enforces it — so every content under it also exists outside,
+/// and `shared_bytes` is that subtree's content weight. This is the strongest
+/// redundancy claim the engine can make short of a duplicate set, and until
+/// now nothing surfaced its size: answering "how much is provably collapsible"
+/// meant querying SQLite by hand.
+///
+/// Deliberately conservative, exactly like the clone-set estimate: nested
+/// contained subtrees collapse to their shallowest ancestor, so the figure may
+/// undercount and never overcounts. Evidence only — it proposes no action, and
+/// no policy consolidates on it today (ADR-0045 is where that is decided).
+fn non_overlapping_embedded_bytes(
+    relations: &[df_db::structure::TreeRelationView],
+) -> (u64, u64, u64) {
+    let mut candidates: Vec<(Vec<String>, u64, u64)> = Vec::new();
+    for relation in relations {
+        if relation.relationship != "TREE_EMBEDDED" {
+            continue;
+        }
+        // `contained` names which side is inside the other; it is not implied
+        // by the ordering of the pair.
+        let (path, files) = match relation.contained.as_deref() {
+            Some("A") => (&relation.path_a, relation.shared_files),
+            Some("B") => (&relation.path_b, relation.shared_files),
+            // A relation without a contained side is not an embedding we can
+            // read, so it contributes nothing rather than a guess.
+            _ => continue,
+        };
+        candidates.push((clone_path_components(path), relation.shared_bytes, files));
+    }
+
+    // One folder can be the contained side of several relations; keep it once.
+    candidates.sort_by(|left, right| {
+        left.0
+            .len()
+            .cmp(&right.0.len())
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.dedup_by(|left, right| left.0 == right.0);
+
+    let mut selected = Vec::<Vec<String>>::new();
+    let (mut bytes, mut files) = (0_u64, 0_u64);
+    for (components, subtree_bytes, subtree_files) in candidates {
+        if selected
+            .iter()
+            .any(|path| clone_paths_overlap(path, &components))
+        {
+            continue;
+        }
+        bytes = bytes.saturating_add(subtree_bytes);
+        files = files.saturating_add(subtree_files);
+        selected.push(components);
+    }
+    (selected.len() as u64, files, bytes)
+}
+
 /// Compute the exact tree-clone report of the latest complete snapshot.
 pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2458,6 +2518,25 @@ pub struct TreeRelationReport {
     pub embedded: u64,
     /// Pairs whose only meaningful overlap is a repeated component.
     pub repeated_components: u64,
+    /// Contained subtrees counted once, ancestors absorbing descendants.
+    pub embedded_contained_folders: u64,
+    /// Distinct contents shared by those subtrees with their outer tree.
+    /// Not a file count of the subtree: a subtree that holds the same content
+    /// twice contributes it once.
+    pub embedded_contained_files: u64,
+    /// Bytes of those distinct shared contents — the strongest redundancy
+    /// claim short of a duplicate set, since every one of them also exists
+    /// outside the contained subtree.
+    ///
+    /// A **lower bound** on what collapsing would avoid writing, twice over:
+    /// nested subtrees collapse into their ancestor, and internal duplication
+    /// inside a subtree is counted once here while a plan would copy it once
+    /// per occurrence. Erring low is deliberate — the same discipline as the
+    /// clone-set estimate — because overstating a saving is how a user ends
+    /// up surprised by a destination that does not fit.
+    ///
+    /// Still evidence: no policy consolidates on it today (ADR-0045).
+    pub embedded_redundant_bytes: u64,
     pub relations: Vec<df_db::structure::TreeRelationView>,
 }
 
@@ -2483,11 +2562,16 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
         .iter()
         .filter(|r| r.relationship == "REPEATED_COMPONENT_ONLY")
         .count() as u64;
+    let (embedded_contained_folders, embedded_contained_files, embedded_redundant_bytes) =
+        non_overlapping_embedded_bytes(&relations);
     Ok(TreeRelationReport {
         snapshot_id: snapshot.id.to_string(),
         partial_clones,
         embedded,
         repeated_components,
+        embedded_contained_folders,
+        embedded_contained_files,
+        embedded_redundant_bytes,
         relations,
     })
 }
@@ -2647,6 +2731,82 @@ pub fn verify_audit(project_dir: &Path) -> DfResult<AuditReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embedded(
+        contained_path: &str,
+        outer_path: &str,
+        files: u64,
+        bytes: u64,
+    ) -> df_db::structure::TreeRelationView {
+        df_db::structure::TreeRelationView {
+            path_a: contained_path.to_owned(),
+            path_b: outer_path.to_owned(),
+            relationship: "TREE_EMBEDDED".to_string(),
+            contained: Some("A".to_string()),
+            shared_files: files,
+            // The schema forbids unique content on the contained side; that
+            // is precisely what makes the claim provable.
+            unique_a_files: 0,
+            unique_b_files: 3,
+            shared_bytes: bytes,
+            similarity: 1.0,
+        }
+    }
+
+    /// The size of a provable redundancy, counted once. Two nested contained
+    /// subtrees are one opportunity, not two, and reporting the sum would
+    /// overstate what collapsing them recovers.
+    #[test]
+    fn nested_contained_subtrees_are_counted_once() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz", 10, 1_000),
+            embedded(r"raiz\copia\dentro", r"raiz", 4, 400),
+        ];
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1, "the descendant is absorbed by its ancestor");
+        assert_eq!(files, 10);
+        assert_eq!(bytes, 1_000, "never the 1.400 of the naive sum");
+    }
+
+    /// One folder can be the contained side of several relations — embedded
+    /// in two different outer trees — and it is still one folder.
+    #[test]
+    fn a_folder_contained_twice_is_still_one_opportunity() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz\a", 10, 1_000),
+            embedded(r"raiz\copia", r"raiz\b", 10, 1_000),
+        ];
+        let (folders, _, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1);
+        assert_eq!(bytes, 1_000);
+    }
+
+    /// Only embeddings count. A partial clone has unique content on both
+    /// sides — dropping either loses data (§19.4) — so it must never appear
+    /// in a figure that describes what is safe to collapse.
+    #[test]
+    fn partial_clones_contribute_nothing_to_the_provable_figure() {
+        let mut partial = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        partial.relationship = "PARTIAL_TREE_CLONE".to_string();
+        partial.contained = None;
+        partial.unique_a_files = 2;
+
+        let mut repeated = embedded(r"raiz\c", r"raiz\d", 5, 500);
+        repeated.relationship = "REPEATED_COMPONENT_ONLY".to_string();
+        repeated.contained = None;
+
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&[partial, repeated]);
+        assert_eq!((folders, files, bytes), (0, 0, 0));
+    }
+
+    /// An embedding whose contained side is not recorded is not readable as
+    /// an embedding, so it contributes nothing rather than a guess.
+    #[test]
+    fn an_embedding_without_a_contained_side_is_skipped() {
+        let mut orphan = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        orphan.contained = None;
+        assert_eq!(non_overlapping_embedded_bytes(&[orphan]), (0, 0, 0));
+    }
 
     fn clone_set(tag: char, folders: &[&str], subtree_bytes: u64) -> TreeCloneSet {
         TreeCloneSet {

@@ -39,6 +39,15 @@ anidadas dentro de otra contenida, para no contar dos veces— con 67.648
 archivos. Sin ese filtro la cifra bruta es de 1.222 carpetas y 162,6 GB, que
 solapa.
 
+`report tree-relations` publica ahora esa medición, y da **108,5 GB** sobre las
+mismas 708 carpetas. La diferencia es real y conviene entenderla: el informe
+suma los **contenidos distintos** compartidos, mientras que 118,9 GB es el peso
+bruto de los subárboles, que incluye la duplicación interna de cada uno. Como
+un plan copiaría cada aparición, el ahorro efectivo se parece más a la cifra
+alta; el informe publica la baja a propósito, igual que hace la estimación de
+clones, porque prometer un ahorro que luego no aparece es como un destino deja
+de caber.
+
 Dicho de otro modo: **la mitad de la redundancia que hoy se declara
 inconsolidable ya está demostrada**, y se copia igual porque la prueba vive en
 una tabla que el clasificador no mira.
