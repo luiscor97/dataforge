@@ -1,9 +1,15 @@
 # Roadmap 2.0 — Reconstrucción agéntica y salida con significado
 
-**Estado:** Borrador
-**Fecha:** 2026-07-29
+**Estado:** Vigente — ejecuta [RFC-0002](../rfcs/RFC-0002-autonomy-ladder.md),
+aprobada el 2026-08-01
+**Fecha:** 2026-07-29 (actualizado 2026-08-01)
 **Relacionada con:** RFC-0001 §45 (roadmap maestro 1.0); RFC-0002 (escalera de
-autonomía); ADR-0037 (contratos congelados); ADR-0040..0044
+autonomía); ADR-0037 (contratos congelados); ADR-0040..0045
+
+> **Nomenclatura.** M2.1–M2.6 dan la **2.0**, igual que M0.1–M0.9 dieron la 1.0.
+> No hay ningún hito intermedio que publique una versión: un run que cumpla la
+> definición de hecho con un humano en el gate es el L1 entregable que este
+> documento ya contempla como punto de parada legítimo, no una release aparte.
 
 ## Qué es la 2.0
 
@@ -82,8 +88,8 @@ poniendo el vocabulario en la frontera de transporte.
 ### M2.2 — Taxonomía de destino
 
 Que la salida pueda tener bolsas con significado, no solo de procedimiento.
-[ADR-0040](../adr/ADR-0040-declared-destination-taxonomy.md), pendiente de
-subsumirse en RFC-0002.
+[ADR-0040](../adr/ADR-0040-declared-destination-taxonomy.md), **subsumida en
+RFC-0002 como mecanismo del paso 1** (resuelto el 2026-08-01).
 
 - Raíces de destino declaradas y cerradas, en lugar de constantes en un
   `match`.
@@ -230,9 +236,11 @@ construcción. No se reescribe historia. El perfil `generic` mantiene la salida
   organizada, nunca una pérdida.
 - **Trabajo en paralelo divergiendo.** Ya pasó: `Actor::Agent` se implementó
   dos veces, y ADR-0040 respondió una pregunta que RFC-0002 ya había
-  contestado mejor. Estado en
-  [estado-superficie-agentica.md](estado-superficie-agentica.md); RFC-0002
-  debería fusionarse antes de seguir.
+  contestado mejor. **Mitigado el 2026-08-01**: RFC-0002 aprobada, ADR-0040
+  subsumida, y el índice de ADR completado con las 0040–0045 que le faltaban. La causa raíz era que el plan vivía en una rama sin fusionar, así
+  que quien abría otra rama no lo veía. Estado en
+  [estado-superficie-agentica.md](estado-superficie-agentica.md), que sigue
+  siendo lo primero que hay que leer al retomar el repo.
 - **Calibración de confianza sin datos.** RFC-0002 deja abierto un modo sombra
   que coloque todo en el espejo y compare con la decisión humana para fijar
   umbrales. Sin eso, los umbrales de auto-colocación son una suposición.

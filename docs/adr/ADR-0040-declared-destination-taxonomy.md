@@ -1,25 +1,25 @@
 # ADR-0040 — Taxonomía de destino declarada por el perfil (2.0)
 
-**Estado:** Propuesta
-**Fecha:** 2026-07-29
-**Relacionada con:** RFC-0001 §26, §15.4; RFC-0002 (borrador); ADR-0019,
-ADR-0026, ADR-0037
+**Estado:** Aceptada (subsumida en RFC-0002 como mecanismo del paso 1)
+**Fecha:** 2026-07-29 (coordinación resuelta 2026-08-01)
+**Relacionada con:** RFC-0001 §26, §15.4; RFC-0002 §«El mecanismo: raíces
+declaradas»; ADR-0019, ADR-0026, ADR-0037
 
-> **Coordinación pendiente con RFC-0002.** Esta ADR se escribió sin conocer el
-> borrador de RFC-0002 (rama `design/rfc-0002-autonomy`, 2026-07-21), que ya
-> responde a la misma pregunta —dónde aterriza lo dudoso— con un diseño
-> distinto y más concreto: `revisar/` como **espejo del árbol de salida**, con
-> cada elemento en su mejor ubicación estimada, y el motivo como metadato en
-> lugar de carpeta. Ese diseño es mejor para lo que resuelve, porque hace que
-> aceptar una revisión sea mover de `revisar/<ruta>` a `output/<ruta>`.
+> **Coordinación con RFC-0002: resuelta.** Esta ADR se escribió sin conocer el
+> borrador de RFC-0002 (2026-07-21), y durante un tiempo pareció que las dos
+> competían por la misma pregunta. Leídas enteras, no: **RFC-0002 fija la
+> política** —qué forma tiene la salida— y **esta ADR el mecanismo** —cómo se
+> declara el conjunto de raíces que la componen. RFC-0002 no especifica el
+> mecanismo y lo necesita, porque su espejo de `revisar/` tiene que ser él mismo
+> una raíz declarada y sus nombres tienen que quedar reservados frente a los
+> orígenes.
 >
-> Lo que aporta esta ADR y RFC-0002 no cubre es el **mecanismo**: que el
-> conjunto de raíces sea declarado y cerrado en vez de tres constantes
-> incrustadas en un `match`. Un espejo de revisión también necesita ser una
-> raíz declarada. Antes de aceptar esta ADR hay que decidir si se subsume en
-> RFC-0002 como parte de su paso 1 o si se mantiene aparte; el código ya
-> commiteado es neutro respecto a esa decisión, porque preserva la salida 1.x
-> byte a byte.
+> Por eso esta ADR **se subsume en RFC-0002 como el mecanismo de su paso 1**, y
+> no se mantiene aparte. Las decisiones 1, 2, 3, 4 y 6 se conservan íntegras. La
+> **decisión 5 queda reemplazada** por el espejo de RFC-0002: ver más abajo.
+>
+> El código ya commiteado es neutro respecto a esta resolución, porque `generic`
+> preserva la salida 1.x byte a byte con un test que lo fija.
 
 ## Contexto
 
@@ -86,10 +86,20 @@ Dos hechos condicionan cómo se arregla:
    que un origen no pueda ensombrecer un contenedor operativo. Esa
    reserva pasa a calcularse sobre el conjunto declarado, que es dinámico.
 
-5. **Lo no clasificable va a la raíz de revisión, nunca a una inventada.**
-   Si ninguna regla del perfil reclama un archivo, cae en la bolsa de
-   criterio humano. La incertidumbre resuelve hacia conservar y hacia
-   señalar, como en el resto del motor.
+5. ~~**Lo no clasificable va a la raíz de revisión, nunca a una inventada.**~~
+   **Reemplazada por RFC-0002.** Se mantiene el principio —la incertidumbre
+   resuelve hacia conservar y hacia señalar, y nunca hacia una raíz inventada—
+   pero no la forma. Esta ADR trataba `revisar/` como una bolsa plana, y
+   RFC-0002 la define como **espejo del árbol de salida**: lo no clasificable va
+   a su mejor ubicación estimada dentro del espejo, con el motivo como metadato,
+   y solo cae en `revisar/_sin-ubicar/` cuando no hay ni apuesta de ubicación.
+
+   El motivo del cambio es concreto: en el espejo, aceptar una revisión es mover
+   de `revisar/<ruta>` a `output/<ruta>` —la ruta relativa ya está calculada— y
+   el revisor ve *junto a qué* iría cada elemento, que es el contexto que
+   necesita para decidir. Una bolsa plana pierde eso y convierte cada decisión en
+   una búsqueda. Sobre el corpus real la diferencia no es cosmética: la cola son
+   5.334 elementos.
 
 6. **Se sube el contrato, no se edita.** Schema de perfil `1.1.0` → `2.0.0`,
    migración nueva para la procedencia de enrutado, y la expectativa del test

@@ -1,6 +1,6 @@
 # Estado de la superficie agéntica
 
-**Última actualización:** 2026-07-29
+**Última actualización:** 2026-08-01
 **Rama:** `feat/agent-drivable-engine`
 
 Documento de coordinación, no de diseño. Existe porque este trabajo se ha
@@ -9,10 +9,11 @@ las otras existían. Si retomas el repo, lee esto primero.
 
 ## Dónde está el plan
 
-**El plan es [RFC-0002](../rfcs/RFC-0002-autonomy-ladder.md)**, borrador del
-2026-07-21, en la rama `design/rfc-0002-autonomy` (todavía sin fusionar).
-Define la escalera de autonomía L0 → L1 → L2 y su plan de adopción en cinco
-pasos, con cuatro ADR asociadas:
+**El plan es [RFC-0002](../rfcs/RFC-0002-autonomy-ladder.md)**, escrito el
+2026-07-21 y **aprobado el 2026-08-01**. Define la escalera de autonomía
+L0 → L1 → L2 y su plan de adopción en cinco pasos, con cuatro ADR asociadas
+—que siguen en Propuesta, porque aprobar el RFC fija la dirección, no los
+detalles:
 
 | ADR | Qué | Estado |
 | --- | --- | --- |
@@ -42,16 +43,30 @@ completa (450 tests, 0 fallos).
 `Actor::Agent` se implementó **sin conocer ADR-0043** y coincidió con lo
 diseñado. Coincidencia afortunada, no coordinación.
 
+## Conflictos resueltos
+
+**ADR-0040 frente a RFC-0002 — resuelto el 2026-08-01: se subsume.** No
+respondían a la misma pregunta. RFC-0002 fija la **política** (qué forma tiene
+la salida: `revisar/` como espejo del árbol de salida, cada elemento en su mejor
+ubicación estimada, el motivo como metadato); ADR-0040 fija el **mecanismo**
+(raíces declaradas y cerradas en vez de constantes en un `match`). RFC-0002
+necesitaba ese mecanismo y no lo especificaba: su espejo tiene que ser él mismo
+una raíz declarada y sus nombres tienen que quedar reservados frente a los
+orígenes.
+
+ADR-0040 pasa a **Aceptada, subsumida en RFC-0002 como mecanismo del paso 1**.
+Sus decisiones 1, 2, 3, 4 y 6 se conservan íntegras; la **5 queda reemplazada**
+por el espejo, porque trataba `revisar/` como bolsa plana.
+
+El código ya commiteado era **neutro** respecto a esa decisión —`generic`
+preserva la salida 1.x byte a byte, con test que lo fija—, así que la resolución
+no obliga a tocar nada de lo ya escrito.
+
+**RFC-0002 aprobada el 2026-08-01.** Deja de ser un borrador en una rama sin
+fusionar. Sus seis preguntas abiertas quedan atadas cada una al hito que no
+puede empezar sin ella; ninguna bloquea M2.1.
+
 ## Conflictos abiertos
-
-**ADR-0040 frente a RFC-0002.** Las dos responden a "dónde aterriza lo
-dudoso". RFC-0002 lo hace mejor: `revisar/` espejo del árbol de salida, con
-cada elemento en su mejor ubicación estimada, y el motivo como metadato. Lo
-que ADR-0040 aporta y RFC-0002 no cubre es el mecanismo: raíces declaradas y
-cerradas en vez de constantes en un `match`. Hay que decidir si se subsume.
-
-El código ya commiteado es **neutro** respecto a esa decisión: `generic`
-preserva la salida 1.x byte a byte, con test que lo fija.
 
 **La CLI no es la superficie diseñada.** ADR-0043 pone el vocabulario acotado
 en la frontera de transporte, con `df-tools` y un servidor MCP, precisamente
