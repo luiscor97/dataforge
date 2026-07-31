@@ -38,5 +38,8 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 df-db = { workspace = true, features = ["test-support"] }
+# Dev-only, and a cycle on purpose: `df-tools` is built on this facade, but its
+# tool names are a frozen contract and `frozen_contracts` is where those live.
+df-tools = { workspace = true }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
 tempfile = { workspace = true }

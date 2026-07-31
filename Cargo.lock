@@ -2233,6 +2233,7 @@ dependencies = [
  "df-scan",
  "df-search",
  "df-similarity",
+ "df-tools",
  "df-verifier",
  "ed25519-dalek",
  "hex",
@@ -2285,6 +2286,16 @@ dependencies = [
  "hex",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "df-mcp"
+version = "1.0.0"
+dependencies = [
+ "df-error",
+ "df-tools",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2459,6 +2470,17 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "df-tools"
+version = "1.0.0"
+dependencies = [
+ "df-error",
+ "df-facade",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

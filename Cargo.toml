@@ -20,12 +20,14 @@ members = [
     "crates/df-plugin",
     "crates/df-ai",
     "crates/df-facade",
+    "crates/df-tools",
     "apps/cli",
     "apps/desktop/src-tauri",
     "tools/df-corpus",
     "tools/df-extract-worker",
     "tools/df-query-worker",
     "tools/df-media-worker",
+    "tools/df-mcp",
 ]
 # The desktop shell is excluded from default builds because it needs the
 # platform webview toolchain; CI and `pnpm tauri build` cover it explicitly.
@@ -49,10 +51,12 @@ default-members = [
     "crates/df-plugin",
     "crates/df-ai",
     "crates/df-facade",
+    "crates/df-tools",
     "apps/cli",
     "tools/df-extract-worker",
     "tools/df-query-worker",
     "tools/df-media-worker",
+    "tools/df-mcp",
 ]
 
 [workspace.package]
@@ -84,6 +88,7 @@ df-media = { path = "crates/df-media", version = "1.0.0" }
 df-plugin = { path = "crates/df-plugin", version = "1.0.0" }
 df-ai = { path = "crates/df-ai", version = "1.0.0" }
 df-facade = { path = "crates/df-facade", version = "1.0.0" }
+df-tools = { path = "crates/df-tools", version = "1.0.0" }
 
 # External crates
 serde = { version = "1", features = ["derive"] }

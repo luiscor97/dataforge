@@ -18,12 +18,16 @@ use df_db::extraction::{
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
 use df_domain::{
-    Actor, ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus,
-    FileFingerprint, MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId,
-    SnapshotId, SourceRoot, TreeCloneSet,
+    ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus, FileFingerprint,
+    MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId, SnapshotId,
+    SourceRoot, TreeCloneSet,
 };
 use sha2::{Digest, Sha256};
 
+/// Re-exported for the same reason as [`DuplicatePolicy`]: every facade call
+/// that changes state takes an [`Actor`], so a client that cannot name one
+/// cannot use the facade without reaching past it to `df-domain`.
+pub use df_domain::Actor;
 /// Re-exported so clients can name a policy without depending on `df-domain`
 /// (RFC-0001 rules 16/17: clients only ever talk to the facade).
 pub use df_domain::DuplicatePolicy;
@@ -3789,6 +3793,23 @@ mod frozen_contracts {
         assert_eq!(
             df_ai::PROMPT_VERSION,
             "dataforge.assisted-intelligence-prompt/0.7.0"
+        );
+
+        // Agent tool surface (M2.1, ADR-0043 §4). Recorded here, next to every
+        // other frozen contract, rather than only in `df-tools`: external
+        // agents pin these names, so they belong in the one test whose job is
+        // to fail when a contract moves. The dependency is a dev-dependency
+        // cycle — `df-tools` sits on top of the facade — which Cargo permits
+        // precisely for this.
+        assert_eq!(
+            df_tools::TOOL_SURFACE_VERSION,
+            "dataforge.tool-surface/0.1.0"
+        );
+        assert_eq!(df_tools::TOOLS.len(), 23, "tool count");
+        assert_eq!(
+            df_tools::tools_with(df_tools::Capability::Commit).count(),
+            3,
+            "the gated class is approve, execute and verify — nothing else"
         );
     }
 }
