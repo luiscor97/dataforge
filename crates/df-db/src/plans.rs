@@ -329,10 +329,10 @@ pub fn insert_plan(
         tx.execute(
             "INSERT INTO plan_operations
                 (id, plan_id, sequence, operation_type, source_occurrence,
-                 content_id, destination_relative_path, confidence, risk,
-                 approval, execution_state, idempotency_key, reason,
-                 created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                 content_id, destination_relative_path, destination_root_id,
+                 confidence, risk, approval, execution_state, idempotency_key,
+                 reason, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
                 op.id.to_string(),
                 op.plan_id.to_string(),
@@ -341,6 +341,7 @@ pub fn insert_plan(
                 op.source_occurrence.map(|id| id.to_string()),
                 op.content_id.map(|id| id.to_string()),
                 op.destination_relative_path,
+                op.destination_root_id,
                 op.confidence,
                 op.risk.as_str(),
                 op.approval.as_str(),
@@ -438,8 +439,9 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
         .conn()
         .prepare(
             "SELECT id, plan_id, sequence, operation_type, source_occurrence,
-                    content_id, destination_relative_path, confidence, risk,
-                    approval, execution_state, idempotency_key, reason
+                    content_id, destination_relative_path, destination_root_id,
+                    confidence, risk, approval, execution_state,
+                    idempotency_key, reason
              FROM plan_operations WHERE plan_id = ?1 ORDER BY sequence",
         )
         .map_err(db_err)?;
@@ -453,12 +455,13 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, f64>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, f64>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
             ))
         })
         .map_err(db_err)?
@@ -471,6 +474,7 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
                 occurrence,
                 content,
                 destination,
+                destination_root,
                 confidence,
                 risk,
                 approval,
@@ -489,6 +493,7 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
                     .transpose()?,
                 content_id: content.as_deref().map(ContentId::from_str).transpose()?,
                 destination_relative_path: destination,
+                destination_root_id: destination_root,
                 confidence,
                 risk: RiskLevel::parse(&risk)?,
                 approval: ApprovalState::parse(&approval)?,
@@ -1453,6 +1458,7 @@ mod tests {
             source_occurrence: None,
             content_id: None,
             destination_relative_path: Some("origen".to_string()),
+            destination_root_id: Some("active".to_string()),
             confidence: 1.0,
             risk: RiskLevel::Low,
             approval: ApprovalState::Pending,

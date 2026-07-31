@@ -688,20 +688,37 @@ impl DestinationTaxonomy {
         self.roots.iter().filter_map(|root| root.folder)
     }
 
-    /// The root an operation type routes into, or `None` when it belongs in
-    /// the working archive.
-    pub fn folder_for(&self, operation_type: OperationType) -> Option<&'static str> {
+    /// The declared root an operation type routes into.
+    ///
+    /// `None` only if a profile declares a set that does not cover the type,
+    /// which `generic` never does.
+    pub fn root_for(&self, operation_type: OperationType) -> Option<&DestinationRoot> {
         let id = match operation_type {
             OperationType::CopyReview => "review",
             OperationType::CopySeparated => "separated",
             OperationType::CopyTemporary => "temporary",
             _ => "active",
         };
-        self.roots
-            .iter()
-            .find(|root| root.id == id)
-            .and_then(|root| root.folder)
+        self.roots.iter().find(|root| root.id == id)
     }
+
+    /// The folder an operation type routes into, or `None` when it belongs in
+    /// the working archive.
+    pub fn folder_for(&self, operation_type: OperationType) -> Option<&'static str> {
+        self.root_for(operation_type).and_then(|root| root.folder)
+    }
+}
+
+/// The declared root id to record against an operation (ADR-0040 §3).
+///
+/// `None` when the operation has no destination at all: an operation that
+/// copies nothing did not land anywhere, and naming a root for it would be
+/// inventing provenance rather than recording it.
+fn routed_root_id(operation_type: OperationType, destination: Option<&str>) -> Option<String> {
+    destination?;
+    DestinationTaxonomy::operational()
+        .root_for(operation_type)
+        .map(|root| root.id.to_string())
 }
 
 /// Turn a source component into a name which is safe to materialise on every
@@ -1035,6 +1052,7 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
             approval: ApprovalState::Pending,
             execution_state: initial_execution_state(operation_type),
             idempotency_key: idempotency_key(plan, None, operation_type, destination.as_deref()),
+            destination_root_id: routed_root_id(operation_type, destination.as_deref()),
             destination_relative_path: destination,
             reason,
         });
@@ -1274,6 +1292,10 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                             OperationType::CreateDirectory,
                             Some(&parent),
                         ),
+                        destination_root_id: routed_root_id(
+                            OperationType::CreateDirectory,
+                            Some(&parent),
+                        ),
                         destination_relative_path: Some(parent),
                         reason: "create the parent for a routed operational bucket".to_string(),
                     });
@@ -1297,6 +1319,7 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                 operation_type,
                 destination.as_deref(),
             ),
+            destination_root_id: routed_root_id(operation_type, destination.as_deref()),
             destination_relative_path: destination,
             reason,
         });
@@ -2045,6 +2068,7 @@ mod tests {
             source_occurrence: None,
             content_id: None,
             destination_relative_path: Some("..\\fuera.txt".to_string()),
+            destination_root_id: Some("active".to_string()),
             confidence: 1.0,
             risk: RiskLevel::Low,
             approval: ApprovalState::Pending,
