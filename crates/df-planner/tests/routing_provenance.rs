@@ -84,7 +84,8 @@ fn the_recorded_root_is_the_one_the_taxonomy_chose() {
         std::fs::write(origin.join("informe.txt"), b"contenido").unwrap();
     });
 
-    let taxonomy = DestinationTaxonomy::operational();
+    let profile = df_domain::Profile::load(df_domain::DEFAULT_PROFILE_ID).unwrap();
+    let taxonomy = DestinationTaxonomy::from_profile(&profile);
     for operation in operations(&db) {
         let Some(recorded) = operation.destination_root_id.as_deref() else {
             continue;
@@ -113,7 +114,8 @@ fn provenance_is_recorded_by_id_not_by_folder_name() {
         std::fs::write(origin.join("informe.txt"), b"contenido").unwrap();
     });
 
-    let folders: Vec<&str> = DestinationTaxonomy::operational()
+    let profile = df_domain::Profile::load(df_domain::DEFAULT_PROFILE_ID).unwrap();
+    let folders: Vec<&str> = DestinationTaxonomy::from_profile(&profile)
         .reserved_folders()
         .collect();
     for operation in operations(&db) {

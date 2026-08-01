@@ -26,8 +26,14 @@ use crate::{context::ContextKind, RuleDefinition};
 /// The declarative-profile schema identifier and version. Frozen for 1.0
 /// (M0.9): changing either requires a new version and an ADR, never an
 /// in-place edit.
+///
+/// `2.0.0` (M2.2, ADR-0040 §6) adds `destination_roots`. A **major** bump and
+/// not a minor one, even though `generic`'s output is unchanged: a 2.0 profile
+/// may declare roots a 1.x engine knows nothing about, and a 1.x engine would
+/// ignore the field and quietly produce different destination paths. Refusing
+/// to load is the only safe reading of a profile you cannot fully interpret.
 pub const PROFILE_SCHEMA: &str = "dataforge.profile";
-pub const PROFILE_SCHEMA_VERSION: &str = "1.1.0";
+pub const PROFILE_SCHEMA_VERSION: &str = "2.0.0";
 const SCHEMA: &str = PROFILE_SCHEMA;
 const SCHEMA_VERSION: &str = PROFILE_SCHEMA_VERSION;
 
@@ -99,6 +105,36 @@ pub struct ProtectedMarker {
     pub match_mode: MatchMode,
 }
 
+/// One destination root a profile declares (ADR-0040 §1).
+///
+/// Declared rather than hardcoded so that enriching the output does not mean
+/// growing a `match` in the planner — and so that the set is enumerable before
+/// a plan runs, which is what lets the reserved-name check see every root
+/// instead of the three that happened to be constants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationRootDef {
+    /// Stable identifier, independent of the folder name. This is what gets
+    /// persisted as routing provenance, so renaming `folder` never rewrites
+    /// the history of plans made before the rename.
+    pub id: String,
+    /// Literal directory name created under the output root. `null` routes to
+    /// the output root itself — the working archive.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Whether what lands here belongs to the working archive or is set aside
+    /// from it. Reports and presentation read this; routing does not.
+    #[serde(default)]
+    pub set_aside: bool,
+}
+
+/// The root ids the engine can route into, and therefore the ones every
+/// profile has to declare.
+///
+/// Checked at load time and fail-closed: a profile that omits one would send
+/// an operation to a root that does not exist, and the failure would surface
+/// as a broken plan over a real archive rather than as a rejected profile.
+pub const REQUIRED_DESTINATION_ROOTS: &[&str] = &["active", "review", "separated", "temporary"];
+
 /// A parsed, resolved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -118,9 +154,71 @@ pub struct Profile {
     /// every match remains evidence even when human review overrides it.
     #[serde(default)]
     pub rules: Vec<RuleDefinition>,
+    /// The destination roots this profile routes into, in presentation order.
+    ///
+    /// Not `#[serde(default)]`: a profile that forgot to declare them would
+    /// silently inherit whatever the engine assumed, which is the coupling
+    /// ADR-0040 exists to remove. `generic` declares exactly the four the 1.x
+    /// engine hardcoded, so its output is unchanged byte for byte.
+    pub destination_roots: Vec<DestinationRootDef>,
 }
 
 impl Profile {
+    /// Reject a declared root set the planner could not route with.
+    ///
+    /// Fail-closed on every count. A missing root would send an operation to a
+    /// place that does not exist; a duplicate id would make provenance
+    /// ambiguous; a duplicate folder would put two meanings in one directory;
+    /// and a folder name with a separator in it would escape the output root,
+    /// which is the one thing the filesystem boundary must never allow.
+    fn validate_destination_roots(&self) -> df_error::DfResult<()> {
+        let id = &self.id;
+        let mut ids = std::collections::HashSet::new();
+        let mut folders = std::collections::HashSet::new();
+        for root in &self.destination_roots {
+            if root.id.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares a destination root with an empty id"
+                )));
+            }
+            if !ids.insert(root.id.as_str()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares destination root `{}` more than once",
+                    root.id
+                )));
+            }
+            let Some(folder) = &root.folder else {
+                continue;
+            };
+            if folder.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` gives destination root `{}` an empty folder; use null for \
+                     the working archive",
+                    root.id
+                )));
+            }
+            if folder.contains(['/', '\\']) || folder.contains("..") {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares destination root folder `{folder}`, which is not a \
+                     single directory name"
+                )));
+            }
+            if !folders.insert(folder.to_lowercase()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` maps two destination roots onto folder `{folder}`"
+                )));
+            }
+        }
+        for required in REQUIRED_DESTINATION_ROOTS {
+            if !ids.contains(required) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` does not declare the required destination root `{required}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Load a built-in profile by id, resolving inheritance.
     ///
     /// Unknown ids are rejected. Falling back to [`DEFAULT_PROFILE_ID`] would
@@ -211,6 +309,7 @@ impl Profile {
                 )));
             }
         }
+        profile.validate_destination_roots()?;
         Ok(profile)
     }
 
@@ -466,5 +565,118 @@ mod tests {
             .rules
             .iter()
             .all(|rule| rule.action.operation_type().is_executable()));
+    }
+
+    /// A profile with a valid root set, to mutate in the rejection tests.
+    fn profile_with_roots(roots: Vec<DestinationRootDef>) -> Profile {
+        let mut profile = Profile::load(DEFAULT_PROFILE_ID).expect("generic loads");
+        profile.destination_roots = roots;
+        profile
+    }
+
+    fn root(id: &str, folder: Option<&str>) -> DestinationRootDef {
+        DestinationRootDef {
+            id: id.to_string(),
+            folder: folder.map(str::to_string),
+            set_aside: false,
+        }
+    }
+
+    fn full_set() -> Vec<DestinationRootDef> {
+        vec![
+            root("active", None),
+            root("review", Some("90_DataForge_Review")),
+            root("separated", Some("95_DataForge_Separated")),
+            root("temporary", Some("98_DataForge_Temporary")),
+        ]
+    }
+
+    #[test]
+    fn every_built_in_profile_declares_every_routable_root() {
+        // The planner routes by id. A profile missing one would send an
+        // operation to a root that does not exist, and over a real archive
+        // that surfaces as a broken plan rather than as a rejected profile.
+        for id in Profile::built_in_ids() {
+            let profile = Profile::load(id).unwrap_or_else(|e| panic!("profile `{id}`: {e}"));
+            for required in REQUIRED_DESTINATION_ROOTS {
+                assert!(
+                    profile
+                        .destination_roots
+                        .iter()
+                        .any(|root| root.id == *required),
+                    "profile `{id}` does not declare root `{required}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_required_root_is_rejected() {
+        let mut roots = full_set();
+        roots.retain(|root| root.id != "review");
+        let error = profile_with_roots(roots)
+            .validate_destination_roots()
+            .expect_err("a set without `review` cannot route a review copy");
+        assert!(error.to_string().contains("review"), "{error}");
+    }
+
+    #[test]
+    fn a_duplicate_root_id_is_rejected() {
+        // Two roots with one id make the recorded provenance ambiguous: the
+        // column would no longer identify where something landed.
+        let mut roots = full_set();
+        roots.push(root("review", Some("otra_carpeta")));
+        let error = profile_with_roots(roots)
+            .validate_destination_roots()
+            .expect_err("an id declared twice is ambiguous");
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn two_roots_cannot_share_one_folder() {
+        // Two meanings in one directory: nothing downstream could tell which
+        // root a file in it came from.
+        let mut roots = full_set();
+        roots.push(root("extra", Some("90_dataforge_review")));
+        let error = profile_with_roots(roots)
+            .validate_destination_roots()
+            .expect_err("two roots mapping onto one folder is ambiguous");
+        assert!(
+            error.to_string().contains("two destination roots"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_root_folder_must_be_a_single_directory_name() {
+        // The one that matters for safety: a folder carrying a separator or a
+        // parent reference would place a root outside the output root, which
+        // is the boundary the whole engine rests on.
+        for escaping in ["a/b", "a\\b", "..", "../fuera"] {
+            let mut roots = full_set();
+            roots.push(root("escapa", Some(escaping)));
+            let error = profile_with_roots(roots)
+                .validate_destination_roots()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("single directory name"),
+                "`{escaping}` was accepted as a root folder: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_folder_name_is_rejected_but_null_is_the_archive() {
+        let mut roots = full_set();
+        roots.push(root("vacia", Some("   ")));
+        assert!(profile_with_roots(roots)
+            .validate_destination_roots()
+            .is_err());
+
+        // `null` is how a root says "the output root itself", and `active`
+        // uses it, so it has to stay valid.
+        assert!(profile_with_roots(full_set())
+            .validate_destination_roots()
+            .is_ok());
     }
 }

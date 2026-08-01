@@ -3741,7 +3741,11 @@ mod frozen_contracts {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");
         }
         assert_eq!(df_domain::PROFILE_SCHEMA, "dataforge.profile");
-        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "1.1.0");
+        // 2.0.0 (M2.2, ADR-0040 §6) adds `destination_roots`. Major, not
+        // minor: a 2.0 profile may declare roots a 1.x engine knows nothing
+        // about, and a 1.x engine would ignore the field and quietly produce
+        // different destination paths.
+        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "2.0.0");
         assert_eq!(super::MARKER_SCHEMA_VERSION, "1.0.0");
 
         // Similarity (M0.3).
