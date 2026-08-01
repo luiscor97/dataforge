@@ -7,6 +7,10 @@ Documento de coordinación, no de diseño. Existe porque este trabajo se ha
 hecho desde varias sesiones en paralelo y una de ellas empezó sin saber que
 las otras existían. Si retomas el repo, lee esto primero.
 
+> Y después [hallazgos-2026-08-01.md](hallazgos-2026-08-01.md): mediciones,
+> la procedencia desconocida del score de representante, y el reencuadre de
+> M2.3 hacia «el agente propone un perfil» que está pendiente de decisión.
+
 ## Dónde está el plan
 
 **El plan es [RFC-0002](../rfcs/RFC-0002-autonomy-ladder.md)**, escrito el
