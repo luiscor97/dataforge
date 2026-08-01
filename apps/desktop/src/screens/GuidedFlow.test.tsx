@@ -13,6 +13,7 @@ import {
   hashProject,
   openProject,
   projectStatus,
+  scanProgress,
   scanProject,
   validatePlan,
   verifyProject,
@@ -31,6 +32,11 @@ vi.mock("../api", () => ({
   openProject: vi.fn(),
   projectStatus: vi.fn(),
   scanProject: vi.fn(),
+  // Missing from this factory, the screen's own `catch` swallowed Vitest's
+  // "no such export on the mock" error and every test still passed — with the
+  // progress counter never running once. An exhaustive factory has to stay
+  // exhaustive.
+  scanProgress: vi.fn(),
   validatePlan: vi.fn(),
   verifyProject: vi.fn(),
 }));
@@ -200,6 +206,46 @@ describe("GuidedFlow", () => {
       }),
     ).toBeDefined();
     expect(screen.getByText(/tus originales siguen intactos/i)).toBeDefined();
+  });
+
+  // --- The live scan counter ---------------------------------------------
+
+  // The engine reports no percentage, so the one honest thing to show while a
+  // long scan runs is the real count climbing. It has to actually appear.
+  test("shows the engine's real file count while the scan runs", async () => {
+    mockFreshReview({ files: 4321, folders: 12, scan_errors: 0 });
+    vi.mocked(scanProgress).mockResolvedValue({
+      files: 4321,
+      folders: 12,
+      bytes: 999,
+    });
+    // Hold the scan open so the polled stage is the one on screen.
+    let finishScan: (value: unknown) => void = () => {};
+    vi.mocked(scanProject).mockReturnValue(
+      new Promise((resolve) => {
+        finishScan = resolve;
+      }) as never,
+    );
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    // Grouped by `humanCount`, never `toLocaleString`: the runtime's locale
+    // data must not decide how a number the user is asked to trust is shaped.
+    expect(await screen.findByText(/4\.321 archivos vistos/)).toBeDefined();
+    finishScan({ errors: 0 });
+  });
+
+  test("a scan whose progress cannot be read still completes", async () => {
+    mockFreshReview({ files: 7, folders: 1, scan_errors: 0 });
+    vi.mocked(scanProgress).mockRejectedValue(new Error("database is locked"));
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    // The counter is a nicety; losing it must not cost the user the run.
+    await screen.findByRole("heading", { name: /esto he encontrado/i });
+    expect(vi.mocked(scanProject)).toHaveBeenCalledOnce();
   });
 
   // --- Resuming an interrupted run ---------------------------------------

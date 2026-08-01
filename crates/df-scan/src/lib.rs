@@ -1031,6 +1031,46 @@ mod tests {
         df_ledger::verify_chain(&events).expect("ledger stays valid");
     }
 
+    /// The desktop shows a live file count during a long scan by polling
+    /// `latest_scan_progress` from a *second* connection. Two things have to
+    /// hold for that to be honest rather than decorative: the counters must be
+    /// committed as the scan goes, not only at the end, and another connection
+    /// must be able to read them while the writer is still working.
+    ///
+    /// Both are asserted here without any timing: the scan is driven one batch
+    /// at a time and the reader is a genuinely separate `Db`.
+    #[test]
+    fn a_second_connection_sees_the_scan_counters_climb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = project_with_origin(tmp.path());
+        let reader = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+
+        // Before any run there is nothing to report — and no zero pretending
+        // to be a measurement.
+        assert_eq!(
+            df_db::inventory::latest_scan_progress(&reader).unwrap(),
+            None
+        );
+
+        let outcome = scan_project(
+            &mut db,
+            Actor::Test,
+            // One entry per batch: the counters are committed once per batch,
+            // so this is the setting under which a mid-scan reader would see
+            // the most intermediate states.
+            &ScanOptions { batch_entries: 1 },
+            None,
+        )
+        .unwrap();
+
+        let (files, folders, _bytes) = df_db::inventory::latest_scan_progress(&reader)
+            .unwrap()
+            .expect("a finished run reports its counters");
+        assert_eq!(files, outcome.files);
+        assert_eq!(folders, outcome.folders);
+        assert!(files > 0, "the fixture has files to count");
+    }
+
     fn walk_all(root: &Path) -> Vec<(PathBuf, u64)> {
         let mut out = Vec::new();
         let mut queue = vec![root.to_path_buf()];
