@@ -20,6 +20,16 @@ pub enum Actor {
     Cli,
     /// A human driving the desktop app.
     Desktop,
+    /// An autonomous agent (an LLM operator) driving the engine on a
+    /// human's behalf.
+    ///
+    /// Distinct from `Cli` on purpose. An agent can read the evidence and
+    /// propose decisions far faster than a person, which is useful — but a
+    /// ledger that cannot tell "a person decided this" from "a model decided
+    /// this" is worthless as an audit trail, and in an evidential archive
+    /// that distinction is the whole point. The safe action set is identical
+    /// for both: attribution records *who*, it never grants *more*.
+    Agent,
     /// Test code.
     Test,
 }
@@ -30,6 +40,7 @@ impl Actor {
             Self::System => "system",
             Self::Cli => "cli",
             Self::Desktop => "desktop",
+            Self::Agent => "agent",
             Self::Test => "test",
         }
     }
@@ -39,6 +50,7 @@ impl Actor {
             "system" => Ok(Self::System),
             "cli" => Ok(Self::Cli),
             "desktop" => Ok(Self::Desktop),
+            "agent" => Ok(Self::Agent),
             "test" => Ok(Self::Test),
             other => Err(df_error::DfError::Validation(format!(
                 "unknown actor `{other}`"

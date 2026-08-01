@@ -1,9 +1,11 @@
 import type {
   MediaRelationView,
+  PlanDestinationTree,
   ProjectStatus,
   SimilarityRelationView,
 } from "../types";
 import { ContentIntelligenceView } from "./ContentIntelligenceView";
+import { PlanTreeView } from "./PlanTreeView";
 import { type Stage, nextStage } from "./resume";
 
 const COUNT_FORMAT = new Intl.NumberFormat("es-ES");
@@ -156,6 +158,11 @@ interface StatusViewProps {
   onAnalyzeMedia?: () => void;
   /** Runs one stage of the reconstruction pipeline. */
   onRunStage?: (stage: Stage) => void;
+  /**
+   * Loads the projected output tree. Optional: without it the screen simply
+   * omits the preview rather than blocking the approval it belongs to.
+   */
+  onLoadPlanTree?: () => Promise<PlanDestinationTree>;
   onBack: () => void;
 }
 
@@ -166,6 +173,7 @@ export function StatusView({
   onAnalyzeSimilarity,
   onAnalyzeMedia,
   onRunStage,
+  onLoadPlanTree,
   onBack,
 }: StatusViewProps): React.JSX.Element {
   const diagnostics = status.structural_diagnostics ?? null;
@@ -235,6 +243,14 @@ export function StatusView({
       <div className="next-step">
         <h3>Siguiente paso</h3>
         <p>{nextStep.message}</p>
+        {/*
+          Approving freezes the manifest, so the projected output goes above
+          the button that does it, not in a screen the user has to go looking
+          for afterwards.
+        */}
+        {nextStep.action === "approve" && onLoadPlanTree !== undefined && (
+          <PlanTreeView load={onLoadPlanTree} />
+        )}
         {nextStep.action !== null &&
           nextStep.action in STAGE_STEPS &&
           (() => {

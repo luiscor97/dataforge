@@ -308,6 +308,17 @@ pub struct PlanOperation {
     pub content_id: Option<ContentId>,
     /// Destination, relative to the project output root.
     pub destination_relative_path: Option<String>,
+    /// Stable id of the declared destination root this operation was routed
+    /// into (ADR-0040 §3) — `active`, `review`, `separated`, `temporary`, or
+    /// whatever a profile declares.
+    ///
+    /// Recorded by id and not by folder name so that renaming a folder does
+    /// not rewrite the provenance of plans made before the rename.
+    ///
+    /// `None` means *not recorded*, never "the active root": operations
+    /// planned before migration 0020, and operations that copy nothing and so
+    /// have no destination at all.
+    pub destination_root_id: Option<String>,
     pub confidence: Confidence,
     pub risk: RiskLevel,
     pub approval: ApprovalState,

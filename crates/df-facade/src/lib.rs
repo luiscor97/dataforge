@@ -18,19 +18,26 @@ use df_db::extraction::{
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
 use df_domain::{
-    Actor, ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus,
-    FileFingerprint, MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId,
-    SnapshotId, SourceRoot, TreeCloneSet,
+    ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus, FileFingerprint,
+    MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId, SnapshotId,
+    SourceRoot, TreeCloneSet,
 };
 use sha2::{Digest, Sha256};
 
+/// Re-exported for the same reason as [`DuplicatePolicy`]: every facade call
+/// that changes state takes an [`Actor`], so a client that cannot name one
+/// cannot use the facade without reaching past it to `df-domain`.
+pub use df_domain::Actor;
 /// Re-exported so clients can name a policy without depending on `df-domain`
 /// (RFC-0001 rules 16/17: clients only ever talk to the facade).
 pub use df_domain::DuplicatePolicy;
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
-pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
+pub use df_db::analysis::{
+    AnomalyReport, ReviewClass, ReviewClassSummary, ReviewDecisionInput, ReviewItemView,
+    ReviewQueue, StructuralDiagnostics,
+};
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOptions;
 pub use df_executor::ExecuteOutcome;
@@ -2103,6 +2110,43 @@ pub fn create_plan(
     df_planner::create_plan(&mut db, actor, policy)
 }
 
+/// The output tree the current plan would produce, `depth` levels deep.
+///
+/// Read-only. Answers the question the counts cannot: *where does my data
+/// end up*. Available from `PLAN_READY` onwards, so the tree can be judged
+/// before approving a manifest that freezes it.
+pub fn plan_destination_tree(project_dir: &Path, depth: u32) -> DfResult<PlanDestinationTree> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let tree = df_db::plans::destination_tree(&db, plan.id, depth)?;
+    Ok(PlanDestinationTree {
+        plan_id: plan.id.to_string(),
+        version: plan.version,
+        output_root: project.output_root.display().to_string(),
+        files: tree.files,
+        directories: tree.directories,
+        bytes: tree.bytes,
+        without_destination: tree.without_destination,
+        nodes: tree
+            .nodes
+            .into_iter()
+            .map(|n| PlanDestinationNode {
+                prefix: n.prefix,
+                depth: n.depth,
+                files: n.files,
+                directories: n.directories,
+                bytes: n.bytes,
+                by_operation: n.by_operation,
+                sample: n.sample,
+            })
+            .collect(),
+    })
+}
+
 /// Re-run the §26.5 invariants against the stored current plan.
 pub fn validate_plan(project_dir: &Path) -> DfResult<PlanValidationReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2174,6 +2218,43 @@ pub fn verify_project_output(project_dir: &Path, actor: Actor) -> DfResult<Verif
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
     df_verifier::verify_project(&mut db, actor, &df_verifier::VerifyOptions::default())
+}
+
+/// One prefix of the projected output tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationNode {
+    /// Path relative to the output root.
+    pub prefix: String,
+    /// Path components in `prefix` (1 for a top-level root).
+    pub depth: u32,
+    /// Copies landing anywhere under this prefix.
+    pub files: u64,
+    /// Directories created under this prefix.
+    pub directories: u64,
+    /// Bytes the copies would write.
+    pub bytes: u64,
+    /// Copies by operation type, most frequent first.
+    pub by_operation: Vec<(String, u64)>,
+    /// A real destination path from this subtree.
+    pub sample: Option<String>,
+}
+
+/// What the current plan would produce on disk.
+///
+/// The plan already holds a destination for every occurrence; this only
+/// aggregates it. Reporting the shape of the output before it is frozen is
+/// what lets an approval be informed rather than blind.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationTree {
+    pub plan_id: String,
+    pub version: u32,
+    pub output_root: String,
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    /// Copies with no recorded destination. Surfaced, never hidden.
+    pub without_destination: u64,
+    pub nodes: Vec<PlanDestinationNode>,
 }
 
 /// Exact duplicate report of the latest snapshot (RFC-0001 §15).
@@ -2347,6 +2428,66 @@ fn non_overlapping_redundant_bytes(sets: &[TreeCloneSet]) -> u64 {
     redundant_bytes
 }
 
+/// Bytes held by subtrees a `TREE_EMBEDDED` relation proves carry nothing of
+/// their own, counting no nested subtree twice.
+///
+/// An embedded relation requires the contained side to have zero unique files
+/// — the schema enforces it — so every content under it also exists outside,
+/// and `shared_bytes` is that subtree's content weight. This is the strongest
+/// redundancy claim the engine can make short of a duplicate set, and until
+/// now nothing surfaced its size: answering "how much is provably collapsible"
+/// meant querying SQLite by hand.
+///
+/// Deliberately conservative, exactly like the clone-set estimate: nested
+/// contained subtrees collapse to their shallowest ancestor, so the figure may
+/// undercount and never overcounts. Evidence only — it proposes no action, and
+/// no policy consolidates on it today (ADR-0045 is where that is decided).
+fn non_overlapping_embedded_bytes(
+    relations: &[df_db::structure::TreeRelationView],
+) -> (u64, u64, u64) {
+    let mut candidates: Vec<(Vec<String>, u64, u64)> = Vec::new();
+    for relation in relations {
+        if relation.relationship != "TREE_EMBEDDED" {
+            continue;
+        }
+        // `contained` names which side is inside the other; it is not implied
+        // by the ordering of the pair.
+        let (path, files) = match relation.contained.as_deref() {
+            Some("A") => (&relation.path_a, relation.shared_files),
+            Some("B") => (&relation.path_b, relation.shared_files),
+            // A relation without a contained side is not an embedding we can
+            // read, so it contributes nothing rather than a guess.
+            _ => continue,
+        };
+        candidates.push((clone_path_components(path), relation.shared_bytes, files));
+    }
+
+    // One folder can be the contained side of several relations; keep it once.
+    candidates.sort_by(|left, right| {
+        left.0
+            .len()
+            .cmp(&right.0.len())
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.dedup_by(|left, right| left.0 == right.0);
+
+    let mut selected = Vec::<Vec<String>>::new();
+    let (mut bytes, mut files) = (0_u64, 0_u64);
+    for (components, subtree_bytes, subtree_files) in candidates {
+        if selected
+            .iter()
+            .any(|path| clone_paths_overlap(path, &components))
+        {
+            continue;
+        }
+        bytes = bytes.saturating_add(subtree_bytes);
+        files = files.saturating_add(subtree_files);
+        selected.push(components);
+    }
+    (selected.len() as u64, files, bytes)
+}
+
 /// Compute the exact tree-clone report of the latest complete snapshot.
 pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2381,6 +2522,25 @@ pub struct TreeRelationReport {
     pub embedded: u64,
     /// Pairs whose only meaningful overlap is a repeated component.
     pub repeated_components: u64,
+    /// Contained subtrees counted once, ancestors absorbing descendants.
+    pub embedded_contained_folders: u64,
+    /// Distinct contents shared by those subtrees with their outer tree.
+    /// Not a file count of the subtree: a subtree that holds the same content
+    /// twice contributes it once.
+    pub embedded_contained_files: u64,
+    /// Bytes of those distinct shared contents — the strongest redundancy
+    /// claim short of a duplicate set, since every one of them also exists
+    /// outside the contained subtree.
+    ///
+    /// A **lower bound** on what collapsing would avoid writing, twice over:
+    /// nested subtrees collapse into their ancestor, and internal duplication
+    /// inside a subtree is counted once here while a plan would copy it once
+    /// per occurrence. Erring low is deliberate — the same discipline as the
+    /// clone-set estimate — because overstating a saving is how a user ends
+    /// up surprised by a destination that does not fit.
+    ///
+    /// Still evidence: no policy consolidates on it today (ADR-0045).
+    pub embedded_redundant_bytes: u64,
     pub relations: Vec<df_db::structure::TreeRelationView>,
 }
 
@@ -2406,11 +2566,16 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
         .iter()
         .filter(|r| r.relationship == "REPEATED_COMPONENT_ONLY")
         .count() as u64;
+    let (embedded_contained_folders, embedded_contained_files, embedded_redundant_bytes) =
+        non_overlapping_embedded_bytes(&relations);
     Ok(TreeRelationReport {
         snapshot_id: snapshot.id.to_string(),
         partial_clones,
         embedded,
         repeated_components,
+        embedded_contained_folders,
+        embedded_contained_files,
+        embedded_redundant_bytes,
         relations,
     })
 }
@@ -2468,6 +2633,23 @@ pub fn structural_review_queue(project_dir: &Path) -> DfResult<ReviewQueue> {
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
+/// The review queue grouped by question rather than listed by item.
+///
+/// The flat queue is the wrong first call over a real archive: it returns
+/// thousands of rows that are mostly the same question repeated. This returns
+/// one row per class, ordered by how many decisions each would settle, so the
+/// shortest path to an empty review bucket is the first line of output.
+pub fn structural_review_classes(project_dir: &Path) -> DfResult<ReviewClassSummary> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::review_class_summary(&db, snapshot.id)
+}
+
 /// Append a review decision before planning. Decisions after a plan exists
 /// would not change that immutable plan, so they are rejected explicitly.
 pub fn decide_structural_review(
@@ -2491,6 +2673,34 @@ pub fn decide_structural_review(
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
     ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     df_db::analysis::decide_review_item(&mut db, project.id, item_id, decision, rationale, actor)?;
+    df_db::analysis::review_queue(&db, snapshot.id)
+}
+
+/// Append many review decisions atomically.
+///
+/// The queue over a real archive runs to thousands of items, most of them
+/// repetitions of a few questions, which is exactly the shape an agent can
+/// answer in one pass. Each decision keeps its own rationale and its own
+/// ledger event; the batch only removes the need for one process per item.
+pub fn decide_structural_review_batch(
+    project_dir: &Path,
+    decisions: &[ReviewDecisionInput],
+    actor: Actor,
+) -> DfResult<ReviewQueue> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    if project.state != ProjectState::Analyzed {
+        return Err(DfError::Validation(format!(
+            "review decisions require ANALYZED state before planning (current {})",
+            project.state
+        )));
+    }
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::decide_review_items(&mut db, project.id, decisions, actor)?;
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
@@ -2525,6 +2735,82 @@ pub fn verify_audit(project_dir: &Path) -> DfResult<AuditReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embedded(
+        contained_path: &str,
+        outer_path: &str,
+        files: u64,
+        bytes: u64,
+    ) -> df_db::structure::TreeRelationView {
+        df_db::structure::TreeRelationView {
+            path_a: contained_path.to_owned(),
+            path_b: outer_path.to_owned(),
+            relationship: "TREE_EMBEDDED".to_string(),
+            contained: Some("A".to_string()),
+            shared_files: files,
+            // The schema forbids unique content on the contained side; that
+            // is precisely what makes the claim provable.
+            unique_a_files: 0,
+            unique_b_files: 3,
+            shared_bytes: bytes,
+            similarity: 1.0,
+        }
+    }
+
+    /// The size of a provable redundancy, counted once. Two nested contained
+    /// subtrees are one opportunity, not two, and reporting the sum would
+    /// overstate what collapsing them recovers.
+    #[test]
+    fn nested_contained_subtrees_are_counted_once() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz", 10, 1_000),
+            embedded(r"raiz\copia\dentro", r"raiz", 4, 400),
+        ];
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1, "the descendant is absorbed by its ancestor");
+        assert_eq!(files, 10);
+        assert_eq!(bytes, 1_000, "never the 1.400 of the naive sum");
+    }
+
+    /// One folder can be the contained side of several relations — embedded
+    /// in two different outer trees — and it is still one folder.
+    #[test]
+    fn a_folder_contained_twice_is_still_one_opportunity() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz\a", 10, 1_000),
+            embedded(r"raiz\copia", r"raiz\b", 10, 1_000),
+        ];
+        let (folders, _, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1);
+        assert_eq!(bytes, 1_000);
+    }
+
+    /// Only embeddings count. A partial clone has unique content on both
+    /// sides — dropping either loses data (§19.4) — so it must never appear
+    /// in a figure that describes what is safe to collapse.
+    #[test]
+    fn partial_clones_contribute_nothing_to_the_provable_figure() {
+        let mut partial = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        partial.relationship = "PARTIAL_TREE_CLONE".to_string();
+        partial.contained = None;
+        partial.unique_a_files = 2;
+
+        let mut repeated = embedded(r"raiz\c", r"raiz\d", 5, 500);
+        repeated.relationship = "REPEATED_COMPONENT_ONLY".to_string();
+        repeated.contained = None;
+
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&[partial, repeated]);
+        assert_eq!((folders, files, bytes), (0, 0, 0));
+    }
+
+    /// An embedding whose contained side is not recorded is not readable as
+    /// an embedding, so it contributes nothing rather than a guess.
+    #[test]
+    fn an_embedding_without_a_contained_side_is_skipped() {
+        let mut orphan = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        orphan.contained = None;
+        assert_eq!(non_overlapping_embedded_bytes(&[orphan]), (0, 0, 0));
+    }
 
     fn clone_set(tag: char, folders: &[&str], subtree_bytes: u64) -> TreeCloneSet {
         TreeCloneSet {
@@ -3447,15 +3733,19 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 19, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 20, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[18].name, "incremental_reuse");
+        assert_eq!(df_db::migrations::MIGRATIONS[19].name, "routing_provenance");
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");
         }
         assert_eq!(df_domain::PROFILE_SCHEMA, "dataforge.profile");
-        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "1.1.0");
+        // 2.0.0 (M2.2, ADR-0040 §6) adds `destination_roots`. Major, not
+        // minor: a 2.0 profile may declare roots a 1.x engine knows nothing
+        // about, and a 1.x engine would ignore the field and quietly produce
+        // different destination paths.
+        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "2.0.0");
         assert_eq!(super::MARKER_SCHEMA_VERSION, "1.0.0");
 
         // Similarity (M0.3).
@@ -3507,6 +3797,46 @@ mod frozen_contracts {
         assert_eq!(
             df_ai::PROMPT_VERSION,
             "dataforge.assisted-intelligence-prompt/0.7.0"
+        );
+
+        // Agent tool surface (M2.1, ADR-0043 §4). Recorded here, next to every
+        // other frozen contract, rather than only in `df-tools`: external
+        // agents pin these names, so they belong in the one test whose job is
+        // to fail when a contract moves. The dependency is a dev-dependency
+        // cycle — `df-tools` sits on top of the facade — which Cargo permits
+        // precisely for this.
+        assert_eq!(
+            df_tools::TOOL_SURFACE_VERSION,
+            "dataforge.tool-surface/0.2.0"
+        );
+        assert_eq!(df_tools::TOOLS.len(), 25, "tool count");
+
+        // Deterministic gate (M2.4, ADR-0041). The hard-boundary count is
+        // frozen alongside the schema: turning an invariant into a tunable
+        // parameter is exactly the change this test exists to catch.
+        assert_eq!(
+            df_rules::RULE_SET_SCHEMA_VERSION,
+            "dataforge.rule-set/0.1.0"
+        );
+        assert_eq!(df_rules::HARD_BOUNDARY_COUNT, 4);
+
+        // Consent by policy (M2.5, ADR-0042). A caller that pins this version
+        // is pinning what a single human approval is allowed to authorise.
+        assert_eq!(
+            df_ai::DISCLOSURE_POLICY_SCHEMA_VERSION,
+            "dataforge.ai-disclosure-policy/0.1.0"
+        );
+
+        // Agent run loop (M2.6, ADR-0044).
+        assert_eq!(
+            df_agent::AGENT_RUN_SCHEMA_VERSION,
+            "dataforge.agent-run/0.1.0"
+        );
+        assert_eq!(df_agent::Stage::ORDER.len(), 10, "run stages");
+        assert_eq!(
+            df_tools::tools_with(df_tools::Capability::Commit).count(),
+            3,
+            "the gated class is approve, execute and verify — nothing else"
         );
     }
 }

@@ -221,11 +221,11 @@ intacto, ruta preservada bit a bit).
 #### El mecanismo: raíces declaradas (subsume ADR-0040)
 
 Este RFC dice qué **forma** tiene la salida; no dice cómo se declara el conjunto
-de carpetas raíz que la componen. Hoy son tres constantes incrustadas en un
+de carpetas raíz que la componen. Eran tres constantes incrustadas en un
 `match` sobre el tipo de operación. [ADR-0040](../adr/ADR-0040-declared-destination-taxonomy.md)
 resuelve exactamente eso y **se adopta aquí como el mecanismo del paso 1**.
-(ADR-0040 y su implementación aterrizan con la PR #45; hasta que se fusione,
-este enlace no resuelve.)
+Implementado en M2.2: las raíces las declara el perfil, y el schema subió a
+`2.0.0` por ello.
 
 - Las raíces las **declara el perfil**, con id estable y nombre literal, en vez
   de una constante. El espejo de `revisar/` y sus buckets técnicos son ellos

@@ -34,10 +34,12 @@
 | [ADR-0037](ADR-0037-frozen-contracts.md) | Contratos congelados y su test de regresión (M0.9) | Aceptada |
 | [ADR-0038](ADR-0038-reproducible-release-linking.md) | Linkado reproducible de release (M0.9) | Aceptada |
 | [ADR-0039](ADR-0039-keyless-release-signing.md) | Firma de release keyless (Sigstore) (M0.9) | Aceptada |
+| [ADR-0040](ADR-0040-declared-destination-taxonomy.md) | Taxonomía de destino declarada por el perfil (M2.2) | Aceptada (subsumida en RFC-0002) |
 | [ADR-0041](ADR-0041-df-rules-canonical-recovery.md) | `df-rules`: autoridad determinista del gate (M2.4) | Propuesta |
 | [ADR-0042](ADR-0042-consent-by-policy.md) | Consentimiento por política con presupuesto (M2.5) | Propuesta |
 | [ADR-0043](ADR-0043-facade-tool-surface.md) | Superficie de herramientas: `df-tools` + `df-mcp` (M2.1) | Propuesta |
 | [ADR-0044](ADR-0044-df-agent-loop.md) | `df-agent`: el bucle de orquestación (M2.6) | Propuesta |
+| [ADR-0045](ADR-0045-embedded-tree-duplicates.md) | Un duplicado en un árbol probadamente contenido no es contexto desconocido (M2.3) | Propuesta |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).
@@ -49,4 +51,5 @@ a la evolución hacia 1.0. Cuando dos ramas de trabajo
 proponen el mismo número, cede la que aún no está publicada (el tag manda).
 
 0040+ corresponden a la evolución hacia 2.0 (RFC-0002, hitos M2.1–M2.6). Las
-ADR-0040 y 0045 aterrizan con la PR #45 y por eso aún no figuran arriba.
+0041–0044 fueron reservadas por RFC-0002 antes de existir como ficheros; el
+índice vuelve a estar completo desde que su rama de diseño se fusionó.
