@@ -78,12 +78,31 @@ Que un agente pueda conducir el motor sin acoplarse a la ABI de Rust.
   la fachada: ni FS arbitrario, ni SQL crudo, ni shell.
 - Nombres y esquemas entran en `frozen_contracts`; cambios solo aditivos.
 
-**Hecho ya:** `Actor::Agent` distinguible en el ledger (ADR-0043 §3);
-`review decide-batch` atómico con un evento por decisión; `plan tree`.
+**Estado: completo (2026-08-01).** `Actor::Agent` distinguible en el ledger
+(ADR-0043 §3); `review decide-batch` atómico con un evento por decisión;
+`plan tree`; y los dos crates.
 
-**Pendiente:** los dos crates. La CLI **no** sustituye la superficie: un
-agente con la CLI tiene el shell, que es exactamente lo que ADR-0043 evita
-poniendo el vocabulario en la frontera de transporte.
+`df-tools` expone 23 herramientas —11 `observe`, 9 `build`, 3 `commit`— y
+rechaza cualquier nombre ausente del registro, de modo que una herramienta no
+puede existir por ser alcanzable sin estar declarada.
+`Capability::requires_authorization` es propiedad de la **clase** y no de la
+herramienta: una puerta que enumerase herramientas fallaría abierta el día que
+se añade una y nadie actualiza la lista. Hoy no hay puerta —ADR-0041 sigue en
+Propuesta—, así que la costura queda declarada y sin efecto.
+
+`df-mcp` habla JSON-RPC 2.0 por stdio, sin red ni estado de sesión. El actor
+**no es un parámetro**: todo se atribuye a `Actor::Agent`, porque una
+atribución que el llamante elige no es atribución. El protocolo se implementó
+directamente, sin SDK — que resuelve la deuda (b) de ADR-0043: cero
+dependencias nuevas en un workspace que fija versiones y corre `cargo deny`.
+
+`TOOL_SURFACE_VERSION` y el recuento de herramientas entran en
+`frozen_contracts`, lo que obliga a un ciclo de dev-dependency que Cargo
+permite justamente para esto.
+
+**Deuda declarada:** `search_project_content` y `query_project_content`
+pertenecen a la clase `observe` en ADR-0043 y aún no están expuestas; sus
+entradas son más ricas y merecen esquema propio. Añadirlas es aditivo.
 
 ### M2.2 — Taxonomía de destino
 
@@ -102,8 +121,42 @@ RFC-0002 como mecanismo del paso 1** (resuelto el 2026-08-01).
 **Contratos que se mueven:** schema de perfil `1.1.0` → `2.0.0`; migración
 append-only para la procedencia de enrutado.
 
-**Hecho ya:** `DestinationTaxonomy`, preservando la salida 1.x byte a byte con
-test que lo fija.
+**Estado: mecanismo completo (2026-08-01); dos puntos aplazados con motivo.**
+
+Hecho: las raíces las **declara el perfil** (`destination_roots`), no una
+constante, y `DestinationTaxonomy` las lee prestadas — el enrutado corre una
+vez por operación y un plan real tiene cientos de miles. `generic` y `legal`
+declaran las cuatro raíces que la 1.x llevaba incrustadas, con los mismos
+nombres, así que la salida no se mueve ni un byte; el test que lo fija ahora
+lee **el perfil que se envía** en vez de una constante, de modo que editar
+`profiles/generic/profile.json` lo rompe.
+
+`Profile::load` rechaza *fail-closed* un conjunto de raíces con el que el
+planificador no podría enrutar: raíz requerida ausente, id duplicado, dos
+raíces sobre una carpeta, o un nombre de carpeta con separador o `..` — este
+último es el que importa de verdad, porque colocaría una raíz **fuera del
+output root**.
+
+La procedencia de enrutado se persiste en `plan_operations`
+(migración 0020, ADR-0040 §3), por **id de raíz y no por nombre de carpeta**,
+para que renombrar una carpeta no reescriba la procedencia de los planes
+anteriores. `NULL` significa *no registrado*, nunca «raíz activa». No entra en
+el manifiesto congelado: va al lado de la operación como evidencia, igual que
+`reason`, así que el digest sigue siendo el de 1.x.
+
+**Aplazado, y no por falta de tiempo:** el hueco `revisar/_sin-ubicar/` y los
+buckets técnicos. Hoy **nada los escribiría**. `_sin-ubicar/` necesita un caso
+sin ubicación estimada, que no existe hasta que haya clasificación (M2.3);
+`_ilegible/` y `_verificacion-fallida/` los llena el executor o el verificador
+ante un fallo de disco, que es robustez de M2.6. Declarar carpetas que nadie
+usa es funcionalidad simulada (CONTRIBUTING) y adelantar hito (regla 7).
+
+La propiedad del espejo, en cambio, **ya se cumple**: una copia a revisión
+aterriza en `<raíz de revisión>/<misma ruta que tendría en la salida>` y el
+motivo ya viaja como metadato en `reason`, no como carpeta. Aceptar una
+revisión ya es mover de `revisar/<ruta>` a `output/<ruta>`. Lo que M2.3 añade
+es que esa «misma ruta» deje de ser la del origen y pase a ser la que la
+clasificación estime.
 
 ### M2.3 — Clasificación
 

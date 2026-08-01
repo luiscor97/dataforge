@@ -29,7 +29,8 @@ a `revisar/` y el run no se detiene nunca.
 ## Qué está ya implementado
 
 Todo esto está en `feat/agent-drivable-engine` y pasa la puerta de calidad
-completa (450 tests, 0 fallos).
+completa (399 tests en macOS, 0 fallos; la cifra de Windows es mayor porque
+112 puntos del workspace están gateados por plataforma).
 
 | Pieza | Sitio en RFC-0002 |
 | --- | --- |
@@ -38,7 +39,10 @@ completa (450 tests, 0 fallos).
 | `review decide-batch`, atómico, un evento por decisión | No previsto; encaja como capacidad `build` |
 | `plan tree`: el árbol de salida antes de aprobar | No previsto; precondición práctica del paso 1 |
 | `hash --resume-interrupted` | Robustez de disco lento (RFC-0002 §robustez) |
-| `DestinationTaxonomy` (ADR-0040) | Ver conflicto abajo |
+| `DestinationTaxonomy` leída del perfil (ADR-0040) | Mecanismo del paso 1, subsumido |
+| `df-tools`: 23 herramientas en tres clases de capacidad | **ADR-0043 §1** |
+| `df-mcp`: servidor MCP por stdio, sin red ni SDK | **ADR-0043 §2** |
+| Procedencia de enrutado por operación (migración 0020) | ADR-0040 §3 |
 
 `Actor::Agent` se implementó **sin conocer ADR-0043** y coincidió con lo
 diseñado. Coincidencia afortunada, no coordinación.
@@ -76,10 +80,18 @@ shell.
 
 ## Qué NO existe todavía
 
-- `df-rules`, `df-tools`, `df-mcp`, `df-agent`: ninguno de los cuatro crates.
+- `df-rules` y `df-agent`: dos de los cuatro crates. `df-tools` y `df-mcp` ya
+  existen (M2.1, 2026-08-01).
 - Clasificación semántica: el motor sigue enrutando por tipo de operación.
+  Es M2.3, y es la precondición de la deduplicación, no una mejora de orden.
 - La procedencia extendida del gate autónomo (regla, política, confianza,
-  proveedor) que RFC-0002 sella en la transacción del congelado.
+  proveedor) que RFC-0002 sella en la transacción del congelado. La de
+  enrutado —qué raíz eligió el planificador— sí existe desde la migración
+  0020; son cosas distintas.
+- El gate en sí: `Capability::requires_authorization` marca las tres
+  herramientas `commit`, pero nada lo consulta todavía. La costura está
+  declarada para que la clasificación quede fijada antes de que algo dependa
+  de ella.
 
 ## Referencia de corpus
 
