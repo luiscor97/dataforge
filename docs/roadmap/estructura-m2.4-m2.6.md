@@ -111,6 +111,14 @@ migración 0021 sube el recuento a 21 (ADR-0037 §2).
 Extiende ADR-0034. No es un crate nuevo: vive donde ya vive el consentimiento,
 en `df-ai` y su almacén, más la auditoría en `df-db`.
 
+> **Puesto ya (2026-08-01):** `df-ai::policy` — `DisclosurePolicy`, `Budget`,
+> `Consumption`, `authorize`, con digest canónico. 11 tests.
+> `DISCLOSURE_POLICY_SCHEMA_VERSION` en `frozen_contracts`.
+>
+> **Falta:** persistir política y auditoría de consumo (migración 0022) y
+> conectar `authorize` a la ruta de transporte, que sigue usando el token por
+> petición de ADR-0034.
+
 ### Superficie
 
 ```
@@ -150,6 +158,14 @@ Migración **0022**: política, su digest, y la auditoría de invocación.
 El bucle completo. Crate nuevo `crates/df-agent`, y **conduce el motor por
 `df-tools`**, no por la fachada directamente: si el agente propio se saltara su
 propia superficie, la frontera de M2.1 no probaría nada.
+
+> **Puesto ya (2026-08-01):** la lógica de decisión sin E/S — `Stage` con orden
+> obligado, `AgentBudget`, `RunTally`, `assess`, `RunMode`. 11 tests, incluido
+> `the_loop_can_never_block`, que es donde habría que defender cualquier
+> variante futura que espere a un humano.
+>
+> **Falta:** conducir el motor por `df-tools`, pre-vuelo de espacio, los buckets
+> técnicos, reanudación desde el manifiesto e informe origen→destino.
 
 ### El ciclo
 

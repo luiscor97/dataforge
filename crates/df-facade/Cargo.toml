@@ -44,5 +44,6 @@ df-tools = { workspace = true }
 # Dev-only: its schema and boundary count are frozen contracts, and
 # `frozen_contracts` is where those live. No cycle — df-rules sits below.
 df-rules = { workspace = true }
+df-agent = { workspace = true }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
 tempfile = { workspace = true }

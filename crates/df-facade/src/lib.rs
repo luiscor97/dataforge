@@ -3826,6 +3826,13 @@ mod frozen_contracts {
             df_ai::DISCLOSURE_POLICY_SCHEMA_VERSION,
             "dataforge.ai-disclosure-policy/0.1.0"
         );
+
+        // Agent run loop (M2.6, ADR-0044).
+        assert_eq!(
+            df_agent::AGENT_RUN_SCHEMA_VERSION,
+            "dataforge.agent-run/0.1.0"
+        );
+        assert_eq!(df_agent::Stage::ORDER.len(), 10, "run stages");
         assert_eq!(
             df_tools::tools_with(df_tools::Capability::Commit).count(),
             3,

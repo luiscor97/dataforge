@@ -298,6 +298,33 @@ que hoy sigue usando el token por petición de ADR-0034.
 
 ### M2.6 — `df-agent`
 
+**Estado: lógica de decisión implementada (2026-08-01)**, en `crates/df-agent`.
+Las fases, los presupuestos y el cortacircuitos, sin E/S, con 11 tests.
+
+Lo que fija el crate es **la garantía de no-bloqueo**. `assess` no puede
+devolver «para y espera»: su peor respuesta es `DegradeToReview`, que significa
+*manda lo que queda a `revisar/` y pasa a la fase siguiente*. Duda, ambigüedad,
+presupuesto agotado y cortacircuitos disparado resuelven todos igual, porque un
+run que se detiene a esperar a un humano en un disco lento sigue sin terminar
+dos días después — que es justo el fallo que RFC-0002 vino a quitar. Hay un
+test, `the_loop_can_never_block`, que lo prueba contra entradas extremas y que
+es donde habría que defender cualquier variante futura que espere.
+
+El orden de fases es un tipo, no una convención: `writes_to_destination()` es
+falso hasta `Execute`, así que «pensar antes de copiar» se comprueba en vez de
+documentarse. Un dry-run llega hasta `Freeze` incluido — uno que no congelara
+estaría previsualizando un plan que aún puede cambiar, que no es lo que se
+quiere ver.
+
+El cortacircuitos tiene **suelo de muestra**: sin él, el primer elemento ambiguo
+de un run es una tasa del 100% y salta con evidencia de uno. Y la comparación es
+estrictamente mayor, no mayor-o-igual: un umbral de 0,35 significa «hasta un 35%
+es aceptable», que es como lo lee cualquiera que lo configure.
+
+**Pendiente del hito:** conducir de verdad el motor por `df-tools`, el pre-vuelo
+de espacio, los buckets `revisar/_ilegible/` y `revisar/_verificacion-fallida/`,
+la reanudación desde el manifiesto y el informe origen→destino exportable.
+
 [ADR-0044]. El bucle completo: intención → plan → reglas → congelar → ejecutar
 → verificar → informe. Con presupuestos, cortacircuitos por tasa de
 ambigüedad, modo dry-run y mapa origen→destino exportable.
