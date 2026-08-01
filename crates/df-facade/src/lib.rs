@@ -3819,6 +3819,13 @@ mod frozen_contracts {
             "dataforge.rule-set/0.1.0"
         );
         assert_eq!(df_rules::HARD_BOUNDARY_COUNT, 4);
+
+        // Consent by policy (M2.5, ADR-0042). A caller that pins this version
+        // is pinning what a single human approval is allowed to authorise.
+        assert_eq!(
+            df_ai::DISCLOSURE_POLICY_SCHEMA_VERSION,
+            "dataforge.ai-disclosure-policy/0.1.0"
+        );
         assert_eq!(
             df_tools::tools_with(df_tools::Capability::Commit).count(),
             3,

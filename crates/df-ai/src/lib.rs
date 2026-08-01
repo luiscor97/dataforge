@@ -8,12 +8,17 @@
 #![forbid(unsafe_code)]
 
 mod engine;
+mod policy;
 mod provider;
 mod redaction;
 mod schema;
 mod types;
 
 pub use engine::{AssistanceEngine, PrepareError, PreparedAssistance};
+pub use policy::{
+    authorize, Budget, Consumption, DisclosurePolicy, PolicyDecision, RefusalReason,
+    DISCLOSURE_POLICY_SCHEMA_VERSION,
+};
 pub use provider::{
     CloudProvider, CloudTransport, LocalProcessProvider, Provider, ProviderFailure,
 };

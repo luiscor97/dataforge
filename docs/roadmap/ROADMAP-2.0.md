@@ -269,6 +269,33 @@ de divulgación con presupuesto de llamadas, tokens y gasto. Agotado el
 presupuesto, lo ambiguo restante va a `revisar/`: degrada, no bloquea, no
 dispara la factura. La clave sigue en el almacén de credenciales del sistema.
 
+**Estado: decisión implementada (2026-08-01)**, en `df-ai::policy`. ADR-0034
+pide aprobación humana **por petición**, que es correcto cuando hay alguien
+delante e inviable en un run autónomo: una cola de 5.334 elementos no se aprueba
+de prompt en prompt, y un run que se para a preguntar es un run que no termina.
+
+Tres propiedades, cada una con test:
+
+- **Se audita antes de tocar la clave o la red.** `authorize` es una decisión
+  pura sobre el manifiesto y el consumo acumulado, y devuelve antes de enviar
+  nada. Auditar después registraría una divulgación ya ocurrida — eso es un
+  log, no un control.
+- **Agotado degrada, no rechaza.** `Exhausted` y `Refused` son cosas distintas
+  a propósito: el primero significa «manda el resto a `revisar/` y sigue», el
+  segundo «esto nunca estuvo permitido».
+- **Un campo fuera de la política se rechaza, no se recorta.** Recortarlo
+  enviaría *algo* que el humano no aprobó mientras el digest seguiría diciendo
+  que describe lo pactado.
+
+Dos detalles que costaría caro equivocar: el presupuesto se comprueba contra el
+total que la invocación **produciría**, no contra el ya gastado, así que la
+llamada que cruzaría la línea no la cruza; y `0` significa «no permitido», nunca
+«ilimitado» — un presupuesto que nadie fijó no puede ser un presupuesto sin fin.
+
+**Pendiente del hito:** persistir la política y su auditoría de consumo
+(migración 0022) y conectar `authorize` a la ruta de transporte de `df-ai`,
+que hoy sigue usando el token por petición de ADR-0034.
+
 ### M2.6 — `df-agent`
 
 [ADR-0044]. El bucle completo: intención → plan → reglas → congelar → ejecutar
