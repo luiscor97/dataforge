@@ -80,8 +80,12 @@ shell.
 
 ## Qué NO existe todavía
 
-- `df-rules` y `df-agent`: dos de los cuatro crates. `df-tools` y `df-mcp` ya
-  existen (M2.1, 2026-08-01).
+- **Los cuatro crates ya existen** (2026-08-01): `df-tools`, `df-mcp`,
+  `df-rules` y `df-agent`. Lo que falta no son crates, es cableado: `df-rules`
+  no persiste sus conjuntos ni alimenta el score del planificador, `df-agent` no
+  conduce todavía el motor por `df-tools`, y la política de M2.5 no está
+  conectada a la ruta de transporte. Cada uno lleva su pendiente escrito en
+  [ROADMAP-2.0](ROADMAP-2.0.md).
 - Clasificación semántica: el motor sigue enrutando por tipo de operación.
   Es M2.3, y es la precondición de la deduplicación, no una mejora de orden.
 - La procedencia extendida del gate autónomo (regla, política, confianza,

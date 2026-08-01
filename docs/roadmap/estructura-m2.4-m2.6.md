@@ -8,10 +8,14 @@ Documento para retomar el trabajo. Dice **qué crate, qué tipos, qué contratos
 mueven y qué prueba cada cosa**, en el orden en que hay que hacerlo. No repite
 el porqué: para eso están las ADR.
 
-> **No hay crates vacíos.** Este documento existe en vez de un esqueleto de
-> código porque un crate que compila y no hace nada es funcionalidad simulada
-> (CONTRIBUTING) y adelanta hito (regla 7). Cada pieza entra cuando entra su
-> comportamiento y su test.
+> **No hay crates vacíos.** Se escribió antes de tocar código, precisamente
+> para no crear esqueletos: un crate que compila y no hace nada es
+> funcionalidad simulada (CONTRIBUTING) y adelanta hito (regla 7).
+>
+> **Actualizado el 2026-08-01:** los tres hitos tienen ya su primera pieza
+> puesta, y ninguna es un esqueleto — cada una entró con su comportamiento y sus
+> tests. Lo que sigue pendiente en cada apartado es cableado y persistencia, no
+> tipos.
 
 ## Lo que bloquea, hoy
 
