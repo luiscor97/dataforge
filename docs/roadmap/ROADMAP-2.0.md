@@ -211,6 +211,10 @@ redundancia bloqueada sin releer un byte.
 La autoridad determinista del gate. [ADR-0041], paso 2 de RFC-0002, y el ~70%
 del trabajo que hace segura la retirada del humano.
 
+> Plan de ejecución de este hito y de los dos siguientes —crates, tipos,
+> migraciones, contratos y orden— en
+> [estructura-m2.4-m2.6.md](estructura-m2.4-m2.6.md).
+
 - Devuelve `Autorizar | A-revisar | Denegar` **con el id de la regla que lo
   determinó**.
 - Fronteras duras *fail-closed*: nunca fusionar proyectos, nunca tocar
