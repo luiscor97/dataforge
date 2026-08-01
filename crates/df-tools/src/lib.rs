@@ -48,11 +48,16 @@
 //! weaker class, is a version bump and never an edit in place, because external
 //! agents depend on this surface (ADR-0043 §4).
 //!
-//! **Declared debt.** `search_project_content` and `query_project_content` are
-//! part of the observe class in ADR-0043 but are not exposed yet: their inputs
-//! are richer than the rest and deserve their own schemas rather than a rushed
-//! one. Adding them is an additive change, which is exactly what the contract
-//! permits.
+//! # Why a SQL tool is not a hole in the boundary
+//!
+//! ADR-0043 rejects exposing raw SQL, and also lists `query_project_content`
+//! under `observe`. Both are right, because they are not the same thing.
+//! `content_query` does not reach the engine's SQLite — the source of truth —
+//! at all. It runs read-only SQL against a **derived Parquet snapshot**, in an
+//! **isolated worker process**, over a single registered table, under hard
+//! limits on rows, bytes, cell size, memory and wall time. What ADR-0043
+//! refuses is a tool that could step around the facade's invariants; this one
+//! cannot see them.
 
 use std::path::PathBuf;
 
@@ -68,7 +73,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.1.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.2.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +183,16 @@ pub const TOOLS: &[Tool] = &[
         name: "verify_audit",
         capability: Capability::Observe,
         summary: "Ledger chain verification and the audit trail it yields.",
+    },
+    Tool {
+        name: "content_search",
+        capability: Capability::Observe,
+        summary: "Full-text search over extracted content, with snippets.",
+    },
+    Tool {
+        name: "content_query",
+        capability: Capability::Observe,
+        summary: "One bounded read-only SQL query over the derived Parquet evidence.",
     },
     // ---- build ---------------------------------------------------------
     Tool {
@@ -295,6 +310,47 @@ struct CreatePlanInput {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ContentSearchInput {
+    project_dir: PathBuf,
+    query: String,
+    /// Completed extraction run. Defaults to the latest of the latest snapshot.
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_snippet_chars")]
+    snippet_chars: usize,
+}
+
+fn default_search_limit() -> usize {
+    20
+}
+
+fn default_snippet_chars() -> usize {
+    240
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentQueryInput {
+    project_dir: PathBuf,
+    /// Read-only SQL. The sole registered table is `content`.
+    sql: String,
+    #[serde(default)]
+    run_id: Option<String>,
+    /// Every limit defaults to the engine's own. A caller may lower them; the
+    /// worker enforces its ceilings regardless, so raising one here cannot
+    /// widen what the query is allowed to cost.
+    #[serde(default)]
+    max_rows: Option<usize>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DecideReviewInput {
     project_dir: PathBuf,
     item_id: String,
@@ -404,6 +460,41 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
         "verify_audit" => {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::verify_audit(&input.project_dir)?)
+        }
+        "content_search" => {
+            let input: ContentSearchInput = parse(name, input)?;
+            encode(
+                name,
+                df_facade::search_project_content(
+                    &input.project_dir,
+                    input.run_id.as_deref(),
+                    &df_facade::SearchRequest {
+                        query: input.query,
+                        limit: input.limit,
+                        offset: input.offset,
+                        snippet_chars: input.snippet_chars,
+                    },
+                )?,
+            )
+        }
+        "content_query" => {
+            let input: ContentQueryInput = parse(name, input)?;
+            let mut options = df_facade::QueryOptions::default();
+            if let Some(max_rows) = input.max_rows {
+                options.max_rows = max_rows;
+            }
+            if let Some(timeout_seconds) = input.timeout_seconds {
+                options.timeout_seconds = timeout_seconds;
+            }
+            encode(
+                name,
+                df_facade::query_project_content(
+                    &input.project_dir,
+                    input.run_id.as_deref(),
+                    &input.sql,
+                    options,
+                )?,
+            )
         }
 
         // ---- build -----------------------------------------------------
@@ -608,6 +699,8 @@ mod tests {
                 ("plan_destination_tree", Capability::Observe),
                 ("destination_guarantees", Capability::Observe),
                 ("verify_audit", Capability::Observe),
+                ("content_search", Capability::Observe),
+                ("content_query", Capability::Observe),
                 ("scan_project", Capability::Build),
                 ("hash_project", Capability::Build),
                 ("analyze_project", Capability::Build),
@@ -623,7 +716,7 @@ mod tests {
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.1.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.2.0");
     }
 
     #[test]

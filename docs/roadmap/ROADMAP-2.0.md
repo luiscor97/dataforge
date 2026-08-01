@@ -100,9 +100,18 @@ dependencias nuevas en un workspace que fija versiones y corre `cargo deny`.
 `frozen_contracts`, lo que obliga a un ciclo de dev-dependency que Cargo
 permite justamente para esto.
 
-**Deuda declarada:** `search_project_content` y `query_project_content`
-pertenecen a la clase `observe` en ADR-0043 y aún no están expuestas; sus
-entradas son más ricas y merecen esquema propio. Añadirlas es aditivo.
+**Deuda saldada (2026-08-01):** `content_search` y `content_query` completan la
+clase `observe` de ADR-0043. La superficie sube a
+`dataforge.tool-surface/0.2.0` — aditivo, que es lo que el contrato permite.
+
+`content_query` merece una aclaración, porque ADR-0043 **rechaza exponer SQL
+crudo** y a la vez lista esta herramienta como `observe`. Las dos cosas son
+ciertas y no se contradicen: esta consulta no alcanza el SQLite del motor —la
+fuente de verdad— en absoluto. Corre SQL de solo lectura contra un **snapshot
+Parquet derivado**, en un **worker aislado**, sobre una única tabla registrada,
+con topes duros de filas, bytes, tamaño de celda, memoria y tiempo. Lo que la
+ADR rechaza es una herramienta capaz de rodear los invariantes de la fachada;
+esta no puede ni verlos.
 
 ### M2.2 — Taxonomía de destino
 

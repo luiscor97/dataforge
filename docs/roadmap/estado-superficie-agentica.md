@@ -40,7 +40,7 @@ completa (399 tests en macOS, 0 fallos; la cifra de Windows es mayor porque
 | `plan tree`: el árbol de salida antes de aprobar | No previsto; precondición práctica del paso 1 |
 | `hash --resume-interrupted` | Robustez de disco lento (RFC-0002 §robustez) |
 | `DestinationTaxonomy` leída del perfil (ADR-0040) | Mecanismo del paso 1, subsumido |
-| `df-tools`: 23 herramientas en tres clases de capacidad | **ADR-0043 §1** |
+| `df-tools`: 25 herramientas en tres clases de capacidad | **ADR-0043 §1**, clase `observe` completa |
 | `df-mcp`: servidor MCP por stdio, sin red ni SDK | **ADR-0043 §2** |
 | Procedencia de enrutado por operación (migración 0020) | ADR-0040 §3 |
 

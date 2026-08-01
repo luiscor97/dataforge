@@ -249,6 +249,48 @@ fn input_schema(name: &str) -> Value {
             "required": ["project_dir"],
             "additionalProperties": false,
         }),
+        "content_search" => json!({
+            "type": "object",
+            "properties": {
+                "project_dir": project_dir,
+                "query": {
+                    "type": "string",
+                    "description": "Tantivy query text.",
+                },
+                "run_id": {
+                    "type": "string",
+                    "description":
+                        "Completed extraction run. Defaults to the latest of the latest snapshot.",
+                },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "snippet_chars": { "type": "integer", "minimum": 1, "default": 240 },
+            },
+            "required": ["project_dir", "query"],
+            "additionalProperties": false,
+        }),
+        "content_query" => json!({
+            "type": "object",
+            "properties": {
+                "project_dir": project_dir,
+                "sql": {
+                    "type": "string",
+                    "description":
+                        "Read-only SQL over the derived Parquet evidence, run in an isolated \
+                         worker. The sole registered table is `content`. This never reaches the \
+                         engine's SQLite.",
+                },
+                "run_id": { "type": "string" },
+                "max_rows": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Lower the engine default only; the worker enforces its own ceiling.",
+                },
+                "timeout_seconds": { "type": "integer", "minimum": 1 },
+            },
+            "required": ["project_dir", "sql"],
+            "additionalProperties": false,
+        }),
         "decide_structural_review" => json!({
             "type": "object",
             "properties": {

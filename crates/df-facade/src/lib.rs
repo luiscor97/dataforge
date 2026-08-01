@@ -3807,9 +3807,9 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.1.0"
+            "dataforge.tool-surface/0.2.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 23, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 25, "tool count");
         assert_eq!(
             df_tools::tools_with(df_tools::Capability::Commit).count(),
             3,
