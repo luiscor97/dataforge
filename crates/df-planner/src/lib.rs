@@ -854,6 +854,43 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
     format!("{prefix}{file_name}")
 }
 
+/// Whether `parent` is inside `folder` — the same folder, or below it.
+///
+/// Compared component-wise rather than with `starts_with`, so `base-ampliada`
+/// is not read as living inside `base`.
+fn is_within(parent: &str, folder: &str) -> bool {
+    if folder.is_empty() {
+        return true;
+    }
+    if parent == folder {
+        return true;
+    }
+    let normalise = |path: &str| path.replace('\\', "/");
+    let parent = normalise(parent);
+    let folder = normalise(folder);
+    parent
+        .strip_prefix(&folder)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The contained folder an occurrence sits in, for the reason it records.
+///
+/// The deepest match, when several nest: that is the one that actually
+/// contains it, and the one a reader would go and look at.
+fn containing_folder<'a>(
+    contained: &'a [df_db::structure::ContainedFolder],
+    member: &df_db::dedup::DuplicateMember,
+) -> Option<&'a str> {
+    contained
+        .iter()
+        .filter(|folder| {
+            folder.source_root_id == member.source_root_id
+                && is_within(&member.parent_relative_path, &folder.relative_path)
+        })
+        .max_by_key(|folder| folder.relative_path.len())
+        .map(|folder| folder.relative_path.as_str())
+}
+
 /// Classify a duplicate set from the contexts of its members (§15.3).
 ///
 /// Conservative by construction: `WithinSameContext` is only claimed when the
@@ -861,7 +898,14 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
 /// graph (§18.2) that is the only "same context" we can demonstrate. Anything
 /// else that is not clearly generic-to-canonical stays `UnknownContext`, which
 /// no policy consolidates.
-fn classify_duplicate_set(members: &[&df_db::dedup::DuplicateMember]) -> DuplicateKind {
+///
+/// The one exception is `ContainedTreeReplica` (ADR-0045), and it is not a
+/// weakening of that rule: a copy inside a folder proved to hold nothing of
+/// its own is redundancy the engine *recorded*, not redundancy it guessed.
+fn classify_duplicate_set(
+    members: &[&df_db::dedup::DuplicateMember],
+    contained: &[df_db::structure::ContainedFolder],
+) -> DuplicateKind {
     if members.len() < 2 {
         return DuplicateKind::UnknownContext;
     }
@@ -905,6 +949,29 @@ fn classify_duplicate_set(members: &[&df_db::dedup::DuplicateMember]) -> Duplica
         };
     }
 
+    // Before giving up: the engine may already have proved that some copies
+    // live in a subtree with nothing of its own (ADR-0045). That is only
+    // usable when the representative sits *outside* every such folder —
+    // otherwise dropping the replicas could drop the only copy there is.
+    if !contained.is_empty() {
+        if let Some(representative) = members.iter().find(|m| m.is_representative) {
+            let inside_contained = |member: &df_db::dedup::DuplicateMember| {
+                contained.iter().any(|folder| {
+                    folder.source_root_id == member.source_root_id
+                        && is_within(&member.parent_relative_path, &folder.relative_path)
+                })
+            };
+            if !inside_contained(representative)
+                && members
+                    .iter()
+                    .filter(|m| !m.is_representative)
+                    .all(|m| inside_contained(m))
+            {
+                return DuplicateKind::ContainedTreeReplica;
+            }
+        }
+    }
+
     // Different folders, no generic/canonical split we can justify.
     DuplicateKind::UnknownContext
 }
@@ -931,9 +998,12 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
             .or_default()
             .push(member);
     }
+    // Read once per plan: the same list answers every set, and over a real
+    // archive there are tens of thousands of sets.
+    let contained = df_db::structure::contained_embedded_folders(db, plan.snapshot_id)?;
     let kinds: HashMap<&str, DuplicateKind> = sets
         .iter()
-        .map(|(set_id, members)| (*set_id, classify_duplicate_set(members)))
+        .map(|(set_id, members)| (*set_id, classify_duplicate_set(members, &contained)))
         .collect();
     let by_occurrence: HashMap<&str, &df_db::dedup::DuplicateMember> = members
         .iter()
@@ -1190,17 +1260,35 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                 },
                             )
                         }
-                        Some((kind, _, DuplicateDisposition::SkipRepresented)) => (
+                        Some((kind, member, DuplicateDisposition::SkipRepresented)) => (
                             OperationType::SkipRepresented,
                             None,
                             RiskLevel::Medium,
                             1.0,
-                            format!(
-                                "exact duplicate ({}) already represented by the set's canonical \
-                                 copy; not copied under policy {} — the source keeps it",
-                                kind.as_str(),
-                                policy.as_str()
-                            ),
+                            if kind == DuplicateKind::ContainedTreeReplica {
+                                // ADR-0045 §5: an output that is gigabytes
+                                // smaller has to be able to explain every byte
+                                // it did not write, so the reason names the
+                                // proof and the folder it came from — not just
+                                // "already represented".
+                                let folder = containing_folder(&contained, member)
+                                    .unwrap_or("an embedded subtree");
+                                format!(
+                                    "exact duplicate inside `{folder}`, a subtree proven to hold \
+                                     no content of its own (TREE_EMBEDDED, unique_files = 0); the \
+                                     set's canonical copy lives outside it, so this occurrence is \
+                                     not copied under policy {} — the source keeps it",
+                                    policy.as_str()
+                                )
+                            } else {
+                                format!(
+                                    "exact duplicate ({}) already represented by the set's \
+                                     canonical copy; not copied under policy {} — the source \
+                                     keeps it",
+                                    kind.as_str(),
+                                    policy.as_str()
+                                )
+                            },
                         ),
                         // Copy: representative, preserved policy, or not a duplicate.
                         _ if taken_destinations.insert(planned.to_lowercase()) => (

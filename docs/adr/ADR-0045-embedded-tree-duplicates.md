@@ -1,11 +1,51 @@
 # ADR-0045 — Un duplicado dentro de un árbol probadamente contenido no es contexto desconocido
 
-**Estado:** Propuesta
-**Fecha:** 2026-07-29
+**Estado:** Parcialmente implementada — insuficiente como está escrita
+**Fecha:** 2026-07-29 (implementación y hallazgo: 2026-08-01)
 **Relacionada con:** RFC-0001 §15.2, §15.3, §19.4; RFC-0002 (Modo 1, pasada 2);
 ADR-0023, ADR-0037; ROADMAP-2.0 M2.3
 
 > Numeración: 0041–0044 están reservadas por RFC-0002.
+
+> ## Hallazgo al implementarla: la decisión 1, sola, no cambia nada
+>
+> `DuplicateKind::ContainedTreeReplica` y la consulta a `tree_relations` están
+> implementadas y son correctas. **Y no tienen ningún efecto observable**, por
+> una razón que esta ADR no consideró.
+>
+> Una relación `TREE_EMBEDDED` **levanta por sí misma un ítem de revisión
+> estructural** que cubre todos los archivos de las dos carpetas. Mientras está
+> pendiente, todo se enruta a la bolsa de revisión. Y una vez decidido, la
+> decisión **sigue siendo una recomendación** — el planificador deja
+> deliberadamente que una recomendación anule la consolidación de duplicados,
+> con este comentario en el código:
+>
+> > *Rules and unresolved human review are conservative copy actions. They
+> > override duplicate consolidation (never protected-boundary preservation) so
+> > an ambiguous occurrence is not silently represented by another path before
+> > the user decides.*
+>
+> Es decir: la clasificación se calcula bien y **nunca se consulta** para estas
+> apariciones. Los 108,5 GB que la ADR promete desbloquear siguen sin
+> desbloquearse.
+>
+> **Lo que falta es una decisión sobre esa precedencia**, y no se toma aquí
+> porque no es la que esta ADR planteó. Las opciones, a bote pronto:
+>
+> 1. Que una disposición respaldada por una **prueba** (no por una inferencia)
+>    gane a una recomendación ya decidida. Habría que definir qué cuenta como
+>    prueba, y el comentario de arriba explica por qué la precedencia actual
+>    existe.
+> 2. Que una relación `TREE_EMBEDDED` **no genere ítem de revisión** cuando el
+>    lado contenido no tiene contenido propio: si el motor ya lo ha probado, no
+>    hay nada que preguntar. Es la opción más limpia y la que menos toca el
+>    orden de seguridad.
+> 3. Dejarlo como está y aceptar que la consolidación exige decidir la clase
+>    *y* que la decisión sea de un tipo que no genere recomendación — hoy no
+>    existe tal tipo.
+>
+> Fijado por `crates/df-planner/tests/contained_tree_replicas.rs::a_recommendation_still_overrides_the_proof`,
+> para que el hueco quede registrado y no se redescubra.
 
 ## Contexto
 

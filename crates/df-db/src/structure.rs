@@ -1904,6 +1904,66 @@ pub fn tree_relations(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<df_domai
     rows.into_iter().collect()
 }
 
+/// A folder the engine has proved holds nothing of its own: the *contained*
+/// side of a `TREE_EMBEDDED` relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainedFolder {
+    /// Root the folder belongs to. Relative paths only compare within a root.
+    pub source_root_id: String,
+    /// Path of the contained folder, relative to its source root.
+    pub relative_path: String,
+}
+
+/// Folders that are the contained side of a `TREE_EMBEDDED` relation.
+///
+/// `TREE_EMBEDDED` means every distinct content of the contained subtree also
+/// exists in the outer one, which its `CHECK` enforces as `unique_files = 0`.
+/// That is the strongest redundancy claim available short of a duplicate set,
+/// and it is the evidence ADR-0045 lets `classify_duplicate_set` use.
+///
+/// **Only `TREE_EMBEDDED`.** A `PARTIAL_TREE_CLONE` has unique content on both
+/// sides by its own `CHECK`, so it is a warning and never an opportunity to
+/// consolidate (§19.4); including it here would be exactly the mistake that
+/// distinction exists to prevent.
+pub fn contained_embedded_folders(
+    db: &Db,
+    snapshot_id: SnapshotId,
+) -> DfResult<Vec<ContainedFolder>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT f.source_root_id, f.relative_path
+             FROM tree_relations tr
+             JOIN folders f
+               ON f.id = CASE tr.contained
+                             WHEN 'A' THEN tr.folder_a
+                             WHEN 'B' THEN tr.folder_b
+                         END
+             WHERE tr.snapshot_id = ?1
+               AND tr.relationship = ?2
+               AND tr.contained IS NOT NULL",
+        )
+        .map_err(db_err)?;
+    let rows: Vec<Result<ContainedFolder, rusqlite::Error>> = stmt
+        .query_map(
+            rusqlite::params![
+                snapshot_id.to_string(),
+                df_domain::TreeRelationship::Embedded.as_str()
+            ],
+            |row| {
+                Ok(ContainedFolder {
+                    source_root_id: row.get(0)?,
+                    relative_path: row.get(1)?,
+                })
+            },
+        )
+        .map_err(db_err)?
+        .collect();
+    rows.into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)
+}
+
 /// A tree relation with both folder paths resolved, ready to show a human.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TreeRelationView {
