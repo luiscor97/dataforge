@@ -29,7 +29,7 @@ a `revisar/` y el run no se detiene nunca.
 ## Qué está ya implementado
 
 Todo esto está en `feat/agent-drivable-engine` y pasa la puerta de calidad
-completa (399 tests en macOS, 0 fallos; la cifra de Windows es mayor porque
+completa (440 tests en macOS, 0 fallos; la cifra de Windows es mayor porque
 112 puntos del workspace están gateados por plataforma).
 
 | Pieza | Sitio en RFC-0002 |
@@ -43,6 +43,9 @@ completa (399 tests en macOS, 0 fallos; la cifra de Windows es mayor porque
 | `df-tools`: 25 herramientas en tres clases de capacidad | **ADR-0043 §1**, clase `observe` completa |
 | `df-mcp`: servidor MCP por stdio, sin red ni SDK | **ADR-0043 §2** |
 | Procedencia de enrutado por operación (migración 0020) | ADR-0040 §3 |
+| `df-rules`: cuatro fronteras duras y parámetros con digest | **ADR-0041 §2 y §4** |
+| `df-ai::policy`: consentimiento por política con presupuesto | **ADR-0042** |
+| `df-agent`: fases, presupuestos y cortacircuitos sin E/S | **ADR-0044** |
 
 `Actor::Agent` se implementó **sin conocer ADR-0043** y coincidió con lo
 diseñado. Coincidencia afortunada, no coordinación.
@@ -107,7 +110,7 @@ que las decisiones se tomen por clase y no por elemento.
 
 ## Si trabajas en paralelo
 
-Hay varias ramas vivas (`design/rfc-0002-autonomy`, `fix/desktop-usability`,
-además de las de dependabot). Antes de abrir una nueva, comprueba
-`git branch -r` y los ADR propuestos: la numeración 0041–0044 está **reservada
-por RFC-0002** aunque su rama no esté fusionada.
+RFC-0002 y las ADR-0041 a 0044 **ya están en `main`** (PR #36, 2026-08-01), así
+que la numeración dejó de estar solo reservada. Siguen vivas
+`fix/desktop-usability` y `perf/m101-pipeline-throughput`, además de las de
+dependabot: antes de abrir una rama nueva, comprueba `git branch -r`.
