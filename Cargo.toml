@@ -20,6 +20,7 @@ members = [
     "crates/df-plugin",
     "crates/df-ai",
     "crates/df-facade",
+    "crates/df-rules",
     "crates/df-tools",
     "apps/cli",
     "apps/desktop/src-tauri",
@@ -51,6 +52,7 @@ default-members = [
     "crates/df-plugin",
     "crates/df-ai",
     "crates/df-facade",
+    "crates/df-rules",
     "crates/df-tools",
     "apps/cli",
     "tools/df-extract-worker",
@@ -88,6 +90,7 @@ df-media = { path = "crates/df-media", version = "1.0.0" }
 df-plugin = { path = "crates/df-plugin", version = "1.0.0" }
 df-ai = { path = "crates/df-ai", version = "1.0.0" }
 df-facade = { path = "crates/df-facade", version = "1.0.0" }
+df-rules = { path = "crates/df-rules", version = "1.0.0" }
 df-tools = { path = "crates/df-tools", version = "1.0.0" }
 
 # External crates

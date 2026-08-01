@@ -3810,6 +3810,15 @@ mod frozen_contracts {
             "dataforge.tool-surface/0.2.0"
         );
         assert_eq!(df_tools::TOOLS.len(), 25, "tool count");
+
+        // Deterministic gate (M2.4, ADR-0041). The hard-boundary count is
+        // frozen alongside the schema: turning an invariant into a tunable
+        // parameter is exactly the change this test exists to catch.
+        assert_eq!(
+            df_rules::RULE_SET_SCHEMA_VERSION,
+            "dataforge.rule-set/0.1.0"
+        );
+        assert_eq!(df_rules::HARD_BOUNDARY_COUNT, 4);
         assert_eq!(
             df_tools::tools_with(df_tools::Capability::Commit).count(),
             3,

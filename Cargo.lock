@@ -2230,6 +2230,7 @@ dependencies = [
  "df-plugin",
  "df-process-safety",
  "df-query",
+ "df-rules",
  "df-scan",
  "df-search",
  "df-similarity",
@@ -2413,6 +2414,19 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "df-rules"
+version = "1.0.0"
+dependencies = [
+ "df-domain",
+ "df-error",
+ "df-ledger",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

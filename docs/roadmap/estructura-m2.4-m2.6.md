@@ -32,7 +32,16 @@ M2.4**, no durante.
 ## M2.4 — `df-rules`
 
 El ~70% del trabajo que hace segura la retirada del humano. Crate nuevo,
-`crates/df-rules`, dependiendo solo de `df-domain`, `df-db` y `df-error`.
+`crates/df-rules`, dependiendo solo de `df-domain`, `df-error` y `df-ledger`
+(no de `df-db`: no hace E/S).
+
+> **Puesto ya (2026-08-01):** el crate, `Verdict`, las cuatro fronteras duras,
+> `RuleParams` con digest y validación de signos, y `evaluate`. 13 tests.
+> `RULE_SET_SCHEMA_VERSION` y `HARD_BOUNDARY_COUNT` en `frozen_contracts`.
+>
+> **Falta:** persistir `rule_sets` (migración 0021) y conectar los pesos al
+> `location_cost` que hoy usa constantes en `df-db`. La clasificación de estado
+> de injerto (§3) espera a la precedencia de ADR-0045.
 
 ### Superficie
 

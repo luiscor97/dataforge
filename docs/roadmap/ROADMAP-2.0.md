@@ -231,6 +231,37 @@ del trabajo que hace segura la retirada del humano.
 - Reglas versionadas y con checksum, misma disciplina que las migraciones.
   Digest del conjunto sellado en cada decisión.
 
+**Estado: primera pieza puesta (2026-08-01).** El crate existe con las **cuatro
+fronteras duras** de ADR-0041 §4 y el motor de veredicto.
+
+La decisión de diseño que lo vertebra es **qué va en código y qué va en datos**.
+Las fronteras duras son invariantes, no preferencias, y viven en Rust: una
+frontera que el llamante puede editar no es una frontera. Los pesos —qué copia
+gana, cuánto penaliza un contenedor genérico, qué margen exige una
+auto-aprobación— dependen del corpus y viven en `RuleParams`, versionados y con
+digest. `HARD_BOUNDARY_COUNT` entra en `frozen_contracts` justamente para que
+mover un invariante a la mitad afinable rompa el build y no el archivo.
+
+Un test —`no_parameter_can_authorise_past_a_hard_boundary`— fija que ningún
+parámetro, por permisivo que sea, autoriza por encima de una frontera.
+
+De las cuatro fronteras solo una **deniega**: consolidar dos documentos
+distintos no es un juicio, es una contradicción. Las otras tres describen
+situaciones que un humano sí puede resolver legítimamente —reutilización entre
+asuntos, un destino que se puede vaciar, un dominio protegido revisable archivo
+a archivo— así que van a `revisar/` y el run continúa, que es la garantía de
+no-bloqueo de RFC-0002.
+
+El digest se **reverifica en cada llamada**, no una vez al cargar: un conjunto
+que derivó entre leerse y usarse es exactamente el caso que una comprobación al
+cargar no ve (amenaza A4).
+
+**Pendiente del hito:** la tabla `rule_sets` persistida (migración 0021) y
+conectar los pesos afinables al `location_cost` que hoy usa constantes en
+`df-db`. La clasificación de estado de injerto (ADR-0041 §3) espera a que se
+resuelva la precedencia de ADR-0045: sin eso, sus veredictos serían correctos e
+inalcanzables, igual que le pasa hoy a `ContainedTreeReplica`.
+
 ### M2.5 — Consentimiento por política
 
 [ADR-0042], extensión de ADR-0034. El humano aprueba **una vez** una política
