@@ -49,7 +49,34 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
+/// Whether this process will run `Capability::Commit` tools.
+///
+/// Closed unless `--allow-commit` is passed. `Capability::requires_authorization`
+/// marks the three commit tools, but nothing consults it yet: `df-rules` is not
+/// wired, so a commit tool reaching `df_tools::invoke` runs with neither a human
+/// nor a rule in front of it. That is L2 without the rules engine — the one rung
+/// RFC-0002 says must not exist — and it would be the state of `main` from the
+/// moment this surface lands until the gate does, several blocks later.
+///
+/// So the default is a server an agent can look and think with but not commit
+/// with, which is exactly L1: the human still holds the gate. The flag exists
+/// for developing the gate itself; it is not a supported way to run. When
+/// `df-rules` becomes the authority this is replaced by the real authorization
+/// call and the flag goes away.
+fn commit_allowed() -> bool {
+    let allowed = std::env::args().any(|arg| arg == "--allow-commit");
+    if allowed {
+        eprintln!(
+            "df-mcp: WARNING --allow-commit: approve_plan, execute_plan and \
+             verify_project_output are reachable with no gate in front of them. \
+             For developing the gate, not for driving real archives."
+        );
+    }
+    allowed
+}
+
 fn main() {
+    let commit_allowed = commit_allowed();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut line = String::new();
@@ -73,7 +100,7 @@ fn main() {
 
         // A notification (no `id`) gets no reply — that is the JSON-RPC
         // contract, and answering one would desynchronise a strict client.
-        if let Some(response) = handle_line(trimmed) {
+        if let Some(response) = handle_line(trimmed, commit_allowed) {
             if let Err(error) = writeln!(stdout, "{response}") {
                 eprintln!("df-mcp: cannot write stdout: {error}");
                 break;
@@ -87,7 +114,7 @@ fn main() {
 }
 
 /// Parse one line and produce its response, if it deserves one.
-fn handle_line(line: &str) -> Option<Value> {
+fn handle_line(line: &str, commit_allowed: bool) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         // No id is recoverable from unparseable input, so the error carries a
@@ -116,15 +143,15 @@ fn handle_line(line: &str) -> Option<Value> {
     let id = id?;
 
     let params = request.get("params").cloned().unwrap_or(Value::Null);
-    Some(dispatch(id, method, params))
+    Some(dispatch(id, method, params, commit_allowed))
 }
 
-fn dispatch(id: Value, method: &str, params: Value) -> Value {
+fn dispatch(id: Value, method: &str, params: Value, commit_allowed: bool) -> Value {
     match method {
         "initialize" => success(id, initialize_result()),
         "ping" => success(id, json!({})),
-        "tools/list" => success(id, json!({ "tools": tool_descriptors() })),
-        "tools/call" => call_tool(id, params),
+        "tools/list" => success(id, json!({ "tools": tool_descriptors(commit_allowed) })),
+        "tools/call" => call_tool(id, params, commit_allowed),
         other => error_response(id, METHOD_NOT_FOUND, &format!("unknown method `{other}`")),
     }
 }
@@ -149,8 +176,12 @@ fn initialize_result() -> Value {
     })
 }
 
-fn tool_descriptors() -> Vec<Value> {
-    df_tools::TOOLS.iter().map(descriptor).collect()
+fn tool_descriptors(commit_allowed: bool) -> Vec<Value> {
+    df_tools::TOOLS
+        .iter()
+        .filter(|tool| commit_allowed || tool.capability != Capability::Commit)
+        .map(descriptor)
+        .collect()
 }
 
 fn descriptor(tool: &Tool) -> Value {
@@ -168,7 +199,7 @@ fn descriptor(tool: &Tool) -> Value {
     })
 }
 
-fn call_tool(id: Value, params: Value) -> Value {
+fn call_tool(id: Value, params: Value, commit_allowed: bool) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return error_response(id, INVALID_PARAMS, "missing tool `name`");
     };
@@ -176,6 +207,32 @@ fn call_tool(id: Value, params: Value) -> Value {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // Leaving a commit tool out of `tools/list` hides it; this refuses it.
+    // Nothing stops a client calling a name it was never offered, and a
+    // boundary that depends on the caller only using what it was shown is not
+    // a boundary — the same reason the vocabulary lives in the transport
+    // rather than in an instruction to the model.
+    if !commit_allowed
+        && df_tools::tool(name).is_some_and(|tool| tool.capability == Capability::Commit)
+    {
+        return success(
+            id,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "`{name}` changes real state and this server runs with \
+                         the commit class closed: the deterministic gate \
+                         (df-rules) is not wired yet, so there is nothing to \
+                         authorise it. Propose the plan and let a human approve \
+                         it — `plan tree` shows what it would write. See RFC-0002."
+                    ),
+                }],
+                "isError": true,
+            }),
+        );
+    }
 
     // The actor is fixed, never taken from the caller: see the module docs.
     match df_tools::invoke(name, arguments, Actor::Agent) {
@@ -366,7 +423,7 @@ mod tests {
 
     #[test]
     fn initialize_announces_the_frozen_surface() {
-        let response = handle_line(&request("initialize", json!({}))).expect("a reply");
+        let response = handle_line(&request("initialize", json!({})), true).expect("a reply");
         let result = &response["result"];
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
@@ -379,7 +436,7 @@ mod tests {
 
     #[test]
     fn tools_list_exposes_every_tool_and_nothing_else() {
-        let response = handle_line(&request("tools/list", json!({}))).expect("a reply");
+        let response = handle_line(&request("tools/list", json!({})), true).expect("a reply");
         let listed = response["result"]["tools"]
             .as_array()
             .expect("tools array")
@@ -391,11 +448,68 @@ mod tests {
         );
     }
 
+    /// Until `df-rules` is the authority, a commit tool reaching the engine
+    /// would freeze a manifest or copy bytes with neither a human nor a rule
+    /// behind it. The server closes that class by default so the shipped state
+    /// is L1 — the human still holds the gate — and not L2 without the rules
+    /// engine, which is the one rung RFC-0002 rules out.
+    #[test]
+    fn the_commit_class_is_closed_unless_asked_for() {
+        let response = handle_line(&request("tools/list", json!({})), false).expect("a reply");
+        let listed: Vec<&str> = response["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name"))
+            .collect();
+
+        for closed in ["approve_plan", "execute_plan", "verify_project_output"] {
+            assert!(!listed.contains(&closed), "{closed} must not be offered");
+        }
+        // Everything an agent needs to look and think with is still there.
+        assert!(listed.contains(&"project_status"));
+        assert!(listed.contains(&"create_plan"));
+        assert_eq!(
+            listed.len(),
+            df_tools::TOOLS
+                .iter()
+                .filter(|tool| tool.capability != Capability::Commit)
+                .count()
+        );
+    }
+
+    /// Hiding a tool is not refusing it. Nothing stops a client calling a name
+    /// it was never offered, so a boundary that relies on the caller only using
+    /// what it saw is not a boundary at all — the same reason the vocabulary
+    /// lives in the transport instead of in an instruction to the model.
+    #[test]
+    fn a_closed_commit_tool_is_refused_even_when_called_directly() {
+        for closed in ["approve_plan", "execute_plan", "verify_project_output"] {
+            let response = handle_line(
+                &request(
+                    "tools/call",
+                    json!({ "name": closed, "arguments": { "project_dir": r"D:\p" } }),
+                ),
+                false,
+            )
+            .expect("a reply");
+
+            assert_eq!(response["result"]["isError"], true, "{closed}");
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text");
+            assert!(
+                text.contains("commit class closed"),
+                "{closed}: unexpected text: {text}"
+            );
+        }
+    }
+
     #[test]
     fn every_listed_tool_carries_a_closed_schema() {
         // `additionalProperties: false` is what stops a caller smuggling a
         // parameter the engine never agreed to read.
-        let response = handle_line(&request("tools/list", json!({}))).expect("a reply");
+        let response = handle_line(&request("tools/list", json!({})), true).expect("a reply");
         for tool in response["result"]["tools"].as_array().expect("tools") {
             let schema = &tool["inputSchema"];
             assert_eq!(
@@ -413,7 +527,7 @@ mod tests {
 
     #[test]
     fn observe_tools_are_marked_read_only_and_none_is_destructive() {
-        let response = handle_line(&request("tools/list", json!({}))).expect("a reply");
+        let response = handle_line(&request("tools/list", json!({})), true).expect("a reply");
         for listed in response["result"]["tools"].as_array().expect("tools") {
             let name = listed["name"].as_str().expect("name");
             let tool = df_tools::tool(name).expect("registered");
@@ -429,19 +543,19 @@ mod tests {
     #[test]
     fn a_notification_gets_no_reply() {
         let notification = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        assert!(handle_line(&notification.to_string()).is_none());
+        assert!(handle_line(&notification.to_string(), true).is_none());
     }
 
     #[test]
     fn unparseable_input_is_answered_not_swallowed() {
-        let response = handle_line("{not json").expect("a reply");
+        let response = handle_line("{not json", true).expect("a reply");
         assert_eq!(response["error"]["code"], PARSE_ERROR);
         assert_eq!(response["id"], Value::Null);
     }
 
     #[test]
     fn an_unknown_method_is_rejected() {
-        let response = handle_line(&request("tools/exec", json!({}))).expect("a reply");
+        let response = handle_line(&request("tools/exec", json!({})), true).expect("a reply");
         assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
     }
 
@@ -449,10 +563,13 @@ mod tests {
     fn calling_an_unregistered_tool_reports_a_tool_error() {
         // Not a JSON-RPC error: the agent has to see the refusal as a result
         // and react to it, rather than the client deciding the server broke.
-        let response = handle_line(&request(
-            "tools/call",
-            json!({ "name": "run_shell", "arguments": {} }),
-        ))
+        let response = handle_line(
+            &request(
+                "tools/call",
+                json!({ "name": "run_shell", "arguments": {} }),
+            ),
+            true,
+        )
         .expect("a reply");
         assert_eq!(response["result"]["isError"], true);
         let text = response["result"]["content"][0]["text"]
@@ -463,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_call_without_a_name_is_an_invalid_params_error() {
-        let response = handle_line(&request("tools/call", json!({}))).expect("a reply");
+        let response = handle_line(&request("tools/call", json!({})), true).expect("a reply");
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
     }
 
@@ -473,7 +590,7 @@ mod tests {
         // the method table is closed, so there is no transport-level escape
         // even for a client that asks for one.
         for method in ["tools/exec", "resources/read", "shell", "sql", "fs/read"] {
-            let response = handle_line(&request(method, json!({}))).expect("a reply");
+            let response = handle_line(&request(method, json!({})), true).expect("a reply");
             assert_eq!(
                 response["error"]["code"], METHOD_NOT_FOUND,
                 "method `{method}` must not resolve"

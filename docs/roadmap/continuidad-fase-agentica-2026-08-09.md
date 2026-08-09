@@ -118,6 +118,12 @@ Objetivo: cerrar PR #45 sin seguir acumulando funcionalidad.
 - confirmar contratos y migraciones;
 - ejecutar la puerta de calidad en el HEAD final;
 - registrar las decisiones anteriores como bloqueos explícitos;
+- **cerrar la clase `commit` en `df-mcp` mientras no exista el gate**: la
+  superficie llega a `main` en este PR y la autoridad determinista no llega
+  hasta el PR 5. Sin esto, durante cinco bloques cualquiera que compile `main`
+  y apunte un modelo al servidor tiene `approve_plan` y `execute_plan` sin
+  humano y sin regla — que no es L1 ni L2, sino L2 sin `df-rules`, la única
+  combinación que RFC-0002 descarta;
 - fusionar antes de abrir el siguiente bloque de implementación.
 
 ### PR 1 — Hacer conversacional la superficie
@@ -175,8 +181,10 @@ Objetivo: convertir `df-rules` en la autoridad efectiva.
 - ninguna herramienta `commit` ejecutable sin pasar por el gate;
 - procedencia sellada en la operación.
 
-Al cerrar este bloque existe L0: el agente observa y propone; el humano autoriza
-el lote.
+Al cerrar este bloque existe **L1 — Copiloto** en el sentido de RFC-0002: el
+agente observa y propone; el humano ocupa el gate y autoriza el lote. (L0 —la
+IA solo explica— está entregado desde M0.7 y no es el resultado de ningún PR
+de esta lista.)
 
 ### PR 6 — Completar M2.5
 
@@ -205,8 +213,9 @@ Objetivo: ejecutar el bucle completo exclusivamente mediante `df-tools`.
 - mapa completo origen → destino;
 - procedencia de regla, política, confianza y proveedor.
 
-Al cerrar este bloque existe L1: el humano aprueba el lote una vez y la fase
-larga termina sin volver a preguntar.
+Al cerrar este bloque **L1 queda completo**: el humano aprueba el lote una vez y
+la fase larga termina sin volver a preguntar. Sigue siendo L1 porque quien
+autoriza es el humano; lo que cambia es que solo se le pregunta una vez.
 
 ### PR 8 — Modo sombra
 
