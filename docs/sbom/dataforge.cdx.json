@@ -6,7 +6,7 @@
     "component": {
       "type": "application",
       "name": "dataforge",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "Local-first, verifiable document reconstruction engine"
     },
     "tools": [
@@ -1988,7 +1988,7 @@
     {
       "type": "library",
       "name": "cranelift-assembler-x64",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "A Cranelift-specific x64 assembler",
       "licenses": [
@@ -1996,7 +1996,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-assembler-x64@0.123.12",
+      "purl": "pkg:cargo/cranelift-assembler-x64@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2007,7 +2007,7 @@
     {
       "type": "library",
       "name": "cranelift-assembler-x64-meta",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Generate a Cranelift-specific assembler for x64 instructions",
       "licenses": [
@@ -2015,7 +2015,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-assembler-x64-meta@0.123.12",
+      "purl": "pkg:cargo/cranelift-assembler-x64-meta@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2026,7 +2026,7 @@
     {
       "type": "library",
       "name": "cranelift-bforest",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "A forest of B+-trees",
       "licenses": [
@@ -2034,7 +2034,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-bforest@0.123.12",
+      "purl": "pkg:cargo/cranelift-bforest@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2045,7 +2045,7 @@
     {
       "type": "library",
       "name": "cranelift-bitset",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Various bitset stuff for use inside Cranelift",
       "licenses": [
@@ -2053,7 +2053,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-bitset@0.123.12",
+      "purl": "pkg:cargo/cranelift-bitset@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2064,7 +2064,7 @@
     {
       "type": "library",
       "name": "cranelift-codegen",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Low-level code generator library",
       "licenses": [
@@ -2072,7 +2072,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-codegen@0.123.12",
+      "purl": "pkg:cargo/cranelift-codegen@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2083,7 +2083,7 @@
     {
       "type": "library",
       "name": "cranelift-codegen-meta",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Metaprogram for cranelift-codegen code generator library",
       "licenses": [
@@ -2091,7 +2091,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-codegen-meta@0.123.12",
+      "purl": "pkg:cargo/cranelift-codegen-meta@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2102,7 +2102,7 @@
     {
       "type": "library",
       "name": "cranelift-codegen-shared",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "For code shared between cranelift-codegen-meta and cranelift-codegen",
       "licenses": [
@@ -2110,7 +2110,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-codegen-shared@0.123.12",
+      "purl": "pkg:cargo/cranelift-codegen-shared@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2121,7 +2121,7 @@
     {
       "type": "library",
       "name": "cranelift-control",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "White-box fuzz testing framework",
       "licenses": [
@@ -2129,7 +2129,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-control@0.123.12",
+      "purl": "pkg:cargo/cranelift-control@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2140,7 +2140,7 @@
     {
       "type": "library",
       "name": "cranelift-entity",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Data structures using entity references as mapping keys",
       "licenses": [
@@ -2148,7 +2148,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-entity@0.123.12",
+      "purl": "pkg:cargo/cranelift-entity@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2159,7 +2159,7 @@
     {
       "type": "library",
       "name": "cranelift-frontend",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Cranelift IR builder helper",
       "licenses": [
@@ -2167,7 +2167,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-frontend@0.123.12",
+      "purl": "pkg:cargo/cranelift-frontend@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2178,7 +2178,7 @@
     {
       "type": "library",
       "name": "cranelift-isle",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "ISLE: Instruction Selection and Lowering Expressions. A domain-specific language for instruction selection in Cranelift.",
       "licenses": [
@@ -2186,7 +2186,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-isle@0.123.12",
+      "purl": "pkg:cargo/cranelift-isle@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2197,7 +2197,7 @@
     {
       "type": "library",
       "name": "cranelift-native",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Support for targeting the host with Cranelift",
       "licenses": [
@@ -2205,7 +2205,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-native@0.123.12",
+      "purl": "pkg:cargo/cranelift-native@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2216,7 +2216,7 @@
     {
       "type": "library",
       "name": "cranelift-srcgen",
-      "version": "0.123.12",
+      "version": "0.123.13",
       "scope": "required",
       "description": "Helper functions for generating Rust and ISLE files",
       "licenses": [
@@ -2224,7 +2224,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/cranelift-srcgen@0.123.12",
+      "purl": "pkg:cargo/cranelift-srcgen@0.123.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -2596,7 +2596,7 @@
     {
       "type": "library",
       "name": "dataforge-cli",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "DataForge command line interface",
       "licenses": [
@@ -2614,7 +2614,7 @@
     {
       "type": "library",
       "name": "dataforge-desktop",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "DataForge Desktop — Tauri 2 shell over df-facade",
       "licenses": [
@@ -3335,7 +3335,7 @@
     {
       "type": "library",
       "name": "df-ai",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3352,7 +3352,7 @@
     {
       "type": "library",
       "name": "df-corpus",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Deterministic synthetic corpus generator and full-pipeline scale test (RFC-0001 §40, M0.1 acceptance criteria 1 and 10)",
       "licenses": [
@@ -3370,7 +3370,7 @@
     {
       "type": "library",
       "name": "df-db",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "SQLite persistence for DataForge: migrations, repositories and integrity checks",
       "licenses": [
@@ -3388,7 +3388,7 @@
     {
       "type": "library",
       "name": "df-domain",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Domain model of the DataForge engine: typed IDs, entities and the project state machine",
       "licenses": [
@@ -3406,7 +3406,7 @@
     {
       "type": "library",
       "name": "df-error",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Shared typed errors for the DataForge engine",
       "licenses": [
@@ -3424,7 +3424,7 @@
     {
       "type": "library",
       "name": "df-executor",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Transactional execution of approved plans: partial files, streamed hashes, atomic finalize (RFC-0001 §27)",
       "licenses": [
@@ -3442,7 +3442,7 @@
     {
       "type": "library",
       "name": "df-extract",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3459,7 +3459,7 @@
     {
       "type": "library",
       "name": "df-extract-worker",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Resource-isolated PDF parser process for DataForge",
       "licenses": [
@@ -3477,7 +3477,7 @@
     {
       "type": "library",
       "name": "df-facade",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Stable local API of the DataForge engine; every client (CLI, desktop) goes through this crate",
       "licenses": [
@@ -3495,7 +3495,7 @@
     {
       "type": "library",
       "name": "df-fs-safety",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Safe filesystem boundary for DataForge: reparse-aware path resolution, physical identity and no-replace finalization",
       "licenses": [
@@ -3513,7 +3513,7 @@
     {
       "type": "library",
       "name": "df-hash",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Content identity: streaming BLAKE3 + SHA-256 with fingerprint invalidation and a resumable job queue",
       "licenses": [
@@ -3531,7 +3531,7 @@
     {
       "type": "library",
       "name": "df-ledger",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Hash-chained audit ledger primitives for DataForge (RFC-0001 §29)",
       "licenses": [
@@ -3549,7 +3549,7 @@
     {
       "type": "library",
       "name": "df-media",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3566,7 +3566,7 @@
     {
       "type": "library",
       "name": "df-media-worker",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3583,7 +3583,7 @@
     {
       "type": "library",
       "name": "df-planner",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Analysis and planning: duplicate sets, full-coverage plans, canonical approval (RFC-0001 §26)",
       "licenses": [
@@ -3601,7 +3601,7 @@
     {
       "type": "library",
       "name": "df-plugin",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3618,7 +3618,7 @@
     {
       "type": "library",
       "name": "df-process-safety",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3635,7 +3635,7 @@
     {
       "type": "library",
       "name": "df-query",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3652,7 +3652,7 @@
     {
       "type": "library",
       "name": "df-query-worker",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3669,7 +3669,7 @@
     {
       "type": "library",
       "name": "df-scan",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Safe inventory scanner: walks source roots read-only and persists snapshots",
       "licenses": [
@@ -3687,7 +3687,7 @@
     {
       "type": "library",
       "name": "df-search",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "licenses": [
         {
@@ -3704,7 +3704,7 @@
     {
       "type": "library",
       "name": "df-similarity",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Bounded, streaming content-defined chunking and similarity evidence",
       "licenses": [
@@ -3722,7 +3722,7 @@
     {
       "type": "library",
       "name": "df-verifier",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scope": "required",
       "description": "Independent verification of executed plans: hashes, coverage, partials, untracked files, origin integrity (RFC-0001 §28)",
       "licenses": [
@@ -8851,7 +8851,7 @@
     {
       "type": "library",
       "name": "pulley-interpreter",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "The Pulley interpreter, its bytecode definition, encoder, decoder, and etc...",
       "licenses": [
@@ -8859,7 +8859,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/pulley-interpreter@36.0.12",
+      "purl": "pkg:cargo/pulley-interpreter@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -8870,7 +8870,7 @@
     {
       "type": "library",
       "name": "pulley-macros",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "Internal pulley macros",
       "licenses": [
@@ -8878,7 +8878,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/pulley-macros@36.0.12",
+      "purl": "pkg:cargo/pulley-macros@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12879,7 +12879,7 @@
     {
       "type": "library",
       "name": "wasmtime",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "High-level API to expose the Wasmtime runtime",
       "licenses": [
@@ -12887,7 +12887,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime@36.0.12",
+      "purl": "pkg:cargo/wasmtime@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12898,7 +12898,7 @@
     {
       "type": "library",
       "name": "wasmtime-environ",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "Standalone environment support for WebAssembly code in Cranelift",
       "licenses": [
@@ -12906,7 +12906,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-environ@36.0.12",
+      "purl": "pkg:cargo/wasmtime-environ@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12917,7 +12917,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-asm-macros",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Macros for defining asm functions in Wasmtime",
       "licenses": [
@@ -12925,7 +12925,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-asm-macros@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-asm-macros@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12936,7 +12936,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-component-macro",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Macros for deriving component interface types from Rust types",
       "licenses": [
@@ -12944,7 +12944,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-component-macro@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-component-macro@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12955,7 +12955,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-component-util",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Utility types and functions to support the component model in Wasmtime",
       "licenses": [
@@ -12963,7 +12963,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-component-util@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-component-util@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12974,7 +12974,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-cranelift",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Integration between Cranelift and Wasmtime",
       "licenses": [
@@ -12982,7 +12982,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-cranelift@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-cranelift@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12993,7 +12993,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-fiber",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Fiber support for Wasmtime",
       "licenses": [
@@ -13001,7 +13001,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-fiber@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-fiber@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13012,7 +13012,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-jit-debug",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: JIT debug interfaces support for Wasmtime",
       "licenses": [
@@ -13020,7 +13020,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-jit-debug@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-jit-debug@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13031,7 +13031,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-jit-icache-coherence",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Utilities for JIT icache maintenance",
       "licenses": [
@@ -13039,7 +13039,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-jit-icache-coherence@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-jit-icache-coherence@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13050,7 +13050,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-math",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Low-level math routines used in Wasmtime",
       "licenses": [
@@ -13058,7 +13058,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-math@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-math@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13069,7 +13069,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-slab",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Uni-typed slab with a free list for use in Wasmtime",
       "licenses": [
@@ -13077,7 +13077,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-slab@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-slab@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13088,7 +13088,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-unwinder",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Wasmtime's unwind format and unwinder",
       "licenses": [
@@ -13096,7 +13096,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-unwinder@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-unwinder@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13107,7 +13107,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-versioned-export-macros",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Macros for defining versioned exports in Wasmtime",
       "licenses": [
@@ -13115,7 +13115,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-versioned-export-macros@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-versioned-export-macros@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13126,7 +13126,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-winch",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: Integration between Wasmtime and Winch",
       "licenses": [
@@ -13134,7 +13134,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-winch@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-winch@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13145,7 +13145,7 @@
     {
       "type": "library",
       "name": "wasmtime-internal-wit-bindgen",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "INTERNAL: `*.wit` support for the `wasmtime` crate's macros",
       "licenses": [
@@ -13153,7 +13153,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/wasmtime-internal-wit-bindgen@36.0.12",
+      "purl": "pkg:cargo/wasmtime-internal-wit-bindgen@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
@@ -13468,7 +13468,7 @@
     {
       "type": "library",
       "name": "winch-codegen",
-      "version": "36.0.12",
+      "version": "36.0.13",
       "scope": "required",
       "description": "Winch code generation library",
       "licenses": [
@@ -13476,7 +13476,7 @@
           "expression": "Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/winch-codegen@36.0.12",
+      "purl": "pkg:cargo/winch-codegen@36.0.13",
       "externalReferences": [
         {
           "type": "distribution",
