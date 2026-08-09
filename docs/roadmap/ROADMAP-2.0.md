@@ -82,7 +82,7 @@ Que un agente pueda conducir el motor sin acoplarse a la ABI de Rust.
 (ADR-0043 §3); `review decide-batch` atómico con un evento por decisión;
 `plan tree`; y los dos crates.
 
-`df-tools` expone 23 herramientas —11 `observe`, 9 `build`, 3 `commit`— y
+`df-tools` expone 25 herramientas —13 `observe`, 9 `build`, 3 `commit`— y
 rechaza cualquier nombre ausente del registro, de modo que una herramienta no
 puede existir por ser alcanzable sin estar declarada.
 `Capability::requires_authorization` es propiedad de la **clase** y no de la

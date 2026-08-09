@@ -7,6 +7,10 @@ Documento de coordinación, no de diseño. Existe porque este trabajo se ha
 hecho desde varias sesiones en paralelo y una de ellas empezó sin saber que
 las otras existían. Si retomas el repo, lee esto primero.
 
+> **Traspaso más reciente:**
+> [continuidad-fase-agentica-2026-08-09.md](continuidad-fase-agentica-2026-08-09.md),
+> que reconcilia este estado con los hallazgos y fija el orden de PR recomendado.
+
 > Y después [hallazgos-2026-08-01.md](hallazgos-2026-08-01.md): mediciones,
 > la procedencia desconocida del score de representante, y el reencuadre de
 > M2.3 hacia «el agente propone un perfil» que está pendiente de decisión.

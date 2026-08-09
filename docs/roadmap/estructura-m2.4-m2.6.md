@@ -131,6 +131,11 @@ Budget           { calls, tokens, bytes, spend_cents }
 Ledger de consumo: cada invocación descuenta y queda auditada
 ```
 
+> **Decisión pendiente antes de la migración 0022:** el tipo actual de
+> `df-ai::policy` contiene llamadas, bytes divulgados y gasto, pero no tokens.
+> La documentación y el contrato persistido deben elegir la misma superficie;
+> no se congela la discrepancia en una migración.
+
 ### Las tres reglas que lo hacen seguro
 
 1. **Se congela y se sella el digest** al aprobarla, como el manifiesto de
