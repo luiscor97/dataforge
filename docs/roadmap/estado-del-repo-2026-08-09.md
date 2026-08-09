@@ -71,6 +71,27 @@ y prueba real.
 
 ## 5. Deuda concreta y accionable
 
+### 5.0 `main` no puede producir release ahora mismo
+
+**El SBOM versionado en `main` no cuadra con el `Cargo.lock` de `main`**: 124
+líneas, toda la familia cranelift/wasmtime. El bump de seguridad de wasmtime
+(#46) actualizó el lock y no regeneró `docs/sbom/dataforge.cdx.json`.
+
+Comprobado ejecutando lo mismo que hace el job del tag:
+
+```bash
+python scripts/generate-sbom.py > /tmp/fresh.cdx.json
+diff docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json
+```
+
+Taggear desde `main` hoy fallaría `SBOM (regenerate and verify)` y **no
+produciría release ninguna**. No se vio porque `release.yml` solo corre en tag
+o dispatch: la #46 se fusionó en verde sin que nada ejercitara la comprobación.
+
+Es la segunda vez que muerde — la primera fue `tauri-plugin-dialog`. La PR #48
+lo repara al regenerar el SBOM, y la #49 añade la comprobación a la CI de
+pull request para que la tercera no exista.
+
 ### 5.1 Colisión de numeración de ADR — real, contra `main`
 
 | ADR | `main` | `feat/agent-drivable` | `perf/m101` |
@@ -85,19 +106,31 @@ tiene declarados como el rango de las decisiones fundacionales.
 
 Nada detecta esto automáticamente. Falta un test de unicidad.
 
-### 5.2 Dependabot: 15 PRs abiertas
+### 5.2 Dependabot — triada, PR #49
 
-Ninguna se ha mirado. Dos avisos que valen para todas:
+Ninguna es un parche de seguridad: `cargo audit` sobre `main` no reporta
+vulnerabilidades, solo los 20 crates sin mantenimiento documentados en
+`deny.toml`.
 
-- Su base de CI está desactualizada; hay que pedir `@dependabot rebase` antes de
-  juzgar sus checks.
-- **Mergear cualquiera de las de Rust obliga a regenerar
-  `docs/sbom/dataforge.cdx.json` en el mismo cambio**, o el job `SBOM
-  (regenerate and verify)` falla en el siguiente tag y no sale release. Ya pasó
-  una vez con `tauri-plugin-dialog`.
+La **PR #49** aplica la mitad rutinaria y cierra nueve: `serde_json`, `uuid`,
+`prettier`, `globals`, `jsdom` 30, `vite` 8 con `@vitejs/plugin-react` 6,
+`setup-node` v7 y `pnpm/action-setup` v6.
 
-Saltos mayores que necesitan mirada: `jsonschema` 0.33→0.49, `vite` 7→8,
-`jsdom` 27→30, y los `actions/*-artifact` 4→7/8.
+Dos cosas que salieron al hacerlo:
+
+- **`vite` y `plugin-react` son un cambio, no dos.** `plugin-react` 6 importa
+  `vite/internal`, que Vite 7 no exporta, así que mergear solo la #39 rompe
+  toda la suite de UI antes del primer test. Dependabot las propuso separadas.
+- **Tres no son rutina y quedan fuera**: `semver`, `jsonschema` y `ureq` están
+  clavadas con `=` porque `df-plugin` clava todas sus dependencias — ejecuta
+  WASM no confiable y verifica firmas, y `jsonschema` parsea los manifiestos,
+  o sea entrada no confiable. Aflojar esos pins es una decisión de cadena de
+  suministro con su propia revisión.
+
+**Las acciones de artefactos de `release.yml` también quedan fuera**: un cambio
+de layout en `download-artifact@v8` pasaría todos los checks de PR y solo
+aparecería cuando un tag no produjera release. Quieren un ensayo con
+`workflow_dispatch` antes.
 
 ### 5.3 Decisiones que bloquean el siguiente bloque grande
 
@@ -189,10 +222,22 @@ funcional.
 
 En este orden, y cada una cabe en una sesión:
 
-1. **Cerrar la #45.** Es la línea activa, pasa la puerta, y cuanto más crezca
+1. **Mergear la #48 y taggear `v1.0.1`.** Es lo único que desbloquea publicar,
+   y además repara el SBOM de `main` (§5.0). La 1.0.0 queda como tag histórico
+   sin release; su borrador lleva wasmtime 36.0.12 (RUSTSEC-2026-0222) y
+   conviene retirarlo para que nadie lo publique por error.
+2. **Cerrar la #45.** Es la línea activa, pasa la puerta, y cuanto más crezca
    más difícil es de revisar. El PR 0 del traspaso.
-2. **Renumerar `perf/m101` a 0046/0047** y añadir el test de unicidad de ADR.
-3. **Decidir qué hacer con el borrador de release**, que hoy contiene software
-   peor que `main`.
+3. **Mergear la #49** (Dependabot) y **la #30** una vez revisada la
+   renumeración a 0046/0047.
 4. **Podar las ramas ya fusionadas.**
-5. Dependabot, con la advertencia del SBOM por delante.
+5. Las tres decisiones de diseño de §5.3, que son lo que bloquea el siguiente
+   bloque grande de la 2.0.
+
+### Ya resuelto desde que se escribió esta foto
+
+- Colisión ADR-0041 contra `main`: `perf/m101` renumerada a 0046/0047, con
+  `adr_numbers_are_unique` para que no vuelva a pasar.
+- Deriva del SBOM: comprobada ahora en la CI de pull request (#49), no solo
+  en el tag.
+- Clase `commit` de `df-mcp` cerrada por defecto hasta que exista el gate.
