@@ -3473,4 +3473,47 @@ mod frozen_contracts {
             "dataforge.assisted-intelligence-prompt/0.7.0"
         );
     }
+
+    /// No two ADRs may claim the same number.
+    ///
+    /// This has gone wrong twice while several lines of work ran in parallel:
+    /// each branch picked "the next free number" against its own tree and two
+    /// of them picked the same one. Nothing caught it, because a duplicate is
+    /// only a conflict once both branches reach `main`, and by then one of the
+    /// two decisions is being cited by a number that means something else.
+    ///
+    /// Reading the directory rather than a list is deliberate: a list would be
+    /// one more thing to update, and the failure being prevented is precisely
+    /// someone forgetting to update something.
+    #[test]
+    fn adr_numbers_are_unique() {
+        use std::collections::BTreeMap;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("adr");
+        let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).expect("docs/adr must exist") {
+            let name = entry.expect("readable entry").file_name();
+            let name = name.to_string_lossy().to_string();
+            // `ADR-1234-slug.md`; README and anything else is not an ADR.
+            let Some(number) = name
+                .strip_prefix("ADR-")
+                .and_then(|rest| rest.get(..4))
+                .filter(|number| number.chars().all(|c| c.is_ascii_digit()))
+            else {
+                continue;
+            };
+            seen.entry(number.to_string()).or_default().push(name);
+        }
+
+        assert!(!seen.is_empty(), "no ADR was found in {}", dir.display());
+        let duplicates: Vec<_> = seen.iter().filter(|(_, files)| files.len() > 1).collect();
+        assert!(
+            duplicates.is_empty(),
+            "two ADRs share a number: {duplicates:?}"
+        );
+    }
 }

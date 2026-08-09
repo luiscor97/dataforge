@@ -94,7 +94,7 @@ modificar arbitrariamente proceso, base y salida a la vez.
   (un único escritor coordinador), el resultado es byte-idéntico a
   `workers=1` (probado) y la cancelación solo deja de tomar trabajos nuevos;
   ninguna respuesta depende del scheduling. Más hilos no relajan ninguna
-  comprobación (ADR-0040).
+  comprobación (ADR-0046).
 
 ## Riesgos aceptados y límites
 

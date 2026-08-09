@@ -1,4 +1,4 @@
-# ADR-0041 — Ejecución estricta paralela (M1.0.1)
+# ADR-0047 — Ejecución estricta paralela (M1.0.1)
 
 - Estado: Aceptada (opt-in; no predeterminado hasta cumplir §9 del diseño)
 - Fecha: 2026-07-22

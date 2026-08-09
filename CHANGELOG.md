@@ -20,7 +20,7 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   cuello de botella **medido**: copiar bytes es solo el 5,7 % del tiempo de
   ejecución; dominan los commits SQLite por operación (~32 %) y la latencia de
   syscalls por archivo (~32 %). No es ancho de banda, es latencia por archivo.
-- Hashing y verificación paralelos acotados (ADR-0040): un coordinador SQLite
+- Hashing y verificación paralelos acotados (ADR-0046): un coordinador SQLite
   único entrega trabajos inmutables a un pool acotado (`std::thread::scope`,
   sin dependencias nuevas; buffer por worker; work-stealing por índice
   atómico), `--workers auto|N`. Determinismo probado: `workers=1` y

@@ -1,4 +1,4 @@
-# ADR-0040 — Hash y verificación paralelos acotados (M1.0.1)
+# ADR-0046 — Hash y verificación paralelos acotados (M1.0.1)
 
 - Estado: Aceptada
 - Fecha: 2026-07-21
