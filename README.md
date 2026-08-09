@@ -9,6 +9,11 @@ justificable; y produce una copia verificada criptográficamente, con
 trazabilidad de cada decisión. El documento fundacional es
 [RFC-0001](docs/rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 
+> **¿Retomas el proyecto, o llegas nuevo a él? Empieza por
+> [docs/ESTADO.md](docs/ESTADO.md).** Dice en qué punto está todo, qué espera
+> una decisión humana, y dónde está cada cosa. El trabajo se reparte entre
+> varios equipos que no comparten memoria: ese documento es la memoria.
+
 **Estado actual: 1.0.0 — Milestone 1.0 "Stable Reconstruction Platform".**
 El pipeline completo llega de la carpeta caótica a una copia verificada —
 probado hasta **1.000.000 de archivos** con verificación independiente
