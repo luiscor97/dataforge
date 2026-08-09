@@ -184,3 +184,22 @@ jobs:
 
       - name: cargo deny
         run: cargo deny check
+
+      # The release workflow diffs the committed SBOM against a fresh
+      # generation and fails hard when they disagree — but it only runs on a
+      # tag or a dispatch, so until now nothing checked this on a pull request.
+      # Twice a dependency change landed on main without regenerating the SBOM,
+      # and both times the drift was invisible until someone tagged and got no
+      # release at all. Same check, moved to where it can still be cheap to fix.
+      - name: SBOM matches Cargo.lock
+        shell: bash
+        run: |
+          python scripts/generate-sbom.py > /tmp/fresh.cdx.json
+          if ! diff -q docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json > /dev/null; then
+            echo "::error::The committed SBOM does not match Cargo.lock."
+            echo "Regenerate it in the same commit that changes dependencies:"
+            echo "  python scripts/generate-sbom.py > docs/sbom/dataforge.cdx.json"
+            diff docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json | head -40
+            exit 1
+          fi
+          echo "SBOM is current"
