@@ -544,6 +544,12 @@ construcción. No se reescribe historia. El perfil `generic` mantiene la salida
   se pueden contrastar. Sigue abierto para todo lo demás: una cifra medida en
   un archivo jurídico no es un umbral universal, y el modo sombra sigue siendo
   la forma de saberlo.
+  **Y agravado el mismo día:** al abrir esa base resulta que de las 47.982
+  decisiones **ninguna la revisó un humano** — las tomó todas una fórmula de
+  puntuación y nadie las ha comprobado nunca. No es que falten datos de
+  calibración: es que los que hay son de una heurística sin auditar. Medición y
+  muestra en
+  [tres-decisiones-con-evidencia.md](tres-decisiones-con-evidencia.md).
 - **Suponer que la política de duplicados basta.** Se dio por hecho, en esta
   misma línea de trabajo, que elegir `CONSOLIDATE_ALL` produciría una salida
   deduplicada de unos 204 GB. Medido, el ahorro alcanzable es de 5,45 GB. La
