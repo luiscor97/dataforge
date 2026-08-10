@@ -47,6 +47,7 @@ mod secrets;
 
 pub use df_db::assistance::AssistanceAuditView;
 pub use df_db::inventory::{NameCollision, NameCollisionReport};
+pub use df_db::liveness::{RunLiveness, RunStage};
 pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
@@ -144,6 +145,10 @@ pub struct ProjectStatus {
     pub media: Option<MediaStatusReport>,
     /// Present when an integrity pass was executed (project_status).
     pub integrity: Option<IntegrityReport>,
+    /// The run holding this project, if one claimed it. Evidence only — who,
+    /// from where, and how long since it last said anything. It carries no
+    /// alive/dead verdict, because that is not a fact this database can hold.
+    pub active_run: Option<df_db::liveness::RunLiveness>,
 }
 
 /// Compact, human-readable relation. It is evidence only: `automatic_action`
@@ -618,6 +623,7 @@ fn status_from_db(
         similarity,
         media,
         integrity,
+        active_run: df_db::liveness::liveness(db, project.id)?,
     })
 }
 
@@ -3781,9 +3787,9 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 20, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 21, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[19].name, "routing_provenance");
+        assert_eq!(df_db::migrations::MIGRATIONS[20].name, "run_liveness");
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");

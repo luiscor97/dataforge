@@ -11,6 +11,7 @@ pub mod dedup;
 pub mod extraction;
 pub mod integrity;
 pub mod inventory;
+pub mod liveness;
 pub mod media;
 pub mod migrations;
 pub mod plans;

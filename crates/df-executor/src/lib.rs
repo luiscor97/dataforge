@@ -147,6 +147,10 @@ pub fn execute_plan(
     if !recovering_executing {
         repository::update_project_state(db, ProjectState::Executing, actor)?;
     }
+    // EXECUTING is a durable state that outlives the process holding it, which
+    // is why recovering from it is a decision the caller has to make. Recording
+    // who is copying makes that decision an informed one instead of a bet.
+    df_db::liveness::claim(db, project.id, df_db::liveness::RunStage::Execute, actor)?;
 
     let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut bytes_copied: u64 = 0;
@@ -214,8 +218,12 @@ pub fn execute_plan(
                 break 'run;
             }
         }
+        // One beat per batch, not per file: a heartbeat at 197k operations
+        // would cost more writes than the work it reports on.
+        df_db::liveness::beat(db, project.id)?;
     }
 
+    df_db::liveness::release(db, project.id)?;
     let progress = plans::plan_progress(db, plan.id)?;
     let all_terminal =
         progress.pending == 0 && progress.running == 0 && progress.failed_retryable == 0;

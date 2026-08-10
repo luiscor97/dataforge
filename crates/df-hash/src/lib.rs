@@ -138,6 +138,10 @@ pub fn hash_project(
     }
 
     repository::update_project_state(db, ProjectState::Hashing, actor)?;
+    // Say who is doing this, so a second process — or the same person
+    // tomorrow — can see whether a run is holding the project rather than
+    // guess from a state that outlives its process.
+    df_db::liveness::claim(db, project.id, df_db::liveness::RunStage::Hash, actor)?;
     inventory::enqueue_hash_jobs(db, snapshot.id, actor)?;
     let reused = if options.incremental {
         inventory::reuse_previous_hash_bindings(db, project.id, snapshot.id)?
@@ -168,6 +172,9 @@ pub fn hash_project(
             });
         }
         inventory::record_hash_results(db, &results)?;
+        // One beat per committed batch: the heartbeat tracks progress that
+        // actually reached the database, never merely that the loop spun.
+        df_db::liveness::beat(db, project.id)?;
         if cancelled {
             break;
         }
@@ -189,6 +196,7 @@ pub fn hash_project(
         actor,
     )?;
     let project = repository::update_project_state(db, next_state, actor)?;
+    df_db::liveness::release(db, project.id)?;
 
     Ok(HashOutcome {
         snapshot_id: snapshot.id.to_string(),

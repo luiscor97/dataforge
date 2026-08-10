@@ -282,6 +282,24 @@ export interface ContentQueryOutcome {
   result: QueryResult;
 }
 
+/**
+ * The run holding this project, if one claimed it. Evidence only: there is no
+ * alive/dead field, because whether a run is alive is not something the
+ * database can know — a pid means nothing on another host, and a sleeping
+ * laptop has a stale heartbeat and a live run.
+ */
+export interface RunLiveness {
+  stage: string;
+  pid: number;
+  host: string;
+  started_at: string;
+  heartbeat_at: string;
+  heartbeat_age_seconds: number;
+  /** The claim belongs to the process asking: the one factual answer. */
+  is_this_process: boolean;
+  is_this_host: boolean;
+}
+
 export interface ProjectStatus {
   project_id: string;
   name: string;
@@ -302,6 +320,7 @@ export interface ProjectStatus {
   similarity: SimilarityStatus | null;
   media: MediaStatusReport | null;
   integrity: IntegrityReport | null;
+  active_run: RunLiveness | null;
 }
 
 // --- Reconstruction pipeline outcomes ------------------------------------
