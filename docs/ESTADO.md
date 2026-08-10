@@ -114,6 +114,7 @@ equipos.
 
 | Fecha | Dónde | Qué pasó | Queda |
 | --- | --- | --- | --- |
+| 2026-08-10 | PC | **Hueco cerrado**: llegó la transcripción del trabajo original (49 turnos) y el corpus `D:\Discolocal`. Registrado en [field-runs](testing/field-runs/2026-06-29-asesoria-juridica-original.md) con las cifras reales: 443,4 GB → 150,57 GB, 29.228 archivos, 0 duplicados | Llevar esos números a la definición de hecho de ROADMAP-2.0; conseguir el manifiesto SHA-256 de cierre |
 | 2026-08-09 | PC | Auditoría del repo; ADRs de `perf/m101` renumerados a 0046/0047 con test de unicidad; clase `commit` cerrada en `df-mcp`; 1.0.1 preparada (#48); Dependabot triado (#49) con check de deriva de SBOM en CI | Mergear #48/#45/#49; retirar el borrador de la 1.0.0 |
 | 2026-08-09 | PC | Ensayo completo del flujo CLI sobre corpus que replica el caso jurídico (4 puestos): `COMPLETED`, ledger verificado. **El 100 % acabó en `90_DataForge_Review`** y el árbol limpio quedó vacío — es la regla 9, no un fallo | Avisarlo antes de enseñar un resultado |
 | 2026-08-01 | Oficina | RFC-0002 aprobada y fusionada; los cuatro crates de la 2.0 creados (`df-tools`, `df-mcp`, `df-rules`, `df-agent`); ROADMAP-2.0 con definición de hecho falsable | Cablear: nada de eso conduce el motor todavía |
@@ -125,11 +126,18 @@ equipos.
 Cosas que se hicieron y **no** están en el repositorio. Se listan para que nadie
 las dé por perdidas ni las repita a ciegas.
 
-- **Las pruebas de la 1.0 en la oficina.** De ahí salen las cifras que sostienen
-  medio ROADMAP-2.0 — 158.219 archivos, 443,9 GB, 28.537 conjuntos de
-  duplicados, 239,7 GB redundantes, 5.334 items de revisión de los que 3.702
-  son una sola clase. Los números están citados; **la ejecución que los produjo
-  no está registrada**. Mientras siga así, no son reproducibles por nadie más.
+- ~~Las pruebas de la 1.0 en la oficina.~~ **Cerrado el 2026-08-10**: llegó la
+  transcripción completa y el corpus. Registrado en
+  [`2026-06-29-asesoria-juridica-original.md`](testing/field-runs/2026-06-29-asesoria-juridica-original.md).
+- **El manifiesto SHA-256 de cierre del trabajo original** (29.239 entradas)
+  sigue fuera del repositorio. Es la única prueba que permitiría comparar una
+  salida de DataForge contra la buena, archivo a archivo — la evidencia más
+  valiosa que existe para la definición de hecho de la 2.0.
+- **El informe final al asesor** está en el disco, no aquí. Contiene datos del
+  cliente, así que no debe entrar tal cual; sí valdría un extracto con los
+  criterios y sin nombres.
+- **2.313 archivos de diferencia** entre lo que cita ROADMAP-2.0 (158.219) y lo
+  medido sobre `D:\Discolocal` (155.906). Sin explicar.
 - **Los pesos del representante** proceden probablemente de la ejecución
   original conducida por un modelo, y no se han validado contra criterio humano.
 
