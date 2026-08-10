@@ -318,6 +318,29 @@ fn input_schema(name: &str) -> Value {
             "required": ["project_dir"],
             "additionalProperties": false,
         }),
+        "hash_project" => json!({
+            "type": "object",
+            "properties": {
+                "project_dir": project_dir,
+                "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description":
+                        "Stop after this many files and pause, leaving the rest queued. \
+                         Use it: on a real archive an unbounded call runs for hours and \
+                         never returns. Call again to continue; `pending` says what is left.",
+                },
+                "resume_interrupted": {
+                    "type": "boolean",
+                    "default": false,
+                    "description":
+                        "Continue a run that died without pausing. You are asserting no \
+                         other run is active — check `project_status.active_run` first.",
+                },
+            },
+            "required": ["project_dir"],
+            "additionalProperties": false,
+        }),
         "create_plan" => json!({
             "type": "object",
             "properties": {

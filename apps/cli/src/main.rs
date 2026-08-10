@@ -124,11 +124,18 @@ enum Command {
         incremental: bool,
         /// Continue a project stranded in `HASHING` by a run that died
         /// without pausing (a kill, a power cut, a closed window). Only
-        /// pass this when no other hash run is active: DataForge cannot
-        /// tell a dead run from a live one. The interrupted run is closed
-        /// with its own `HASH_PAUSED` event before the queue continues.
+        /// pass this when no other hash run is active: DataForge still
+        /// cannot decide that for you, but `project status` now shows
+        /// `active_run` — who claimed the project, from where, and how long
+        /// since it last reported — so the assertion can be an informed one.
+        /// The interrupted run is closed with its own `HASH_PAUSED` event
+        /// before the queue continues.
         #[arg(long)]
         resume_interrupted: bool,
+        /// Stop after this many files, leaving the rest queued. The queue is
+        /// persistent, so running again continues where this stopped.
+        #[arg(long)]
+        max_files: Option<u64>,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -731,12 +738,14 @@ fn run(cli: &Cli) -> DfResult<Output> {
             path,
             incremental,
             resume_interrupted,
+            max_files,
         } => df_facade::hash_project_with_options(
             path,
             actor,
             &df_facade::HashOptions {
                 incremental: *incremental,
                 resume_interrupted: *resume_interrupted,
+                max_files: *max_files,
                 ..df_facade::HashOptions::default()
             },
         )

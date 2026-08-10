@@ -50,6 +50,20 @@ pub struct HashOptions {
     /// closed with its own `HASH_PAUSED` event before the new one starts, so
     /// the ledger shows why a `HASHING` project was allowed to restart.
     pub resume_interrupted: bool,
+    /// Stop after this many files and pause, leaving the rest queued.
+    ///
+    /// For a caller that cannot afford to block. An agent driving the engine
+    /// over stdio has one session, and a call that takes hours to return is a
+    /// call that never comes back. A budget turns hashing into something it
+    /// can supervise — do this much, report, decide, call again — and needs no
+    /// detached process to do it, because the queue was already persistent and
+    /// resumable.
+    ///
+    /// Exhausting it is neither a failure nor a user cancellation: it takes
+    /// the same cooperative pause path, so the project lands in `HASH_PAUSED`
+    /// with the remainder queued, and `pending` says how much is left. `None`
+    /// runs to completion, which is what a person at a terminal wants.
+    pub max_files: Option<u64>,
 }
 
 impl Default for HashOptions {
@@ -59,6 +73,7 @@ impl Default for HashOptions {
             job_batch: 256,
             incremental: false,
             resume_interrupted: false,
+            max_files: None,
         }
     }
 }
@@ -155,6 +170,8 @@ pub fn hash_project(
     // recomputed on resume.
     let mut buffer = vec![0u8; options.read_buffer_bytes];
     let mut cancelled = false;
+    let mut budget_spent: u64 = 0;
+    let mut budget_exhausted = false;
     loop {
         let jobs = inventory::pending_hash_jobs(db, snapshot.id, options.job_batch)?;
         if jobs.is_empty() {
@@ -166,22 +183,32 @@ pub fn hash_project(
                 cancelled = true;
                 break;
             }
+            // Checked before the work, so the budget is a ceiling on files
+            // hashed rather than on files hashed minus one.
+            if options.max_files.is_some_and(|max| budget_spent >= max) {
+                budget_exhausted = true;
+                break;
+            }
             results.push(inventory::HashJobResult {
                 job,
                 outcome: hash_one(job, &mut buffer),
             });
+            budget_spent += 1;
         }
         inventory::record_hash_results(db, &results)?;
         // One beat per committed batch: the heartbeat tracks progress that
         // actually reached the database, never merely that the loop spun.
         df_db::liveness::beat(db, project.id)?;
-        if cancelled {
+        if cancelled || budget_exhausted {
             break;
         }
     }
 
     let summary = inventory::inventory_summary(db, snapshot.id)?;
-    let (event_type, next_state) = if cancelled {
+    // A spent budget pauses exactly as a cancellation does. What matters to a
+    // caller is not why it stopped but what is left, and `pending` says that
+    // either way.
+    let (event_type, next_state) = if cancelled || budget_exhausted {
         (inventory::EVENT_HASH_PAUSED, ProjectState::HashPaused)
     } else {
         (inventory::EVENT_HASH_COMPLETED, ProjectState::Hashed)
@@ -432,6 +459,38 @@ mod tests {
         // One sample per distinct content, so the sample shows the
         // disagreement instead of repeating one side of it.
         assert_eq!(collision.sample_paths.len(), 3);
+    }
+
+    /// The shape an agent drives: bounded calls over a persistent queue.
+    #[test]
+    fn a_budget_stops_early_and_the_rest_stays_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut db, _origin) = scanned_project(tmp.path());
+
+        let first = hash_project(
+            &mut db,
+            Actor::Test,
+            &HashOptions {
+                max_files: Some(2),
+                ..HashOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.hashed, 2, "the budget is a ceiling, not a suggestion");
+        assert_eq!(first.pending, 1, "and it says what is left");
+        assert_eq!(
+            first.state, "HASH_PAUSED",
+            "a spent budget pauses on the same path a cancellation does"
+        );
+        // Not a cancellation: nobody asked it to stop.
+        assert!(!first.cancelled);
+
+        // Calling again finishes the job. Nothing was lost or re-read.
+        let second = hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+        assert_eq!(second.hashed, 3, "counts are per snapshot, not per call");
+        assert_eq!(second.pending, 0);
+        assert_eq!(second.state, "HASHED");
     }
 
     #[test]

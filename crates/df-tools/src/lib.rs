@@ -320,6 +320,24 @@ struct ProjectInput {
     project_dir: PathBuf,
 }
 
+/// Hashing, as something an agent can supervise.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HashInput {
+    project_dir: PathBuf,
+    /// Stop after this many files and pause, leaving the rest queued. The one
+    /// parameter that makes this tool usable over stdio: without it a call on
+    /// a real archive runs for hours and the session is gone. Omitted, it runs
+    /// to completion.
+    #[serde(default)]
+    max_files: Option<u64>,
+    /// Continue a run that died without pausing. The caller asserting that no
+    /// other run is active — `project_status.active_run` is what that
+    /// assertion should be based on.
+    #[serde(default)]
+    resume_interrupted: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlanTreeInput {
@@ -712,8 +730,19 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             encode(name, df_facade::scan_project(&input.project_dir, actor)?)
         }
         "hash_project" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(name, df_facade::hash_project(&input.project_dir, actor)?)
+            let input: HashInput = parse(name, input)?;
+            encode(
+                name,
+                df_facade::hash_project_with_options(
+                    &input.project_dir,
+                    actor,
+                    &df_facade::HashOptions {
+                        max_files: input.max_files,
+                        resume_interrupted: input.resume_interrupted,
+                        ..df_facade::HashOptions::default()
+                    },
+                )?,
+            )
         }
         "analyze_project" => {
             let input: ProjectInput = parse(name, input)?;
