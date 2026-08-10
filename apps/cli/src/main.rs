@@ -15,11 +15,11 @@ use df_facade::{
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
     DuplicateReport, ExecuteOutcome, ExtractionLimits, HashOutcome, MediaOutcome,
-    MediaProjectOptions, MediaReport, MediaSidecars, PlanDestinationTree, PlanOutcome,
-    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
-    QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome,
-    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
-    SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport, PlanDestinationTree,
+    PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome,
+    ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue,
+    ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome,
+    SimilarityReport, SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -437,6 +437,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// File names standing for different content in different places.
+    NameCollisions {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Exact tree clones (folders with byte-for-byte identical subtrees).
     TreeClones {
         /// Project directory.
@@ -661,6 +667,7 @@ enum Output {
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
+    NameCollisions(NameCollisionReport),
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
@@ -1017,6 +1024,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)
+            }
+            ReportCommand::NameCollisions { path } => {
+                df_facade::name_collision_report(path).map(Output::NameCollisions)
             }
             ReportCommand::TreeClones { path } => {
                 df_facade::tree_clone_report(path).map(Output::TreeClones)
@@ -1470,6 +1480,37 @@ fn print_verify(outcome: &VerifyOutcome) {
                 finding.severity, finding.kind, finding.subject, finding.detail
             );
         }
+    }
+}
+
+fn print_name_collisions(report: &NameCollisionReport) {
+    println!("Snapshot          : {}", report.snapshot_id);
+    println!("Colliding names   : {}", report.colliding_names);
+    println!("Files involved    : {}", report.occurrences_involved);
+    println!(
+        "Worst name holds  : {} contents",
+        report.worst_name_contents
+    );
+    for collision in &report.collisions {
+        println!();
+        println!(
+            "  {} -> {} contents in {} folders ({} files)",
+            collision.normalized_name, collision.contents, collision.folders, collision.occurrences
+        );
+        for path in &collision.sample_paths {
+            println!("    {path}");
+        }
+    }
+    if report.collisions.is_empty() {
+        println!();
+        println!("No name in this snapshot stands for more than one content.");
+    } else {
+        println!();
+        // The point of the report: these are not duplicates to collapse.
+        println!(
+            "Evidence only. Each name above holds different content in \
+             different places, so merging by name would lose material."
+        );
     }
 }
 
@@ -1985,6 +2026,7 @@ fn print_human(output: &Output) {
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
+        Output::NameCollisions(report) => print_name_collisions(report),
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
@@ -2142,6 +2184,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
         // Evidence reports always succeed: finding duplicates, clones or
         // partial clones is information, not a failure.
         Output::Duplicates(_) => 0,
+        Output::NameCollisions(_) => 0,
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,

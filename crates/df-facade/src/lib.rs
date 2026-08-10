@@ -46,6 +46,7 @@ mod ai_transport;
 mod secrets;
 
 pub use df_db::assistance::AssistanceAuditView;
+pub use df_db::inventory::{NameCollision, NameCollisionReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
 pub use df_plugin::{
