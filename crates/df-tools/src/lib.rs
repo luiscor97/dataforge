@@ -40,6 +40,31 @@
 //! is what lets an agent die mid-run and resume with no coordination
 //! (ADR-0043 §5).
 //!
+//! # Reports are bounded
+//!
+//! A report that lists detail returns a **window** over it, never the whole
+//! collection. On a real archive the collections are the reason the surface
+//! was unusable: 28,537 duplicate sets and 5,334 review items fit in no
+//! context window, and an agent that asks for one and receives tens of
+//! megabytes of JSON has spent its session without learning anything.
+//!
+//! Three properties make the window safe to rely on:
+//!
+//! - **Totals are never windowed.** Every report pairs scalar counts computed
+//!   over the whole snapshot with the list of instances. `redundant_bytes`
+//!   means the same thing whether one set came back or a thousand.
+//! - **Truncation is always visible.** [`Page::has_more`] and
+//!   [`Page::returned`] describe what actually came back, so no caller can
+//!   mistake a window for the whole. A truncation that cannot be detected is
+//!   not pagination — it is a wrong answer that looks like a right one.
+//! - **The ceiling is not negotiable.** A caller may ask for fewer items than
+//!   [`MAX_REPORT_ITEMS`] and never for more, because a bound the caller can
+//!   raise is not a bound.
+//!
+//! This is the pattern `structural_review_classes` already established, where
+//! answering 3,702 identical questions by class rather than by item is what
+//! makes the queue tractable at all.
+//!
 //! # Stability
 //!
 //! Tool names and their capability classes are a frozen contract, versioned by
@@ -73,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.2.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.3.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +400,144 @@ struct ReviewDecision {
     rationale: String,
 }
 
+/// The input of a report that lists detail: a project, and a window over it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportInput {
+    project_dir: PathBuf,
+    /// Items to list per collection. Clamped to [`MAX_REPORT_ITEMS`]; `0` asks
+    /// for totals with no detail at all, which is a useful thing to want.
+    #[serde(default = "default_report_items")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_report_items() -> usize {
+    DEFAULT_REPORT_ITEMS
+}
+
+impl ReportInput {
+    fn window(&self) -> Window {
+        Window {
+            offset: self.offset,
+            limit: self.limit.min(MAX_REPORT_ITEMS),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    offset: usize,
+    limit: usize,
+}
+
+/// What a report lists when the caller asks for no particular window.
+///
+/// Small on purpose. An agent surveys first and drills in second, and the
+/// common case is wanting to know the shape of the problem rather than to
+/// read every instance of it.
+pub const DEFAULT_REPORT_ITEMS: usize = 50;
+
+/// Hard ceiling on the items a single report response may list.
+///
+/// A caller may ask for fewer, never for more — the same discipline
+/// `content_query` applies to its own limits, and for the same reason: a bound
+/// the caller can raise is not a bound. Clamping here is not a silent
+/// truncation, because [`Page::has_more`] and [`Page::returned`] always
+/// describe what actually came back.
+pub const MAX_REPORT_ITEMS: usize = 1_000;
+
+// A default above the ceiling would be clamped on every call, so the declared
+// default would be a lie. Cheaper to make it impossible to compile.
+const _: () = assert!(DEFAULT_REPORT_ITEMS <= MAX_REPORT_ITEMS);
+
+/// A window over one of a report's detail collections.
+///
+/// Every report pairs scalar totals computed over the whole snapshot with a
+/// list of instances. Windowing narrows what is **listed**, never what is
+/// **counted**: `redundant_bytes` means the same thing whether one set came
+/// back or a thousand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Page {
+    /// Items the collection holds in full, before the window.
+    pub total: usize,
+    /// Items actually listed in this response.
+    pub returned: usize,
+    /// Where this window starts.
+    pub offset: usize,
+    /// Whether items remain past this window. Explicit because a truncation
+    /// the caller cannot detect is not pagination — it is a wrong answer that
+    /// looks like a right one.
+    pub has_more: bool,
+}
+
+/// Narrow one named array of an encoded report in place, and describe it.
+fn window_field(name: &str, value: &mut Value, field: &str, window: Window) -> DfResult<Page> {
+    let array = value
+        .get_mut(field)
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            DfError::Serialization(format!(
+                "tool `{name}` expected `{field}` to be an array of detail"
+            ))
+        })?;
+
+    let total = array.len();
+    // Drop what falls outside the window rather than copying what falls
+    // inside it: on a real corpus this collection is the large object.
+    let start = window.offset.min(total);
+    let end = window.offset.saturating_add(window.limit).min(total);
+    array.truncate(end);
+    array.drain(..start);
+    let returned = array.len();
+
+    Ok(Page {
+        total,
+        returned,
+        offset: window.offset,
+        has_more: window.offset.saturating_add(returned) < total,
+    })
+}
+
+/// The detail collections a tool windows, or `None` if it is not a windowed
+/// report.
+///
+/// The single definition of which tools page and over what. Both the dispatch
+/// below and the MCP input schema read it, so the schema cannot advertise a
+/// window the dispatch does not apply — or miss one it does.
+pub fn report_collections(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "duplicate_report" | "tree_clone_report" => &["sets"],
+        "tree_relation_report" => &["relations"],
+        "context_report" => &["generic_folders", "protected_folders"],
+        "structural_anomaly_report" => &["anomalies"],
+        "structural_review_queue" => &["items"],
+        _ => return None,
+    })
+}
+
+/// Encode a report and bound every collection it lists.
+///
+/// The windows go into a `pages` object keyed by field name, so a report with
+/// one collection and a report with three describe themselves the same way and
+/// an agent learns the shape once.
+fn encode_report<T: Serialize>(name: &str, report: T, window: Window) -> DfResult<Value> {
+    let fields = report_collections(name)
+        .ok_or_else(|| DfError::Serialization(format!("tool `{name}` is not a windowed report")))?;
+    let mut value = encode(name, report)?;
+    let mut pages = serde_json::Map::with_capacity(fields.len());
+    for field in fields {
+        let page = window_field(name, &mut value, field, window)?;
+        pages.insert((*field).to_string(), encode(name, page)?);
+    }
+    value
+        .as_object_mut()
+        .ok_or_else(|| DfError::Serialization(format!("tool `{name}` did not encode an object")))?
+        .insert("pages".to_string(), Value::Object(pages));
+    Ok(value)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(name: &str, input: Value) -> DfResult<T> {
     serde_json::from_value(input)
         .map_err(|error| DfError::Validation(format!("invalid input for tool `{name}`: {error}")))
@@ -410,33 +573,51 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             encode(name, df_facade::project_status(&input.project_dir)?)
         }
         "duplicate_report" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(name, df_facade::duplicate_report(&input.project_dir)?)
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::duplicate_report(&input.project_dir)?,
+                input.window(),
+            )
         }
         "tree_clone_report" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(name, df_facade::tree_clone_report(&input.project_dir)?)
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::tree_clone_report(&input.project_dir)?,
+                input.window(),
+            )
         }
         "tree_relation_report" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(name, df_facade::tree_relation_report(&input.project_dir)?)
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::tree_relation_report(&input.project_dir)?,
+                input.window(),
+            )
         }
         "context_report" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(name, df_facade::context_report(&input.project_dir)?)
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::context_report(&input.project_dir)?,
+                input.window(),
+            )
         }
         "structural_anomaly_report" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
                 name,
                 df_facade::structural_anomaly_report(&input.project_dir)?,
+                input.window(),
             )
         }
         "structural_review_queue" => {
-            let input: ProjectInput = parse(name, input)?;
-            encode(
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
                 name,
                 df_facade::structural_review_queue(&input.project_dir)?,
+                input.window(),
             )
         }
         "structural_review_classes" => {
@@ -716,7 +897,106 @@ mod tests {
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.2.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.3.0");
+    }
+
+    /// A report shaped like the real ones: scalar totals beside the detail.
+    fn report(items: usize) -> Value {
+        serde_json::json!({
+            "snapshot_id": "snap",
+            "redundant_bytes": 239_700_000_000u64,
+            "sets": (0..items).map(Value::from).collect::<Vec<_>>(),
+        })
+    }
+
+    fn window(offset: usize, limit: usize) -> Window {
+        Window { offset, limit }
+    }
+
+    #[test]
+    fn a_window_narrows_the_detail_and_leaves_the_totals_alone() {
+        let paged = encode_report("duplicate_report", report(28_537), window(0, 50))
+            .expect("a report windows");
+
+        assert_eq!(paged["sets"].as_array().expect("sets").len(), 50);
+        // The claim the caller actually reasons with must survive windowing,
+        // or the window would be quietly answering a different question.
+        assert_eq!(paged["redundant_bytes"], 239_700_000_000u64);
+        assert_eq!(paged["pages"]["sets"]["total"], 28_537);
+        assert_eq!(paged["pages"]["sets"]["returned"], 50);
+        assert_eq!(paged["pages"]["sets"]["has_more"], true);
+    }
+
+    #[test]
+    fn the_last_window_reports_no_more_and_a_short_one_is_not_an_error() {
+        let paged = encode_report("duplicate_report", report(120), window(100, 50))
+            .expect("a tail windows");
+        assert_eq!(paged["pages"]["sets"]["returned"], 20);
+        assert_eq!(paged["pages"]["sets"]["has_more"], false);
+
+        // Past the end is empty, never a failure: an agent walking a queue
+        // finds the end by arriving at it, not by being rejected.
+        let past =
+            encode_report("duplicate_report", report(120), window(500, 50)).expect("past the end");
+        assert_eq!(past["sets"].as_array().expect("sets").len(), 0);
+        assert_eq!(past["pages"]["sets"]["total"], 120);
+        assert_eq!(past["pages"]["sets"]["has_more"], false);
+    }
+
+    #[test]
+    fn asking_for_no_detail_still_answers_the_totals() {
+        let paged =
+            encode_report("duplicate_report", report(28_537), window(0, 0)).expect("totals only");
+        assert_eq!(paged["sets"].as_array().expect("sets").len(), 0);
+        assert_eq!(paged["redundant_bytes"], 239_700_000_000u64);
+        assert_eq!(paged["pages"]["sets"]["total"], 28_537);
+        // Nothing was listed and everything remains, which is exactly true.
+        assert_eq!(paged["pages"]["sets"]["has_more"], true);
+    }
+
+    #[test]
+    fn no_caller_can_raise_the_ceiling() {
+        let input: ReportInput = serde_json::from_value(serde_json::json!({
+            "project_dir": "p",
+            "limit": 10_000_000usize,
+        }))
+        .expect("input parses");
+
+        // Clamped, not honoured — and not silently, since the response still
+        // says how many came back and that more remain.
+        assert_eq!(input.window().limit, MAX_REPORT_ITEMS);
+        let paged = encode_report("duplicate_report", report(28_537), input.window())
+            .expect("a clamped report windows");
+        assert_eq!(paged["pages"]["sets"]["returned"], MAX_REPORT_ITEMS);
+        assert_eq!(paged["pages"]["sets"]["has_more"], true);
+    }
+
+    #[test]
+    fn a_report_with_two_collections_describes_both() {
+        let value = serde_json::json!({
+            "snapshot_id": "snap",
+            "generic_folders": (0..36_381).map(Value::from).collect::<Vec<_>>(),
+            "protected_folders": Vec::<Value>::new(),
+        });
+        let paged =
+            encode_report("context_report", value, window(0, 50)).expect("two collections window");
+
+        assert_eq!(paged["pages"]["generic_folders"]["total"], 36_381);
+        assert_eq!(paged["pages"]["generic_folders"]["has_more"], true);
+        // An empty collection is described too, rather than omitted: absence
+        // of a page would read as absence of the field.
+        assert_eq!(paged["pages"]["protected_folders"]["total"], 0);
+        assert_eq!(paged["pages"]["protected_folders"]["has_more"], false);
+    }
+
+    #[test]
+    fn a_report_defaults_to_a_bounded_window() {
+        let input: ReportInput =
+            serde_json::from_value(serde_json::json!({"project_dir": "p"})).expect("input parses");
+        // The default has to bound, or the trap this fixes is still armed for
+        // every caller that does not know to pass a limit.
+        assert_eq!(input.window().limit, DEFAULT_REPORT_ITEMS);
+        assert_eq!(input.window().offset, 0);
     }
 
     #[test]

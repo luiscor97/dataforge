@@ -271,6 +271,38 @@ fn input_schema(name: &str) -> Value {
         "description": "Absolute path to the DataForge project directory.",
     });
 
+    // Reports list detail in windows. Declaring the window here is what makes
+    // it usable: a caller that cannot see `limit` in the schema cannot page,
+    // and would read the first window as the whole answer.
+    if let Some(collections) = df_tools::report_collections(name) {
+        let collections = collections.join(", ");
+        return json!({
+            "type": "object",
+            "properties": {
+                "project_dir": project_dir,
+                "limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": df_tools::MAX_REPORT_ITEMS,
+                    "default": df_tools::DEFAULT_REPORT_ITEMS,
+                    "description": format!(
+                        "Items listed per collection ({collections}). Totals are never \
+                         windowed. 0 returns totals only; a larger value is clamped, and \
+                         `pages.<collection>.has_more` always says whether more remain.",
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Where the window starts. Past the end is empty, not an error.",
+                },
+            },
+            "required": ["project_dir"],
+            "additionalProperties": false,
+        });
+    }
+
     match name {
         "plan_destination_tree" => json!({
             "type": "object",
@@ -523,6 +555,43 @@ mod tests {
                 tool["name"]
             );
         }
+    }
+
+    #[test]
+    fn every_windowed_report_advertises_its_window() {
+        // A report that pages without saying so hands back a first window that
+        // reads as the whole answer. The schema is the only place a caller
+        // learns otherwise, so it is the schema this asserts — and it reads the
+        // same list the dispatch does, which is what keeps the two from
+        // drifting apart.
+        let response = handle_line(&request("tools/list", json!({})), true).expect("a reply");
+        let mut checked = 0;
+        for listed in response["result"]["tools"].as_array().expect("tools") {
+            let name = listed["name"].as_str().expect("name");
+            if df_tools::report_collections(name).is_none() {
+                continue;
+            }
+            let schema = &listed["inputSchema"];
+            assert_eq!(
+                schema["properties"]["limit"]["maximum"],
+                df_tools::MAX_REPORT_ITEMS,
+                "report `{name}` advertises a ceiling the dispatch does not enforce"
+            );
+            assert_eq!(
+                schema["properties"]["limit"]["default"],
+                df_tools::DEFAULT_REPORT_ITEMS,
+                "report `{name}` advertises the wrong default window"
+            );
+            assert!(
+                schema["properties"]["offset"].is_object(),
+                "`{name}` cannot page"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 6,
+            "the windowed reports are six; a new one needs a schema"
+        );
     }
 
     #[test]

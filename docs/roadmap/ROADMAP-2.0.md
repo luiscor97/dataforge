@@ -140,13 +140,20 @@ mecánicos, y ninguno necesita inteligencia:
    ya se escribe. La transcripción del trabajo original está llena de «sigue
    vivo» y «va por 30/75»: el operador humano necesitaba ese latido y lo
    obtenía mirando la consola, que es justo lo que un agente no tiene.
-2. **Los informes no caben en ninguna ventana de contexto.** `duplicate_report`
-   devuelve 28.537 conjuntos; `structural_review_queue`, 5.334 elementos. Un
-   agente que pide un informe y recibe decenas de MB de JSON ha gastado su
-   sesión sin aprender nada. `structural_review_classes` ya hace lo correcto
-   agregando por clase: **el patrón existe y hay que extenderlo** —agregado por
-   defecto, `limit`/`offset` para el detalle— a duplicados, anomalías y
-   relaciones de árbol.
+2. ~~**Los informes no caben en ninguna ventana de contexto.**~~
+   **Resuelto (2026-08-10).** `duplicate_report` devolvía 28.537 conjuntos y
+   `structural_review_queue` 5.334 elementos; ahora los seis informes con
+   detalle devuelven una **ventana** con `limit`/`offset`, 50 por defecto y un
+   techo de 1.000 que el llamante no puede subir. Tres propiedades lo hacen
+   fiable: **los totales nunca se acotan** —`redundant_bytes` significa lo
+   mismo con un conjunto que con mil, porque los informes ya calculaban los
+   escalares aparte del vector—; **la truncación siempre es visible**, en
+   `pages.<colección>.has_more`, porque una truncación que no se detecta no es
+   paginación sino una respuesta incorrecta con aspecto de correcta; y la lista
+   de colecciones tiene **una sola definición**, que leen tanto el dispatch
+   como el esquema MCP, de modo que no pueden discrepar. Superficie
+   `dataforge.tool-surface/0.3.0`, con `frozen_contracts` actualizado en el
+   mismo commit (ADR-0037 §2).
 3. **Nada registra si un run sigue vivo.** Buscado en todo `crates/`: ni PID,
    ni host, ni latido, ni marca de actividad. No está a medias, no hay nada.
    Es la causa de que el proyecto de la prueba de la 1.0 siga clavado en

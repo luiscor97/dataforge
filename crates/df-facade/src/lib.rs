@@ -3807,9 +3807,15 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.2.0"
+            "dataforge.tool-surface/0.3.0"
         );
         assert_eq!(df_tools::TOOLS.len(), 25, "tool count");
+
+        // Reports bound what they list. These two are contract, not tuning: an
+        // agent sizes its own reading against them, and raising the ceiling
+        // later would hand a pinned caller a response it budgeted against.
+        assert_eq!(df_tools::DEFAULT_REPORT_ITEMS, 50);
+        assert_eq!(df_tools::MAX_REPORT_ITEMS, 1_000);
 
         // Deterministic gate (M2.4, ADR-0041). The hard-boundary count is
         // frozen alongside the schema: turning an invariant into a tunable

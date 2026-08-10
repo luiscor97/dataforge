@@ -71,19 +71,32 @@ arrancar de esperar**.
 
 Sin esto no hay bucle: hay una llamada que no vuelve.
 
-### 3.2 Los informes no caben
+### 3.2 Los informes no caben — **resuelto el 2026-08-10**
 
-`duplicate_report` sobre este corpus devuelve 28.537 conjuntos. `structural_review_queue`,
-5.334 elementos. Ninguna ventana de contexto los aguanta, y un agente que pide
-un informe y recibe 40 MB de JSON ha gastado su sesión sin aprender nada.
+`duplicate_report` sobre este corpus devolvía 28.537 conjuntos.
+`structural_review_queue`, 5.334 elementos. Ninguna ventana de contexto los
+aguanta, y un agente que pide un informe y recibe decenas de MB de JSON ha
+gastado su sesión sin aprender nada.
 
-Hoy `structural_review_classes` ya agrega por clase — **es el patrón correcto**
-y hay que extenderlo:
+Los seis informes con detalle —duplicados, clones de árbol, relaciones,
+contexto, anomalías y cola de revisión— devuelven ahora una **ventana**:
+`limit`/`offset`, 50 por defecto, techo de 1.000. Tres propiedades, cada una
+con test:
 
-- **Agregado por defecto, detalle bajo petición.** `duplicate_report` debería
-  responder «28.537 conjuntos, 239,7 GB, top 20 por bytes» y aceptar
-  `limit`/`offset` para el resto.
-- Lo mismo para anomalías estructurales y relaciones de árbol.
+- **Los totales nunca se acotan.** Salió gratis porque los informes ya
+  calculaban los escalares aparte del vector: `redundant_bytes` significa lo
+  mismo con un conjunto que con mil.
+- **La truncación siempre es visible**, en `pages.<colección>.has_more`. Una
+  truncación que el llamante no puede detectar no es paginación: es una
+  respuesta incorrecta con aspecto de correcta.
+- **El techo no se negocia.** Se puede pedir menos y nunca más, porque un
+  límite que el llamante puede subir no es un límite. El clamp no es silencioso:
+  `returned` y `has_more` siguen diciendo la verdad.
+
+La lista de colecciones tiene **una sola definición**, que leen tanto el
+dispatch como el esquema MCP — si no, el esquema podría anunciar una ventana
+que el dispatch no aplica. Superficie `dataforge.tool-surface/0.3.0`, con
+`frozen_contracts` actualizado en el mismo commit (ADR-0037 §2).
 
 ### 3.3 No hay forma de saber si un trabajo sigue vivo
 
@@ -167,8 +180,9 @@ Un resultado correcto que no se puede demostrar no sirve.
 
 Primero lo mecánico, porque sin ello no hay bucle que optimizar:
 
-1. **`job_start` / `job_status`** y agregados por defecto en los informes.
-   Convierte «una llamada que no vuelve» en «un trabajo que se supervisa».
+1. ~~Agregados por defecto en los informes.~~ **Hecho el 2026-08-10** (§3.2).
+   **`job_start` / `job_status`**, que es lo que queda para convertir «una
+   llamada que no vuelve» en «un trabajo que se supervisa».
 2. **Vitalidad** (PID, host, latido). Precondición de reanudar sin apostar.
 3. **`grafted_tree_report`** y **`name_collision_report`**. Son lectura sobre
    evidencia que ya existe en la base; baratos y desbloquean el 99,1 %.
