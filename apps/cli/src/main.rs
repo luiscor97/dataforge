@@ -14,12 +14,13 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DuplicateReport, ExecuteOutcome, ExtractionLimits, HashOutcome, MediaOutcome,
-    MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport, PlanDestinationTree,
-    PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome,
-    ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue,
-    ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome,
-    SimilarityReport, SnapshotBuildOptions, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    DuplicateReport, ExecuteOutcome, ExtractionLimits, GraftedTreeReport, HashOutcome,
+    MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport,
+    PlanDestinationTree, PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport,
+    PluginsOutcome, ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary,
+    ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions,
+    SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, TreeCloneReport, TreeRelationReport,
+    VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -443,6 +444,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Grafted subtrees and how much of each places itself.
+    GraftedTrees {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Exact tree clones (folders with byte-for-byte identical subtrees).
     TreeClones {
         /// Project directory.
@@ -668,6 +675,7 @@ enum Output {
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
     NameCollisions(NameCollisionReport),
+    GraftedTrees(GraftedTreeReport),
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
@@ -1027,6 +1035,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::NameCollisions { path } => {
                 df_facade::name_collision_report(path).map(Output::NameCollisions)
+            }
+            ReportCommand::GraftedTrees { path } => {
+                df_facade::grafted_tree_report(path).map(Output::GraftedTrees)
             }
             ReportCommand::TreeClones { path } => {
                 df_facade::tree_clone_report(path).map(Output::TreeClones)
@@ -1480,6 +1491,53 @@ fn print_verify(outcome: &VerifyOutcome) {
                 finding.severity, finding.kind, finding.subject, finding.detail
             );
         }
+    }
+}
+
+fn print_grafted_trees(report: &GraftedTreeReport) {
+    println!("Snapshot        : {}", report.snapshot_id);
+    println!("Graft prefixes  : {}", report.prefixes);
+    println!("Files grafted   : {}", report.files);
+    let share = |n: u64| {
+        if report.files == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / report.files as f64
+        }
+    };
+    println!(
+        "Places itself   : {} ({:.1}%)",
+        report.auto_placeable,
+        share(report.auto_placeable)
+    );
+    println!(
+        "Needs a human   : {} ({:.1}%)",
+        report.needs_review,
+        share(report.needs_review)
+    );
+    for graft in &report.grafts {
+        println!();
+        println!("  {}  ({} files)", graft.prefix, graft.files);
+        println!(
+            "    at canonical path, same content : {}",
+            graft.canonical_path_same_hash
+        );
+        println!(
+            "    content lives outside the graft : {}",
+            graft.hash_elsewhere_outside_prefix
+        );
+        println!(
+            "    only copy there is              : {}",
+            graft.unique_hash_not_elsewhere
+        );
+        println!(
+            "    canonical path holds something else: {}",
+            graft.canonical_path_hash_diff
+        );
+    }
+    if report.grafts.is_empty() {
+        println!();
+        println!("No folder in this snapshot carries a grafted prefix.");
     }
 }
 
@@ -2027,6 +2085,7 @@ fn print_human(output: &Output) {
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
         Output::NameCollisions(report) => print_name_collisions(report),
+        Output::GraftedTrees(report) => print_grafted_trees(report),
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
@@ -2185,6 +2244,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
         // partial clones is information, not a failure.
         Output::Duplicates(_) => 0,
         Output::NameCollisions(_) => 0,
+        Output::GraftedTrees(_) => 0,
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,

@@ -2029,3 +2029,264 @@ pub fn tree_relation_views(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Tre
         .map_err(db_err)?;
     Ok(rows)
 }
+
+/// Where one file inside a grafted subtree stands relative to its probable
+/// canonical path (ROADMAP-2.0 M2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GraftMatch {
+    /// The canonical path exists and holds this very content. Placing it
+    /// takes no judgement: the graft is a second copy of something already
+    /// where it belongs.
+    CanonicalPathSameHash,
+    /// The canonical path is free, but this content does live somewhere
+    /// outside the graft. Nothing unique is at stake.
+    HashElsewhereOutsidePrefix,
+    /// This content exists **only** inside the graft. Dropping the graft
+    /// would drop the sole copy, so a human decides.
+    UniqueHashNotElsewhere,
+    /// The canonical path exists and holds **different** content. Two files
+    /// claim one place; that is a question, not a placement.
+    CanonicalPathHashDiff,
+}
+
+impl GraftMatch {
+    /// Whether this file can be placed without asking anyone.
+    ///
+    /// The split is the point of the report: the automatic cases are backed
+    /// by a hash that exists outside the graft, and the review cases are
+    /// exactly those where something could be lost or overwritten.
+    pub fn is_automatic(self) -> bool {
+        matches!(
+            self,
+            Self::CanonicalPathSameHash | Self::HashElsewhereOutsidePrefix
+        )
+    }
+}
+
+/// One prefix an unrelated folder acquired when a whole tree was copied under
+/// it, with its files split by what placing them would take.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraftedPrefix {
+    pub source_root_id: String,
+    /// Leading components that are not part of the canonical path.
+    pub prefix: String,
+    /// Files under this prefix, each counted once.
+    pub files: u64,
+    pub canonical_path_same_hash: u64,
+    pub hash_elsewhere_outside_prefix: u64,
+    pub unique_hash_not_elsewhere: u64,
+    pub canonical_path_hash_diff: u64,
+}
+
+/// Grafted subtrees and how much of them places itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraftedTreeReport {
+    pub snapshot_id: String,
+    pub prefixes: u64,
+    /// Files under some graft prefix, counted once each.
+    pub files: u64,
+    /// Files whose placement is backed by a hash found outside the graft.
+    pub auto_placeable: u64,
+    /// Files where something could be lost or overwritten.
+    pub needs_review: u64,
+    pub grafts: Vec<GraftedPrefix>,
+}
+
+/// Split a relative path into comparable components.
+///
+/// Compared folded, because Windows paths are case-insensitive and a graft
+/// differing only in case would otherwise look like a separate tree. Working
+/// in components rather than bytes is not fussiness: folding a non-ASCII path
+/// can change its byte length, so slicing a folded string at a length measured
+/// in the original is a panic waiting for the right filename.
+fn components(path: &str) -> Vec<String> {
+    path.split(['\\', '/'])
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_lowercase())
+        .collect()
+}
+
+/// Report the grafted subtrees of a snapshot and classify what they hold.
+///
+/// A graft is a folder whose path **ends with** another folder's path: the
+/// extra leading components are a prefix that some unrelated folder acquired
+/// when a whole tree was copied under it. On the archive this was built
+/// against, a course folder had swallowed a copy of an entire matter tree and
+/// a client folder held an application's help directory — the prefix is the
+/// accident, not the context, which is why stripping it is what recovers the
+/// canonical location rather than destroying it.
+///
+/// The probable canonical path of a file inside a graft is its own path with
+/// that prefix removed, and [`GraftMatch`] says what placing it there would
+/// take. Evidence only: this proposes no move and consolidates nothing
+/// (RFC-0001 §15.2).
+///
+/// A file belongs to its **longest** matching prefix and is counted once.
+/// Grafts nest — a tree copied under a folder that was itself copied — and
+/// counting a file once per prefix it falls under inflates the total past the
+/// size of the snapshot.
+pub fn grafted_trees(db: &Db, snapshot_id: SnapshotId) -> DfResult<GraftedTreeReport> {
+    let empty = |grafts: Vec<GraftedPrefix>| GraftedTreeReport {
+        snapshot_id: snapshot_id.to_string(),
+        prefixes: grafts.len() as u64,
+        files: 0,
+        auto_placeable: 0,
+        needs_review: 0,
+        grafts,
+    };
+
+    // 1. Derive prefixes from the embedded relations already on file. Only
+    //    within one source root: relative paths from different roots describe
+    //    different trees and comparing them would invent a graft.
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT fi.source_root_id, fi.relative_path, fo.relative_path
+             FROM tree_relations tr
+             JOIN folders fi
+               ON fi.id = CASE tr.contained WHEN 'A' THEN tr.folder_a
+                                            ELSE tr.folder_b END
+             JOIN folders fo
+               ON fo.id = CASE tr.contained WHEN 'A' THEN tr.folder_b
+                                            ELSE tr.folder_a END
+             WHERE tr.snapshot_id = ?1
+               AND tr.relationship = ?2
+               AND tr.contained IS NOT NULL
+               AND fi.source_root_id = fo.source_root_id",
+        )
+        .map_err(db_err)?;
+    let candidates = stmt
+        .query_map(
+            rusqlite::params![
+                snapshot_id.to_string(),
+                df_domain::TreeRelationship::Embedded.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let mut prefixes: std::collections::BTreeSet<(String, Vec<String>)> =
+        std::collections::BTreeSet::new();
+    for (root, inner, outer) in candidates {
+        let (inner, outer) = (components(&inner), components(&outer));
+        if outer.is_empty() || inner.len() <= outer.len() {
+            continue;
+        }
+        let head = &inner[..inner.len() - outer.len()];
+        if inner[head.len()..] == outer[..] {
+            prefixes.insert((root, head.to_vec()));
+        }
+    }
+    if prefixes.is_empty() {
+        return Ok(empty(Vec::new()));
+    }
+
+    // Longest first, so a file lands in its most specific graft.
+    let mut ordered: Vec<(String, Vec<String>)> = prefixes.into_iter().collect();
+    ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.cmp(b)));
+
+    // 2. One pass over the snapshot's hashed occurrences.
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT o.source_root_id, o.relative_path, oc.content_id
+             FROM path_occurrences o
+             JOIN occurrence_content oc ON oc.occurrence_id = o.id
+             WHERE o.snapshot_id = ?1",
+        )
+        .map_err(db_err)?;
+    let occurrences = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                components(&row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let mut content_at: std::collections::HashMap<(&str, &[String]), &str> =
+        std::collections::HashMap::with_capacity(occurrences.len());
+    let mut occurrences_of: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for (root, path, content) in &occurrences {
+        content_at.insert((root.as_str(), path.as_slice()), content.as_str());
+        *occurrences_of.entry(content.as_str()).or_default() += 1;
+    }
+
+    // Assign each occurrence to its most specific graft, and count how many
+    // copies of each content sit inside that graft — enough to tell "exists
+    // elsewhere" from "only here" without a query per file.
+    let mut inside: std::collections::HashMap<(usize, &str), u64> =
+        std::collections::HashMap::new();
+    let mut assigned: Vec<(usize, &str, &[String])> = Vec::new();
+    for (root, path, content) in &occurrences {
+        let Some(index) = ordered.iter().position(|(other, prefix)| {
+            other == root && path.len() > prefix.len() && path[..prefix.len()] == prefix[..]
+        }) else {
+            continue;
+        };
+        *inside.entry((index, content.as_str())).or_default() += 1;
+        assigned.push((index, content.as_str(), &path[ordered[index].1.len()..]));
+    }
+
+    let mut grafts: Vec<GraftedPrefix> = ordered
+        .iter()
+        .map(|(root, prefix)| GraftedPrefix {
+            source_root_id: root.clone(),
+            prefix: prefix.join(std::path::MAIN_SEPARATOR_STR),
+            files: 0,
+            canonical_path_same_hash: 0,
+            hash_elsewhere_outside_prefix: 0,
+            unique_hash_not_elsewhere: 0,
+            canonical_path_hash_diff: 0,
+        })
+        .collect();
+
+    for (index, content, canonical) in assigned {
+        let root = ordered[index].0.as_str();
+        let at_canonical = content_at.get(&(root, canonical)).copied();
+        let graft = &mut grafts[index];
+        graft.files += 1;
+        match at_canonical {
+            Some(found) if found == content => graft.canonical_path_same_hash += 1,
+            Some(_) => graft.canonical_path_hash_diff += 1,
+            None => {
+                let total = occurrences_of.get(content).copied().unwrap_or(0);
+                let here = inside.get(&(index, content)).copied().unwrap_or(0);
+                if total > here {
+                    graft.hash_elsewhere_outside_prefix += 1;
+                } else {
+                    graft.unique_hash_not_elsewhere += 1;
+                }
+            }
+        }
+    }
+
+    grafts.retain(|graft| graft.files > 0);
+    grafts.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.prefix.cmp(&b.prefix)));
+
+    let files = grafts.iter().map(|graft| graft.files).sum::<u64>();
+    let auto_placeable = grafts
+        .iter()
+        .map(|graft| graft.canonical_path_same_hash + graft.hash_elsewhere_outside_prefix)
+        .sum::<u64>();
+    Ok(GraftedTreeReport {
+        snapshot_id: snapshot_id.to_string(),
+        prefixes: grafts.len() as u64,
+        files,
+        auto_placeable,
+        needs_review: files - auto_placeable,
+        grafts,
+    })
+}

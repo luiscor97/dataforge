@@ -47,6 +47,7 @@ mod secrets;
 
 pub use df_db::assistance::AssistanceAuditView;
 pub use df_db::inventory::{NameCollision, NameCollisionReport};
+pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
 pub use df_plugin::{
@@ -2365,6 +2366,24 @@ pub fn name_collision_report(
     df_db::inventory::name_collisions(&db, snapshot.id, NAME_COLLISION_SAMPLES)
 }
 
+/// Grafted subtrees and how much of each places itself.
+///
+/// A graft is a folder that acquired a leading prefix when a whole tree was
+/// copied under it; stripping the prefix recovers the canonical path. Evidence
+/// only — it proposes no move (RFC-0001 §15.2).
+pub fn grafted_tree_report(project_dir: &Path) -> DfResult<GraftedTreeReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Gated on complete analysis, unlike the name report: this one reads
+    // `tree_relations`, which only a finished analysis has written.
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::structure::grafted_trees(&db, snapshot.id)
+}
+
 /// Exact tree-clone report of the latest snapshot (RFC-0001 §19).
 ///
 /// Evidence only: DataForge reports directory trees that are byte-for-byte
@@ -3836,9 +3855,9 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.4.0"
+            "dataforge.tool-surface/0.5.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 26, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 27, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling
