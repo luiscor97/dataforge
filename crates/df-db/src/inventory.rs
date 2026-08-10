@@ -958,6 +958,159 @@ pub fn exact_duplicates(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<Duplic
     Ok(sets)
 }
 
+/// One file name that means different things in different places.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NameCollision {
+    /// The name as normalised for comparison, so case and width folding do
+    /// not hide a collision.
+    pub normalized_name: String,
+    /// Distinct contents sharing it. Always at least 2 — that is the finding.
+    pub contents: u64,
+    /// Files carrying it, counting every occurrence.
+    pub occurrences: u64,
+    /// Distinct folders those files sit in.
+    pub folders: u64,
+    pub largest_bytes: u64,
+    /// A few absolute paths, to make the collision concrete in a report.
+    pub sample_paths: Vec<String>,
+}
+
+/// Names carrying more than one content, worst first.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NameCollisionReport {
+    pub snapshot_id: String,
+    /// Names that mean more than one thing.
+    pub colliding_names: u64,
+    /// Files involved in some collision.
+    pub occurrences_involved: u64,
+    /// Contents the worst single name stands for.
+    pub worst_name_contents: u64,
+    pub collisions: Vec<NameCollision>,
+}
+
+/// Report file names that stand for different content in different places.
+///
+/// This is the evidence behind a rule the engine already follows and could
+/// not previously show: **never deduplicate by name**. On an evidential
+/// archive the failure is not theoretical — scanned exhibits are numbered per
+/// matter, so `00000001.JPG` legitimately names a different photograph in
+/// every one of them. Collapsing those by name would not tidy anything, it
+/// would destroy evidence and leave a plausible-looking tree behind.
+///
+/// Evidence only, like every other report here (RFC-0001 §15.2): it proposes
+/// nothing and consolidates nothing. Its purpose is to let an operator — or an
+/// agent writing a report for one — demonstrate why a name is not an identity,
+/// which is what turns a refusal into a guarantee someone can check.
+pub fn name_collisions(
+    db: &Db,
+    snapshot_id: SnapshotId,
+    samples_per_name: usize,
+) -> DfResult<NameCollisionReport> {
+    // Grouped by content id rather than by hash so a snapshot that is only
+    // partially hashed reports what it knows instead of failing: an unhashed
+    // occurrence has no content row and simply does not take part.
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT o.normalized_name,
+                    COUNT(DISTINCT oc.content_id),
+                    COUNT(*),
+                    COUNT(DISTINCT o.parent_relative_path),
+                    MAX(o.size_bytes)
+             FROM path_occurrences o
+             JOIN occurrence_content oc ON oc.occurrence_id = o.id
+             WHERE o.snapshot_id = ?1
+             GROUP BY o.normalized_name
+             HAVING COUNT(DISTINCT oc.content_id) > 1
+             ORDER BY COUNT(DISTINCT oc.content_id) DESC,
+                      COUNT(*) DESC,
+                      o.normalized_name",
+        )
+        .map_err(db_err)?;
+
+    let rows = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, i64>(4)? as u64,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let colliding_names = rows.len() as u64;
+    let occurrences_involved = rows.iter().map(|row| row.2).sum();
+    let worst_name_contents = rows.iter().map(|row| row.1).max().unwrap_or(0);
+
+    let mut collisions = Vec::with_capacity(rows.len());
+    for (normalized_name, contents, occurrences, folders, largest_bytes) in rows {
+        let sample_paths = collision_samples(db, snapshot_id, &normalized_name, samples_per_name)?;
+        collisions.push(NameCollision {
+            normalized_name,
+            contents,
+            occurrences,
+            folders,
+            largest_bytes,
+            sample_paths,
+        });
+    }
+
+    Ok(NameCollisionReport {
+        snapshot_id: snapshot_id.to_string(),
+        colliding_names,
+        occurrences_involved,
+        worst_name_contents,
+        collisions,
+    })
+}
+
+/// A few absolute paths for one colliding name, one per distinct content so
+/// the sample shows the disagreement rather than repeating one side of it.
+fn collision_samples(
+    db: &Db,
+    snapshot_id: SnapshotId,
+    normalized_name: &str,
+    limit: usize,
+) -> DfResult<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT r.absolute_path, o.relative_path
+             FROM path_occurrences o
+             JOIN occurrence_content oc ON oc.occurrence_id = o.id
+             JOIN source_roots r ON r.id = o.source_root_id
+             WHERE o.snapshot_id = ?1 AND o.normalized_name = ?2
+             GROUP BY oc.content_id
+             ORDER BY o.relative_path
+             LIMIT ?3",
+        )
+        .map_err(db_err)?;
+    let paths = stmt
+        .query_map(
+            rusqlite::params![snapshot_id.to_string(), normalized_name, limit as i64],
+            |row| {
+                let root = row.get::<_, String>(0)?;
+                let relative = row.get::<_, String>(1)?;
+                Ok(if relative.is_empty() {
+                    root
+                } else {
+                    format!("{root}{}{relative}", std::path::MAIN_SEPARATOR)
+                })
+            },
+        )
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(paths)
+}
+
 /// Fill in the logical representative of each set from the rows recorded by
 /// `dedup::score_duplicate_representatives` (RFC-0001 §15.5). Sets analysed
 /// before that step existed simply keep `None`.

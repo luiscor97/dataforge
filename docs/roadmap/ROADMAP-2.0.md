@@ -289,13 +289,25 @@ para árboles injertados y **no es una suposición**: es el reparto medido. Los
 dos casos que van a revisión son exactamente los que un humano tiene que mirar,
 y son 1.236 elementos, no 135.378.
 
-**`name_collision_report`.** El caso que ninguna regla de contenido detecta:
-106 nombres con contenido distinto entre asuntos, el peor `00000001.JPG` con
-**19 hashes en 6 periciales**. Y su simétrico: 678 hashes genuinamente
-compartidos entre asuntos, que **no** se pueden consolidar. El motor ya se
-niega a deduplicar por nombre; lo que falta es **poder demostrar por qué**, que
-es lo que convierte una negativa en una garantía a ojos de quien recibe la
-entrega.
+**`name_collision_report`. Implementado el 2026-08-10.** El caso que ninguna
+regla de contenido detecta: 106 nombres con contenido distinto entre asuntos,
+el peor `00000001.JPG` con **19 hashes en 6 periciales**. El motor ya se negaba
+a deduplicar por nombre; lo que faltaba era **poder demostrar por qué**, que es
+lo que convierte una negativa en una garantía para quien recibe la entrega.
+
+Agrupa por **contenido distinto**, no por nombre repetido: dos archivos con el
+mismo nombre y los mismos bytes son un duplicado, no una colisión, y contarlos
+inflaría el hallazgo justo donde tiene que ser preciso. Hay un test con el caso
+real —el mismo exhibit numerado en tres periciales, más un duplicado legítimo
+que no debe aparecer— y agrupar por nombre lo rompe.
+
+Lee hashes y nombres, que la etapa de hash ya selló, así que **no exige
+análisis completo** como los informes estructurales: la colisión importa
+sobre todo *antes* de que nadie planifique una fusión. Superficie
+`dataforge.tool-surface/0.4.0`, 26 herramientas.
+
+Queda su simétrico, que aún no está: 678 hashes genuinamente compartidos entre
+asuntos, que **no** se pueden consolidar.
 
 #### El reencuadre de la clasificación: perfil, no veredicto por archivo
 

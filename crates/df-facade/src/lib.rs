@@ -2336,6 +2336,34 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     })
 }
 
+/// Absolute paths sampled per colliding name, one per distinct content.
+///
+/// Enough to make a collision concrete in a report without turning the
+/// response into a file listing: the finding is that the name disagrees, and
+/// four disagreeing paths show that as well as four hundred.
+const NAME_COLLISION_SAMPLES: usize = 4;
+
+/// File names that stand for different content in different places.
+///
+/// The evidence behind a rule the engine already follows and could not
+/// previously show: a name is not an identity. Report only — it proposes
+/// nothing (RFC-0001 §15.2).
+pub fn name_collision_report(
+    project_dir: &Path,
+) -> DfResult<df_db::inventory::NameCollisionReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Deliberately not gated on complete analysis, unlike the structural
+    // reports: this one reads hashes and names, which the hash stage already
+    // sealed. Requiring analysis would withhold an answer the database can
+    // give — and the collision matters most *before* anyone plans a merge.
+    df_db::inventory::name_collisions(&db, snapshot.id, NAME_COLLISION_SAMPLES)
+}
+
 /// Exact tree-clone report of the latest snapshot (RFC-0001 §19).
 ///
 /// Evidence only: DataForge reports directory trees that are byte-for-byte
@@ -3807,9 +3835,9 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.3.0"
+            "dataforge.tool-surface/0.4.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 25, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 26, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling

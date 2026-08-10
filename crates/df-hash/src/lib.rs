@@ -322,7 +322,7 @@ fn compose_path(root: &Path, relative: &Path) -> PathBuf {
 mod tests {
     use std::path::Path;
 
-    use df_db::inventory::{exact_duplicates, list_occurrences};
+    use df_db::inventory::{exact_duplicates, list_occurrences, name_collisions};
     use df_domain::{ProfileRef, Project, SourceRoot};
     use df_scan::{scan_project, ScanOptions};
 
@@ -372,6 +372,58 @@ mod tests {
         assert_eq!(set.sha256, hex::encode(sha2::Sha256::digest(b"same bytes")));
         assert!(set.occurrences.iter().any(|p| p.ends_with("a.txt")));
         assert!(set.occurrences.iter().any(|p| p.ends_with("b.txt")));
+    }
+
+    /// The case from the real archive: exhibits are numbered per matter, so
+    /// the same file name legitimately holds a different photograph in each.
+    #[test]
+    fn a_name_reused_across_matters_with_different_content_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        for (matter, bytes) in [
+            ("pericial-1", b"foto uno".as_slice()),
+            ("pericial-2", b"foto dos".as_slice()),
+            ("pericial-3", b"foto tres".as_slice()),
+        ] {
+            std::fs::create_dir_all(origin.join(matter)).unwrap();
+            std::fs::write(origin.join(matter).join("00000001.JPG"), bytes).unwrap();
+        }
+        // Same name *and* same bytes in two places: a duplicate, not a
+        // collision. It must not inflate the finding.
+        std::fs::create_dir_all(origin.join("copia")).unwrap();
+        std::fs::write(origin.join("copia").join("informe.pdf"), b"identico").unwrap();
+        std::fs::write(origin.join("informe.pdf"), b"identico").unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Colisiones",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+        let outcome = hash_project(&mut db, Actor::Test, &HashOptions::default(), None).unwrap();
+
+        let snapshot_id = outcome.snapshot_id.parse().unwrap();
+        let report = name_collisions(&db, snapshot_id, 4).unwrap();
+
+        assert_eq!(
+            report.colliding_names, 1,
+            "only the exhibit name means more than one thing"
+        );
+        assert_eq!(report.worst_name_contents, 3);
+        assert_eq!(report.occurrences_involved, 3);
+
+        let collision = &report.collisions[0];
+        assert_eq!(collision.normalized_name, "00000001.jpg");
+        assert_eq!(collision.contents, 3);
+        assert_eq!(collision.folders, 3);
+        // One sample per distinct content, so the sample shows the
+        // disagreement instead of repeating one side of it.
+        assert_eq!(collision.sample_paths.len(), 3);
     }
 
     #[test]
