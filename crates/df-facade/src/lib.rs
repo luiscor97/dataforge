@@ -3893,4 +3893,40 @@ mod frozen_contracts {
             "the gated class is approve, execute and verify — nothing else"
         );
     }
+
+    /// Every ADR is listed in the index.
+    ///
+    /// Reads the directory rather than a list, because a list is one more
+    /// thing to forget. The index is how anyone arriving at the repo finds
+    /// the decisions, so an ADR missing from it is a decision nobody will
+    /// read — which is the same as not having written it.
+    #[test]
+    fn every_adr_is_in_the_index() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("adr");
+        let index = std::fs::read_to_string(root.join("README.md")).expect("the ADR index");
+
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&root).expect("docs/adr") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if !name.starts_with("ADR-") || !name.ends_with(".md") {
+                continue;
+            }
+            if !index.contains(&name) {
+                missing.push(name);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "ADRs missing from docs/adr/README.md: {missing:?}"
+        );
+    }
 }

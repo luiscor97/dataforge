@@ -40,6 +40,7 @@
 | [ADR-0043](ADR-0043-facade-tool-surface.md) | Superficie de herramientas: `df-tools` + `df-mcp` (M2.1) | Propuesta |
 | [ADR-0044](ADR-0044-df-agent-loop.md) | `df-agent`: el bucle de orquestación (M2.6) | Propuesta |
 | [ADR-0045](ADR-0045-embedded-tree-duplicates.md) | Un duplicado en un árbol probadamente contenido no es contexto desconocido (M2.3) | Propuesta |
+| [ADR-0046](ADR-0046-classification-proposes-a-profile.md) | La clasificación se propone como perfil, no como veredicto por archivo (M2.3) | Propuesta |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).
