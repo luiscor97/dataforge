@@ -272,10 +272,11 @@ redundancia bloqueada sin releer un byte.
 Derivados del trabajo original, no de principios. Los dos son **lectura sobre
 evidencia que ya está en la base**: baratos, y desbloquean el grueso del hito.
 
-**`grafted_tree_report`.** `tree_relation_report` da las relaciones, pero el
-trabajo original necesitó algo más fino: para cada archivo dentro de un
-injerto, **su ruta canónica probable** y en cuál de estos cuatro casos cae.
-Medido sobre 135.378 archivos en 124 prefijos:
+**`grafted_tree_report`. Implementado el 2026-08-10.** `tree_relation_report`
+da las relaciones, pero el trabajo original necesitó algo más fino: para cada
+archivo dentro de un injerto, **su ruta canónica probable** y en cuál de estos
+cuatro casos cae. Cifras de la transcripción, sobre 135.378 archivos en 124
+prefijos:
 
 | Caso | Archivos | |
 | --- | ---: | --- |
@@ -288,6 +289,22 @@ Medido sobre 135.378 archivos en 124 prefijos:
 para árboles injertados y **no es una suposición**: es el reparto medido. Los
 dos casos que van a revisión son exactamente los que un humano tiene que mirar,
 y son 1.236 elementos, no 135.378.
+
+Reejecutado con la implementación del motor sobre el proyecto de la prueba de
+la 1.0 —otra derivación de los prefijos, otro estado del corpus— sale
+**97,9 % / 2,1 %** sobre 87.667 archivos en 20 prefijos. La afirmación robusta
+no es la cifra exacta sino su orden: **alrededor del 98 % se coloca solo**, y
+todo el valor del informe está en el 2 % restante.
+
+Dos cosas que costó aprender, ambas equivocándose primero:
+
+- Un archivo pertenece a **su prefijo más largo** y se cuenta una vez. Los
+  injertos anidan, y contar un archivo una vez por cada prefijo bajo el que
+  cae daba más archivos que los que tiene el snapshot.
+- Las rutas se comparan **por componentes**, no rebanando bytes: minuscular
+  una ruta no ASCII puede cambiar su longitud en bytes, y cortar la cadena
+  minusculada por una longitud medida en la original es un `panic` esperando
+  al nombre de archivo adecuado.
 
 **`name_collision_report`. Implementado el 2026-08-10.** El caso que ninguna
 regla de contenido detecta: 106 nombres con contenido distinto entre asuntos,
