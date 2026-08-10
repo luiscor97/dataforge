@@ -119,16 +119,92 @@ queda dimensionado: **la 1.0 no puede acercarse, y no por falta de política
 sino por falta de clasificación.** Es la razón de que M2.3 sea precondición y
 no adorno.
 
-## Qué falta para que esto sea evidencia completa
+## El rastro de evidencia existe, y es mejor de lo esperado
 
-- **El informe final al asesor** (`INFORME_FINAL_ORDENACION_...docx` y su PDF)
-  vive en `D:\DataForge_Salida\05_Asesoria_Juridica_v2\00_INFORME_DE_ORGANIZACION\`.
-  No está en el repositorio y contiene datos del cliente, así que no debe
-  entrar tal cual; sí valdría un extracto con los criterios y sin nombres.
-- **El manifiesto SHA-256 de cierre** (29.239 entradas) es lo que permitiría
-  comparar una salida de DataForge contra esta, archivo a archivo. Es la
-  prueba más valiosa que existe y **sigue fuera del repositorio**.
-- La diferencia de 2.313 archivos entre lo citado y lo medido.
+`D:\DataForge_Audit_Work\` conserva la auditoría completa del trabajo. No es
+un resumen: es el conjunto etiquetado de decisiones, archivo a archivo.
+
+| Artefacto | Contenido |
+| --- | --- |
+| `dataforge.sqlite` | **156.962 archivos** inventariados, **47.982 decisiones**, 2.281 medios |
+| `asesoria_juridica/manifest_asesoria_juridica_v2.csv` | 47.982 filas: `category, reason, source_abs_path, dest_abs_path, size, mtime_ns, sha256` |
+| `estructura/arboles_injertados_detalle.csv` | **135.378 filas** de árbol injertado con ruta canónica probable |
+| `estructura/periciales_mismo_nombre_hash_distinto.csv` | 1.463 filas |
+| `estructura/periciales_imagenes_compartidas_entre_asuntos.csv` | 7.276 filas |
+| `media_clasificada.csv` | 2.281 medios con `media_type` y `reason` |
+
+**Esto es exactamente la muestra de criterio humano que ROADMAP-2.0 declara
+pendiente de auditar.** Ya no hay que construirla: hay que leerla.
+
+### Las decisiones, por categoría
+
+| Categoría | Archivos | Razón dominante |
+| --- | ---: | --- |
+| `excluido_no_juridico` | 19.413 | «sin señales suficientes» (11.242), «software/técnico» (8.171) |
+| `asesoria_main` | 12.426 | «raíz jurídica reconocida» |
+| `correos` | 7.873 | «correo o contenedor de correo» |
+| `revision_origen_mixto` | 5.576 | «vocabulario jurídico fuera de raíz principal» (4.433) |
+| `periciales` | 2.331 | «pericial/fotos/asunto caligráfico» |
+| `pericial_revision_origen_mixto` | 176 | «dentro de raíz mixta o copia arrastrada» |
+| `soporte_juridico` | 160 | «archivo técnico dentro de raíz jurídica» |
+| `revision_estructural` | 27 | «contenido único en contexto sospechoso» |
+
+**El 40 % de las decisiones fue excluir.** Y la razón mayoritaria —«sin
+señales suficientes»— es un juicio de ausencia, no de presencia: exactamente
+el tipo que una regla determinista puede formular y un modelo no debería
+inventar.
+
+### Árboles injertados: el 99,1 % se resuelve solo
+
+135.378 archivos afectados en **124 prefijos injertados distintos**:
+
+| Situación | Archivos | |
+| --- | ---: | --- |
+| `canonical_path_same_hash` | 130.165 | 96,1 % — está en su ruta canónica con el mismo contenido |
+| `hash_elsewhere_outside_prefix` | 3.977 | 2,9 % — el contenido existe fuera del injerto |
+| `unique_hash_not_elsewhere` | **817** | 0,6 % — **contenido único dentro del injerto** |
+| `canonical_path_hash_diff` | **419** | 0,3 % — misma ruta canónica, **contenido distinto** |
+
+Los dos últimos son los que no se pueden tocar sin criterio: 1.236 archivos,
+el **0,9 %**. Es literalmente la taxonomía que RFC-0002 llama
+«clean-replacement=auto vs unique-in-suspicious-context=review», descubierta
+por necesidad y ahora cuantificada. **Un umbral de auto-colocación para
+árboles injertados no es una suposición: son 99,1 / 0,9.**
+
+### Periciales: la prueba de las dos reglas, en el mismo archivo
+
+**Mismo nombre, contenido distinto.** 106 nombres afectados. El peor:
+
+```
+00000001.JPG  → 19 hashes distintos en 6 asuntos
+DUB-1.TIF     →  8 hashes distintos en 6 asuntos
+DSC_0013.JPG  →  8 hashes distintos en 7 asuntos
+```
+
+Deduplicar por nombre habría fusionado diecinueve imágenes distintas de seis
+periciales caligráficas. En un peritaje, eso no es desorden: es destruir
+prueba.
+
+**Mismo contenido, asuntos distintos.** 678 hashes únicos aparecen en más de
+un asunto (7.276 apariciones). Aquí la regla es la contraria: **no
+consolidar**, porque cada expediente debe sostenerse solo como unidad
+probatoria (regla 9, §15.3 `ACROSS_PROTECTED_CONTEXTS`).
+
+Las dos reglas que DataForge ya afirma por diseño, con datos reales que
+demuestran que ambos casos existen a escala **en el mismo archivo**.
+
+## Qué sigue faltando
+
+- **El informe final al asesor** (`INFORME_FINAL_ORDENACION_...docx` y PDF)
+  está en `D:\DataForge_Salida\05_Asesoria_Juridica_v2\00_INFORME_DE_ORGANIZACION\`.
+  Contiene datos del cliente: no debe entrar tal cual, pero un extracto de
+  criterios sin nombres sí valdría.
+- **Conciliar tres recuentos del mismo corpus**: 158.219 (ROADMAP-2.0),
+  156.962 (base del trabajo original), 155.906 (medido hoy en disco). Momentos
+  de medición distintos es la explicación probable, no la comprobada.
+- Los CSV son grandes (84 MB el de árboles injertados) y contienen rutas
+  reales. **No se versionan aquí**; lo que se versiona es este análisis. Si
+  hace falta evidencia en el repo, van agregados sin rutas.
 
 Sin nombres de cliente: este documento describe formas y recuentos a
 propósito. Las rutas y nombres reales viven en el disco, no aquí.
