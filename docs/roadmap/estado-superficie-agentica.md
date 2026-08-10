@@ -107,6 +107,15 @@ shell.
   herramientas `commit`, pero nada lo consulta todavía. La costura está
   declarada para que la clasificación quede fijada antes de que algo dependa
   de ella.
+- **Conducción de un trabajo largo (2026-08-10).** Las 25 herramientas son un
+  vocabulario completo y **no** una superficie conducible: arrancar y esperar
+  están acoplados (`hash_project` ocupa la única sesión stdio durante horas),
+  los informes grandes no caben en ninguna ventana de contexto (28.537
+  conjuntos, 5.334 elementos de revisión), y **nada registra si un run sigue
+  vivo** — ni PID, ni host, ni latido en todo `crates/`. Es deuda reabierta de
+  M2.1 y va antes que la clasificación, porque sin ella no hay bucle: hay una
+  llamada que no vuelve. Detalle en
+  [superficie-derivada-del-trabajo-real.md](superficie-derivada-del-trabajo-real.md).
 
 ## Referencia de corpus
 

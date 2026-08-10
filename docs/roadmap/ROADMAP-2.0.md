@@ -65,6 +65,12 @@ orígenes intactos.
 
 El orden es obligado: cada hito depende de que exista el anterior.
 
+> **Actualización del 2026-08-10.** Contrastar la superficie contra lo que el
+> trabajo original hizo de verdad reabrió deuda en M2.1 y añadió trabajo
+> derivado de evidencia a M2.3 y M2.6. El análisis que lo sostiene está en
+> [superficie-derivada-del-trabajo-real.md](superficie-derivada-del-trabajo-real.md);
+> las secciones fechadas de cada hito son su resultado.
+
 ### M2.1 — Superficie agéntica
 
 Que un agente pueda conducir el motor sin acoplarse a la ABI de Rust.
@@ -112,6 +118,45 @@ Parquet derivado**, en un **worker aislado**, sobre una única tabla registrada,
 con topes duros de filas, bytes, tamaño de celda, memoria y tiempo. Lo que la
 ADR rechaza es una herramienta capaz de rodear los invariantes de la fachada;
 esta no puede ni verlos.
+
+#### Deuda reabierta (2026-08-10): el vocabulario está completo, la conducción no
+
+Contrastar las 25 herramientas contra lo que el trabajo original **hizo de
+verdad** deja una conclusión incómoda: un agente con esta superficie no puede
+terminar la tarea, y no por falta de criterio. Análisis completo en
+[superficie-derivada-del-trabajo-real.md](superficie-derivada-del-trabajo-real.md).
+
+El objetivo declarado de este hito era *«que un agente pueda conducir el motor»*.
+Se cumplió como **vocabulario** —las 25 herramientas existen, están tipadas y
+clasificadas— y no como **conducción** de un trabajo de horas. Son tres huecos
+mecánicos, y ninguno necesita inteligencia:
+
+1. **Arrancar y esperar están acoplados.** `hash_project` sobre 443 GB ocupa la
+   única sesión stdio durante horas y no devuelve nada hasta terminar. El
+   matiz que importa: **los contadores ya existen**. `inventory_summary`
+   (`crates/df-db/src/inventory.rs`) publica `hash_done`/`hash_pending` y
+   `project_status` ya los expone. No falta telemetría; falta un
+   `job_start(stage)` que devuelva un id y un `job_status(id)` que lea lo que
+   ya se escribe. La transcripción del trabajo original está llena de «sigue
+   vivo» y «va por 30/75»: el operador humano necesitaba ese latido y lo
+   obtenía mirando la consola, que es justo lo que un agente no tiene.
+2. **Los informes no caben en ninguna ventana de contexto.** `duplicate_report`
+   devuelve 28.537 conjuntos; `structural_review_queue`, 5.334 elementos. Un
+   agente que pide un informe y recibe decenas de MB de JSON ha gastado su
+   sesión sin aprender nada. `structural_review_classes` ya hace lo correcto
+   agregando por clase: **el patrón existe y hay que extenderlo** —agregado por
+   defecto, `limit`/`offset` para el detalle— a duplicados, anomalías y
+   relaciones de árbol.
+3. **Nada registra si un run sigue vivo.** Buscado en todo `crates/`: ni PID,
+   ni host, ni latido, ni marca de actividad. No está a medias, no hay nada.
+   Es la causa de que el proyecto de la prueba de la 1.0 siga clavado en
+   `EXECUTING` sin que nadie pueda distinguir «hay algo copiando» de «murió
+   hace tres días». Es precondición de la autonomía, no robustez opcional:
+   **sin esto, reanudar es apostar.**
+
+Estos tres van **antes** que cualquier trabajo de clasificación. No por
+prelación de diseño, sino porque sin ellos no hay bucle que optimizar: hay una
+llamada que no vuelve.
 
 ### M2.2 — Taxonomía de destino
 
@@ -214,6 +259,63 @@ redundancia bloqueada sin releer un byte.
 - Reglas duras heredadas del caso real: nunca deduplicar por nombre; evidencia
   compartida entre asuntos siempre a revisión; origen suelto se marca, no se
   colapsa.
+
+#### Dos informes que la evidencia pidió (2026-08-10)
+
+Derivados del trabajo original, no de principios. Los dos son **lectura sobre
+evidencia que ya está en la base**: baratos, y desbloquean el grueso del hito.
+
+**`grafted_tree_report`.** `tree_relation_report` da las relaciones, pero el
+trabajo original necesitó algo más fino: para cada archivo dentro de un
+injerto, **su ruta canónica probable** y en cuál de estos cuatro casos cae.
+Medido sobre 135.378 archivos en 124 prefijos:
+
+| Caso | Archivos | |
+| --- | ---: | --- |
+| En su ruta canónica, mismo hash | 130.165 | 96,1 % → automático |
+| El contenido existe fuera del injerto | 3.977 | 2,9 % → automático |
+| **Contenido único dentro del injerto** | **817** | 0,6 % → revisión |
+| **Misma ruta canónica, contenido distinto** | **419** | 0,3 % → revisión |
+
+**99,1 % automático / 0,9 % a revisión.** Ese es el umbral de auto-colocación
+para árboles injertados y **no es una suposición**: es el reparto medido. Los
+dos casos que van a revisión son exactamente los que un humano tiene que mirar,
+y son 1.236 elementos, no 135.378.
+
+**`name_collision_report`.** El caso que ninguna regla de contenido detecta:
+106 nombres con contenido distinto entre asuntos, el peor `00000001.JPG` con
+**19 hashes en 6 periciales**. Y su simétrico: 678 hashes genuinamente
+compartidos entre asuntos, que **no** se pueden consolidar. El motor ya se
+niega a deduplicar por nombre; lo que falta es **poder demostrar por qué**, que
+es lo que convierte una negativa en una garantía a ojos de quien recibe la
+entrega.
+
+#### El reencuadre de la clasificación: perfil, no veredicto por archivo
+
+**Bloqueado: necesita su propia ADR antes de escribirse.**
+
+El trabajo original produjo, por archivo, una categoría y un motivo —
+`excluido_no_juridico` 19.413, `asesoria_main` 12.426, `correos` 7.873,
+`revision_origen_mixto` 5.576, `periciales` 2.331, sobre 47.982 decisiones.
+DataForge no tiene ese verbo: sabe decidir sobre *elementos de revisión*
+estructurales, pero no puede decir «este archivo va a esta raíz por este
+motivo».
+
+Lo que la evidencia desaconseja es que el modelo juzgue 158.219 archivos. El
+trabajo original **no acabó así**: acabó con marcadores y raíces declaradas. La
+forma que reproduce ese resultado es un trío:
+
+- **`propose_profile(evidence)`** — el agente propone **un perfil**: raíces,
+  marcadores, reglas. Pequeño, auditable, reutilizable.
+- **`validate_profile(profile)`** — el motor lo valida *fail-closed*, sin
+  escribir nada.
+- **`apply_profile(profile)`** — determinista y reproducible sobre todo el
+  corpus, sellando digest y versión.
+
+Veinte reglas que un humano lee, frente a 158.219 juicios que nadie puede
+auditar. Encaja con ADR-0026 (perfiles declarativos) y con
+`destination_roots` de M2.2, que ya declara las raíces en el perfil en vez de
+en un `match`.
 
 ### M2.4 — `df-rules`
 
@@ -325,6 +427,27 @@ es aceptable», que es como lo lee cualquiera que lo configure.
 de espacio, los buckets `revisar/_ilegible/` y `revisar/_verificacion-fallida/`,
 la reanudación desde el manifiesto y el informe origen→destino exportable.
 
+#### Vitalidad del run (2026-08-10) — precondición, no robustez opcional
+
+Reanudar exacto desde el manifiesto exige antes saber **si hay alguien
+copiando**. Hoy no hay forma: ni PID, ni host, ni fase, ni latido en todo
+`crates/`. Un agente que se reconecta no puede distinguir un run vivo de uno
+muerto hace tres días, y el proyecto de la prueba de la 1.0 —clavado en
+`EXECUTING`— es la demostración. Va con el desacoplamiento `job_start`/
+`job_status` de M2.1, porque son la misma costura vista desde los dos lados.
+
+#### `export_delivery_package` — el criterio de aceptación real
+
+El trabajo original no se aceptó por una métrica técnica. Se aceptó, literal,
+*«que el asesor no tenga desconfianza porque se haya podido perder material
+alguno»*. Por eso el entregable acabó siendo informe + CSV de trazabilidad +
+manifiesto SHA-256 dentro de la propia carpeta de salida.
+
+El motor ya tiene todo el dato —manifiesto congelado, procedencia por
+operación, ledger encadenado—; lo que no tiene es **la forma de entregarlo**.
+Un resultado correcto que no se puede demostrar no sirve, que es la diferencia
+entre terminar la tarea y que te la den por buena.
+
 [ADR-0044]. El bucle completo: intención → plan → reglas → congelar → ejecutar
 → verificar → informe. Con presupuestos, cortacircuitos por tasa de
 ambigüedad, modo dry-run y mapa origen→destino exportable.
@@ -351,6 +474,7 @@ se alcanzó con scripts y criterio humano a lo largo de diez días**:
 | Verificación independiente | `COMPLETED` |
 | Ledger | Cadena verificada, con procedencia por decisión |
 | Mapa origen→destino | Completo y exportable |
+| Paquete de entrega | Informe + trazabilidad + manifiesto SHA-256 en la salida |
 
 Referencia de escala: 158.219 archivos, 443,9 GB, 28.537 conjuntos de
 duplicados, 239,7 GB redundantes. La cola de revisión tiene 5.334 elementos y
@@ -395,6 +519,12 @@ construcción. No se reescribe historia. El perfil `generic` mantiene la salida
 - **Calibración de confianza sin datos.** RFC-0002 deja abierto un modo sombra
   que coloque todo en el espejo y compare con la decisión humana para fijar
   umbrales. Sin eso, los umbrales de auto-colocación son una suposición.
+  **Reducido en parte el 2026-08-10:** para árboles injertados el umbral ya no
+  se supone, se midió —99,1 % automático / 0,9 % a revisión sobre 135.378
+  archivos— porque el trabajo original dejó las 47.982 decisiones etiquetadas y
+  se pueden contrastar. Sigue abierto para todo lo demás: una cifra medida en
+  un archivo jurídico no es un umbral universal, y el modo sombra sigue siendo
+  la forma de saberlo.
 - **Suponer que la política de duplicados basta.** Se dio por hecho, en esta
   misma línea de trabajo, que elegir `CONSOLIDATE_ALL` produciría una salida
   deduplicada de unos 204 GB. Medido, el ahorro alcanzable es de 5,45 GB. La
