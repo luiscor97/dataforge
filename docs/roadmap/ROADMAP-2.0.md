@@ -119,7 +119,7 @@ con topes duros de filas, bytes, tamaño de celda, memoria y tiempo. Lo que la
 ADR rechaza es una herramienta capaz de rodear los invariantes de la fachada;
 esta no puede ni verlos.
 
-#### Deuda reabierta (2026-08-10): el vocabulario está completo, la conducción no
+#### Deuda reabierta (2026-08-10) y saldada (2026-08-11)
 
 Contrastar las 25 herramientas contra lo que el trabajo original **hizo de
 verdad** deja una conclusión incómoda: un agente con esta superficie no puede
@@ -131,15 +131,19 @@ Se cumplió como **vocabulario** —las 25 herramientas existen, están tipadas 
 clasificadas— y no como **conducción** de un trabajo de horas. Son tres huecos
 mecánicos, y ninguno necesita inteligencia:
 
-1. **Arrancar y esperar están acoplados.** `hash_project` sobre 443 GB ocupa la
-   única sesión stdio durante horas y no devuelve nada hasta terminar. El
-   matiz que importa: **los contadores ya existen**. `inventory_summary`
-   (`crates/df-db/src/inventory.rs`) publica `hash_done`/`hash_pending` y
-   `project_status` ya los expone. No falta telemetría; falta un
-   `job_start(stage)` que devuelva un id y un `job_status(id)` que lea lo que
-   ya se escribe. La transcripción del trabajo original está llena de «sigue
-   vivo» y «va por 30/75»: el operador humano necesitaba ese latido y lo
-   obtenía mirando la consola, que es justo lo que un agente no tiene.
+1. ~~**Arrancar y esperar están acoplados.**~~ **Resuelto, y no como estaba
+   planteado.** `job_start`/`job_status` daba por supuesto un proceso
+   desacoplado y un registro de trabajos — que, por ADR-0043 §5, habría tenido
+   que vivir en SQLite de todos modos. Pero **la cola de hash ya era
+   persistente y reanudable**, así que la forma honesta es una llamada
+   acotada: `max_files` hace tanto y vuelve diciendo cuánto queda. El agente
+   conduce el bucle, informa entre llamadas y puede parar; nadie gestiona un
+   proceso huérfano ni persigue un PID.
+
+   Agotar el presupuesto toma **la misma ruta de pausa cooperativa** que una
+   cancelación, así que hay una sola manera de que un run pare antes de tiempo
+   y una sola de que continúe. Probado de punta a punta: 25 archivos en
+   llamadas de 10 → 10/15 pendientes, 20/5, 25/0 y `HASHED`.
 2. ~~**Los informes no caben en ninguna ventana de contexto.**~~
    **Resuelto (2026-08-10).** `duplicate_report` devolvía 28.537 conjuntos y
    `structural_review_queue` 5.334 elementos; ahora los seis informes con
@@ -154,16 +158,27 @@ mecánicos, y ninguno necesita inteligencia:
    como el esquema MCP, de modo que no pueden discrepar. Superficie
    `dataforge.tool-surface/0.3.0`, con `frozen_contracts` actualizado en el
    mismo commit (ADR-0037 §2).
-3. **Nada registra si un run sigue vivo.** Buscado en todo `crates/`: ni PID,
-   ni host, ni latido, ni marca de actividad. No está a medias, no hay nada.
-   Es la causa de que el proyecto de la prueba de la 1.0 siga clavado en
-   `EXECUTING` sin que nadie pueda distinguir «hay algo copiando» de «murió
-   hace tres días». Es precondición de la autonomía, no robustez opcional:
-   **sin esto, reanudar es apostar.**
+3. ~~**Nada registra si un run sigue vivo.**~~ **Resuelto (migración 0021).**
+   Y lo que lo define es lo que **no** tiene: no hay `is_alive()`. Un PID no
+   significa nada en otra máquina y se reutiliza; un portátil que durmió tiene
+   latido viejo y run vivo; un proceso matado hace un segundo tiene latido
+   fresco y ningún run. «Vivo» no es un dato que esta base pueda guardar, y un
+   umbral de frescura convertiría ese imposible en un número de configuración
+   que se equivoca justo en esos casos.
 
-Estos tres van **antes** que cualquier trabajo de clasificación. No por
-prelación de diseño, sino porque sin ellos no hay bucle que optimizar: hay una
-llamada que no vuelve.
+   Así que guarda **evidencia** —quién reclamó la etapa, desde dónde, cuándo
+   empezó, cuándo habló por última vez— más la única comparación factual: si
+   la reclamación es de este proceso. El juicio se queda en quien lee, que es
+   la misma forma que ya usaba `resume_interrupted`. `beat` y `release` solo
+   tocan la reclamación propia: un run que pudiera latir por la de otro
+   mantendría uno muerto pareciendo fresco para siempre.
+
+   Hash y execute reclaman, laten por lote confirmado y sueltan. `project
+   status` lo publica en `active_run`.
+
+**Los tres cerrados el 2026-08-11.** La superficie ya es conducible: un agente
+puede pedir informes que caben, hashear en pasos que puede supervisar, y ver
+quién tiene el proyecto antes de decidir nada.
 
 ### M2.2 — Taxonomía de destino
 
