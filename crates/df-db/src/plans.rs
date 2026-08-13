@@ -1119,6 +1119,99 @@ pub fn pending_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
         .map_err(db_err)
 }
 
+/// One completed verification run, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerificationRunView {
+    pub id: String,
+    pub plan_id: String,
+    /// `COMPLETED`, `COMPLETED_WITH_WARNINGS` or `FAILED`.
+    pub verdict: String,
+    pub checked: u64,
+    pub problems: u64,
+    pub warnings: u64,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+/// One thing a verification run found.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerificationFindingView {
+    pub kind: String,
+    /// `PROBLEM` or `WARNING`.
+    pub severity: String,
+    /// What the finding is about — a destination path, usually.
+    pub subject: String,
+    pub detail: String,
+}
+
+/// The most recent verification of a plan, if it has been verified.
+///
+/// The verifier has always written these; nothing read them back, so the
+/// verdict existed only as the return value of the call that produced it. A
+/// result you can only learn by re-running the check is not a record, and
+/// re-reading a delivered archive to answer "did this verify?" is exactly the
+/// work the run already did.
+pub fn latest_verification(db: &Db, plan_id: PlanId) -> DfResult<Option<VerificationRunView>> {
+    db.conn()
+        .query_row(
+            "SELECT id, plan_id, verdict, checked, problems, warnings, started_at, finished_at
+             FROM verification_runs
+             WHERE plan_id = ?1
+             ORDER BY finished_at DESC, created_at DESC
+             LIMIT 1",
+            params![plan_id.to_string()],
+            |row| {
+                Ok(VerificationRunView {
+                    id: row.get(0)?,
+                    plan_id: row.get(1)?,
+                    verdict: row.get(2)?,
+                    checked: row.get::<_, i64>(3)? as u64,
+                    problems: row.get::<_, i64>(4)? as u64,
+                    warnings: row.get::<_, i64>(5)? as u64,
+                    started_at: row.get(6)?,
+                    finished_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_err)
+}
+
+/// What a verification run found, problems before warnings.
+///
+/// Bounded by `limit`, because a failed verification of a large archive can
+/// hold as many findings as there are files, and a caller asking what went
+/// wrong wants the worst of it rather than all of it.
+pub fn verification_findings(
+    db: &Db,
+    verification_run_id: &str,
+    limit: usize,
+) -> DfResult<Vec<VerificationFindingView>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT kind, severity, subject, detail
+             FROM verification_findings
+             WHERE verification_run_id = ?1
+             ORDER BY CASE severity WHEN 'PROBLEM' THEN 0 ELSE 1 END, subject
+             LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![verification_run_id, limit as i64], |row| {
+            Ok(VerificationFindingView {
+                kind: row.get(0)?,
+                severity: row.get(1)?,
+                subject: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
 pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
     let mut progress = PlanProgress::default();
     db.conn()

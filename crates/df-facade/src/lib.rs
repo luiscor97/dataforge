@@ -2482,10 +2482,19 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         ));
     }
 
-    // Deliberately not asserting a verification verdict. Nothing in `df-db`
-    // reads verification runs back yet, and a document whose entire purpose is
-    // to be trusted must not carry a claim its author could not check. It
-    // points at where the answer actually lives instead.
+    // The verdict is read back from the run that produced it, never asserted.
+    // "Not verified" is said in those words rather than left blank: a delivery
+    // that was never checked and one that passed must not look alike.
+    let verification = df_db::plans::latest_verification(&db, plan.id)?;
+    let verdict = match &verification {
+        Some(run) => format!(
+            "**{}** — {} checked, {} problems, {} warnings, finished {}",
+            run.verdict, run.checked, run.problems, run.warnings, run.finished_at
+        ),
+        None => {
+            "**not verified** — no verification run has been recorded for this plan".to_string()
+        }
+    };
     let summary = format!(
         "# Delivery package\n\n\
          Plan `{}`, version {}.\n\n\
@@ -2493,10 +2502,8 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
          - Entries in the frozen manifest: **{}**\n\
          - Of those, carrying a SHA-256 anyone can check: **{}**\n\
          - Without a recorded destination: **{}**\n\
-         - Bytes described: **{}**\n\n\
-         Independent verification is a separate step (`verify`), and its \
-         verdict is recorded in the project's chained ledger rather than \
-         asserted here.\n\n\
+         - Bytes described: **{}**\n\
+         - Independent verification: {}\n\n\
          ## Guarantees\n\n\
          The origin was never written to: no code in this engine renames, \
          deletes or modifies anything inside a source root. Nothing was \
@@ -2513,6 +2520,7 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         checksummed,
         without_destination,
         bytes,
+        verdict,
     );
 
     write_delivery_file(&directory, "traceability.csv", &csv)?;
@@ -3540,8 +3548,25 @@ mod tests {
 
         let summary = std::fs::read_to_string(directory.join("delivery.md")).expect("summary");
         assert!(summary.contains("The origin was never written to"));
-        // No verdict is claimed, because none can be read back yet.
-        assert!(!summary.contains("COMPLETED"));
+        // Never verified and verified-and-passed must not read alike, so the
+        // unchecked case says so in words rather than leaving a blank.
+        assert!(
+            summary.contains("not verified"),
+            "an unverified delivery must say so: {summary}"
+        );
+
+        // After a real verification the package reports what that run found,
+        // read back from the run itself rather than re-derived.
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        let verify = verify_project_output(&req.project_dir, Actor::Test).expect("verify");
+        let after = export_delivery_package(&req.project_dir).expect("exported again");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&after.directory).join("delivery.md"))
+                .expect("summary");
+        assert!(
+            summary.contains(&verify.verdict),
+            "the package must carry the verdict the run produced: {summary}"
+        );
     }
 
     /// Count CSV fields honouring quoting.
