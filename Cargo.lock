@@ -2088,6 +2088,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "df-agent"
+version = "1.0.0"
+dependencies = [
+ "df-error",
+ "serde",
+]
+
+[[package]]
 name = "df-ai"
 version = "1.0.1"
 dependencies = [
@@ -2216,6 +2224,7 @@ name = "df-facade"
 version = "1.0.1"
 dependencies = [
  "chrono",
+ "df-agent",
  "df-ai",
  "df-db",
  "df-domain",
@@ -2230,9 +2239,11 @@ dependencies = [
  "df-plugin",
  "df-process-safety",
  "df-query",
+ "df-rules",
  "df-scan",
  "df-search",
  "df-similarity",
+ "df-tools",
  "df-verifier",
  "ed25519-dalek",
  "hex",
@@ -2285,6 +2296,16 @@ dependencies = [
  "hex",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "df-mcp"
+version = "1.0.0"
+dependencies = [
+ "df-error",
+ "df-tools",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2405,6 +2426,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "df-rules"
+version = "1.0.0"
+dependencies = [
+ "df-domain",
+ "df-error",
+ "df-ledger",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "df-scan"
 version = "1.0.1"
 dependencies = [
@@ -2459,6 +2493,17 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "df-tools"
+version = "1.0.0"
+dependencies = [
+ "df-error",
+ "df-facade",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

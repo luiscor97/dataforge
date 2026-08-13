@@ -12,9 +12,9 @@ use std::path::{Component, Path};
 
 use df_db::{plans, repository, Db};
 use df_domain::{
-    Actor, ApprovalState, DuplicateDisposition, DuplicateKind, DuplicatePolicy, ExecutionState,
-    ManifestEntry, OperationType, Plan, PlanOperation, PlanStatus, ProjectState, RiskLevel,
-    SourceRootId,
+    Actor, ApprovalState, DestinationRootDef, DuplicateDisposition, DuplicateKind, DuplicatePolicy,
+    ExecutionState, ManifestEntry, OperationType, Plan, PlanOperation, PlanStatus, Profile,
+    ProjectState, RiskLevel, SourceRootId,
 };
 use df_error::{DfError, DfResult};
 use serde::Serialize;
@@ -611,10 +611,86 @@ fn idempotency_key(
 
 /// Destination top-level directory per source root: the root's folder name,
 /// disambiguated deterministically when several roots share one.
-const REVIEW_BUCKET: &str = "90_DataForge_Review";
-const SEPARATED_BUCKET: &str = "95_DataForge_Separated";
-const TEMPORARY_BUCKET: &str = "98_DataForge_Temporary";
 const PORTABLE_COMPONENT_PREFIX: &str = "~df-portable-";
+
+/// The named destination roots a plan may route into (ADR-0040 §1).
+///
+/// One place that knows every root, rather than constants read separately by
+/// the router and by the source-root namer. Those two had to agree — a root
+/// the router can emit but the namer does not reserve is a container a source
+/// folder could shadow — and nothing but proximity was keeping them in step.
+///
+/// The set comes from the profile, so enriching the output does not mean
+/// growing a `match` here. `generic` declares exactly the four roots 1.x
+/// hardcoded, so its output is unchanged byte for byte.
+///
+/// Borrows from the profile rather than owning: routing runs once per
+/// operation and a plan over a real archive holds hundreds of thousands of
+/// them, so the profile is loaded once per plan and the roots are read in
+/// place.
+#[derive(Debug, Clone, Copy)]
+pub struct DestinationTaxonomy<'a> {
+    roots: &'a [DestinationRootDef],
+}
+
+impl<'a> DestinationTaxonomy<'a> {
+    /// Read the roots a profile declares.
+    ///
+    /// `Profile::load` has already rejected a set the planner could not route
+    /// with — missing required root, duplicate id, duplicate or non-atomic
+    /// folder — so nothing here has to re-check it.
+    pub fn from_profile(profile: &'a Profile) -> Self {
+        Self {
+            roots: &profile.destination_roots,
+        }
+    }
+
+    /// Folder names that a source root must never be allowed to shadow.
+    ///
+    /// Reserved even when the profile emits nothing into them: a name that
+    /// becomes reachable only once some item lands there is a name that
+    /// collides on the run where it first matters.
+    pub fn reserved_folders(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.roots.iter().filter_map(|root| root.folder.as_deref())
+    }
+
+    /// The declared root an operation type routes into.
+    ///
+    /// `None` only if a profile declares a set that does not cover the type,
+    /// which `Profile::load` refuses to accept.
+    pub fn root_for(&self, operation_type: OperationType) -> Option<&'a DestinationRootDef> {
+        let id = match operation_type {
+            OperationType::CopyReview => "review",
+            OperationType::CopySeparated => "separated",
+            OperationType::CopyTemporary => "temporary",
+            _ => "active",
+        };
+        self.roots.iter().find(|root| root.id == id)
+    }
+
+    /// The folder an operation type routes into, or `None` when it belongs in
+    /// the working archive.
+    pub fn folder_for(&self, operation_type: OperationType) -> Option<&'a str> {
+        self.root_for(operation_type)
+            .and_then(|root| root.folder.as_deref())
+    }
+}
+
+/// The declared root id to record against an operation (ADR-0040 §3).
+///
+/// `None` when the operation has no destination at all: an operation that
+/// copies nothing did not land anywhere, and naming a root for it would be
+/// inventing provenance rather than recording it.
+fn routed_root_id(
+    taxonomy: &DestinationTaxonomy<'_>,
+    operation_type: OperationType,
+    destination: Option<&str>,
+) -> Option<String> {
+    destination?;
+    taxonomy
+        .root_for(operation_type)
+        .map(|root| root.id.clone())
+}
 
 /// Turn a source component into a name which is safe to materialise on every
 /// supported Windows filesystem. Safe names stay readable; unsafe or reserved
@@ -707,11 +783,15 @@ fn portable_relative_path(
     ))
 }
 
-fn root_destination_dirs(roots: &[df_domain::SourceRoot]) -> HashMap<SourceRootId, (String, bool)> {
-    // Bucket names are reserved even when a profile currently emits no item
-    // into them, so a source root can never shadow an operational container.
-    let mut used: HashSet<String> = [REVIEW_BUCKET, SEPARATED_BUCKET, TEMPORARY_BUCKET]
-        .into_iter()
+fn root_destination_dirs(
+    roots: &[df_domain::SourceRoot],
+    taxonomy: &DestinationTaxonomy<'_>,
+) -> HashMap<SourceRootId, (String, bool)> {
+    // Reserved from the declared taxonomy rather than from a second copy of
+    // the same names: the router and this namer must agree about every root,
+    // and a list repeated in two places is a list that eventually diverges.
+    let mut used: HashSet<String> = taxonomy
+        .reserved_folders()
         .map(str::to_ascii_lowercase)
         .collect();
     let mut mapping = HashMap::new();
@@ -741,17 +821,12 @@ fn root_destination_dirs(roots: &[df_domain::SourceRoot]) -> HashMap<SourceRootI
     mapping
 }
 
-fn operational_bucket(operation_type: OperationType) -> Option<&'static str> {
-    match operation_type {
-        OperationType::CopyReview => Some(REVIEW_BUCKET),
-        OperationType::CopySeparated => Some(SEPARATED_BUCKET),
-        OperationType::CopyTemporary => Some(TEMPORARY_BUCKET),
-        _ => None,
-    }
-}
-
-fn route_destination(operation_type: OperationType, active_destination: &str) -> String {
-    operational_bucket(operation_type).map_or_else(
+fn route_destination(
+    taxonomy: &DestinationTaxonomy<'_>,
+    operation_type: OperationType,
+    active_destination: &str,
+) -> String {
+    taxonomy.folder_for(operation_type).map_or_else(
         || active_destination.to_string(),
         |bucket| {
             Path::new(bucket)
@@ -779,6 +854,43 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
     format!("{prefix}{file_name}")
 }
 
+/// Whether `parent` is inside `folder` — the same folder, or below it.
+///
+/// Compared component-wise rather than with `starts_with`, so `base-ampliada`
+/// is not read as living inside `base`.
+fn is_within(parent: &str, folder: &str) -> bool {
+    if folder.is_empty() {
+        return true;
+    }
+    if parent == folder {
+        return true;
+    }
+    let normalise = |path: &str| path.replace('\\', "/");
+    let parent = normalise(parent);
+    let folder = normalise(folder);
+    parent
+        .strip_prefix(&folder)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The contained folder an occurrence sits in, for the reason it records.
+///
+/// The deepest match, when several nest: that is the one that actually
+/// contains it, and the one a reader would go and look at.
+fn containing_folder<'a>(
+    contained: &'a [df_db::structure::ContainedFolder],
+    member: &df_db::dedup::DuplicateMember,
+) -> Option<&'a str> {
+    contained
+        .iter()
+        .filter(|folder| {
+            folder.source_root_id == member.source_root_id
+                && is_within(&member.parent_relative_path, &folder.relative_path)
+        })
+        .max_by_key(|folder| folder.relative_path.len())
+        .map(|folder| folder.relative_path.as_str())
+}
+
 /// Classify a duplicate set from the contexts of its members (§15.3).
 ///
 /// Conservative by construction: `WithinSameContext` is only claimed when the
@@ -786,7 +898,14 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
 /// graph (§18.2) that is the only "same context" we can demonstrate. Anything
 /// else that is not clearly generic-to-canonical stays `UnknownContext`, which
 /// no policy consolidates.
-fn classify_duplicate_set(members: &[&df_db::dedup::DuplicateMember]) -> DuplicateKind {
+///
+/// The one exception is `ContainedTreeReplica` (ADR-0045), and it is not a
+/// weakening of that rule: a copy inside a folder proved to hold nothing of
+/// its own is redundancy the engine *recorded*, not redundancy it guessed.
+fn classify_duplicate_set(
+    members: &[&df_db::dedup::DuplicateMember],
+    contained: &[df_db::structure::ContainedFolder],
+) -> DuplicateKind {
     if members.len() < 2 {
         return DuplicateKind::UnknownContext;
     }
@@ -830,13 +949,41 @@ fn classify_duplicate_set(members: &[&df_db::dedup::DuplicateMember]) -> Duplica
         };
     }
 
+    // Before giving up: the engine may already have proved that some copies
+    // live in a subtree with nothing of its own (ADR-0045). That is only
+    // usable when the representative sits *outside* every such folder —
+    // otherwise dropping the replicas could drop the only copy there is.
+    if !contained.is_empty() {
+        if let Some(representative) = members.iter().find(|m| m.is_representative) {
+            let inside_contained = |member: &df_db::dedup::DuplicateMember| {
+                contained.iter().any(|folder| {
+                    folder.source_root_id == member.source_root_id
+                        && is_within(&member.parent_relative_path, &folder.relative_path)
+                })
+            };
+            if !inside_contained(representative)
+                && members
+                    .iter()
+                    .filter(|m| !m.is_representative)
+                    .all(|m| inside_contained(m))
+            {
+                return DuplicateKind::ContainedTreeReplica;
+            }
+        }
+    }
+
     // Different folders, no generic/canonical split we can justify.
     DuplicateKind::UnknownContext
 }
 
 fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<Vec<PlanOperation>> {
     let roots = repository::load_source_roots(db, plan.project_id)?;
-    let root_dirs = root_destination_dirs(&roots);
+    // Loaded once per plan, not once per operation: the taxonomy borrows from
+    // it and routing runs hundreds of thousands of times over a real archive.
+    let project = repository::load_project(db)?;
+    let profile = Profile::load(project.profile.as_str())?;
+    let taxonomy = DestinationTaxonomy::from_profile(&profile);
+    let root_dirs = root_destination_dirs(&roots, &taxonomy);
     let folders = df_db::inventory::list_folders(db, plan.snapshot_id)?;
     let occurrences = plans::planning_occurrences(db, plan.snapshot_id)?;
     let guidance = df_db::analysis::occurrence_guidance(db, plan.snapshot_id)?;
@@ -851,9 +998,12 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
             .or_default()
             .push(member);
     }
+    // Read once per plan: the same list answers every set, and over a real
+    // archive there are tens of thousands of sets.
+    let contained = df_db::structure::contained_embedded_folders(db, plan.snapshot_id)?;
     let kinds: HashMap<&str, DuplicateKind> = sets
         .iter()
-        .map(|(set_id, members)| (*set_id, classify_duplicate_set(members)))
+        .map(|(set_id, members)| (*set_id, classify_duplicate_set(members, &contained)))
         .collect();
     let by_occurrence: HashMap<&str, &df_db::dedup::DuplicateMember> = members
         .iter()
@@ -953,6 +1103,7 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
             approval: ApprovalState::Pending,
             execution_state: initial_execution_state(operation_type),
             idempotency_key: idempotency_key(plan, None, operation_type, destination.as_deref()),
+            destination_root_id: routed_root_id(&taxonomy, operation_type, destination.as_deref()),
             destination_relative_path: destination,
             reason,
         });
@@ -1063,7 +1214,11 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                     "planner recommendation guard became inconsistent".to_string(),
                                 )
                             })?;
-                            let routed = route_destination(recommendation.operation_type, &planned);
+                            let routed = route_destination(
+                                &taxonomy,
+                                recommendation.operation_type,
+                                &planned,
+                            );
                             let (destination, collision) =
                                 if taken_destinations.insert(routed.to_lowercase()) {
                                     (routed.clone(), false)
@@ -1089,7 +1244,7 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                         recommendation.reason
                                     )
                                 } else if let Some(bucket) =
-                                    operational_bucket(recommendation.operation_type)
+                                    taxonomy.folder_for(recommendation.operation_type)
                                 {
                                     format!(
                                         "{}; routed to operational bucket `{bucket}`",
@@ -1105,17 +1260,35 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                 },
                             )
                         }
-                        Some((kind, _, DuplicateDisposition::SkipRepresented)) => (
+                        Some((kind, member, DuplicateDisposition::SkipRepresented)) => (
                             OperationType::SkipRepresented,
                             None,
                             RiskLevel::Medium,
                             1.0,
-                            format!(
-                                "exact duplicate ({}) already represented by the set's canonical \
-                                 copy; not copied under policy {} — the source keeps it",
-                                kind.as_str(),
-                                policy.as_str()
-                            ),
+                            if kind == DuplicateKind::ContainedTreeReplica {
+                                // ADR-0045 §5: an output that is gigabytes
+                                // smaller has to be able to explain every byte
+                                // it did not write, so the reason names the
+                                // proof and the folder it came from — not just
+                                // "already represented".
+                                let folder = containing_folder(&contained, member)
+                                    .unwrap_or("an embedded subtree");
+                                format!(
+                                    "exact duplicate inside `{folder}`, a subtree proven to hold \
+                                     no content of its own (TREE_EMBEDDED, unique_files = 0); the \
+                                     set's canonical copy lives outside it, so this occurrence is \
+                                     not copied under policy {} — the source keeps it",
+                                    policy.as_str()
+                                )
+                            } else {
+                                format!(
+                                    "exact duplicate ({}) already represented by the set's \
+                                     canonical copy; not copied under policy {} — the source \
+                                     keeps it",
+                                    kind.as_str(),
+                                    policy.as_str()
+                                )
+                            },
                         ),
                         // Copy: representative, preserved policy, or not a duplicate.
                         _ if taken_destinations.insert(planned.to_lowercase()) => (
@@ -1192,6 +1365,11 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                             OperationType::CreateDirectory,
                             Some(&parent),
                         ),
+                        destination_root_id: routed_root_id(
+                            &taxonomy,
+                            OperationType::CreateDirectory,
+                            Some(&parent),
+                        ),
                         destination_relative_path: Some(parent),
                         reason: "create the parent for a routed operational bucket".to_string(),
                     });
@@ -1215,6 +1393,7 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                 operation_type,
                 destination.as_deref(),
             ),
+            destination_root_id: routed_root_id(&taxonomy, operation_type, destination.as_deref()),
             destination_relative_path: destination,
             reason,
         });
@@ -1286,6 +1465,65 @@ mod tests {
     use df_scan::{scan_project, ScanOptions};
 
     use super::*;
+
+    /// Every folder the router can emit has to be a folder the source-root
+    /// namer refuses to hand out, or an origin called `90_DataForge_Review`
+    /// would end up sharing a directory with the review bucket. Before the
+    /// taxonomy these were two separate lists kept in step by proximity
+    /// alone; this asserts they cannot drift (ADR-0040).
+    #[test]
+    fn every_routable_root_is_reserved_against_source_roots() {
+        let profile = Profile::load(df_domain::DEFAULT_PROFILE_ID).unwrap();
+        let taxonomy = DestinationTaxonomy::from_profile(&profile);
+        let reserved: HashSet<String> = taxonomy
+            .reserved_folders()
+            .map(str::to_ascii_lowercase)
+            .collect();
+
+        for operation_type in [
+            OperationType::CopyActive,
+            OperationType::CopyReview,
+            OperationType::CopySeparated,
+            OperationType::CopyTemporary,
+            OperationType::CopyWithSuffix,
+            OperationType::PreserveAcrossContext,
+            OperationType::CreateDirectory,
+        ] {
+            if let Some(folder) = taxonomy.folder_for(operation_type) {
+                assert!(
+                    reserved.contains(&folder.to_ascii_lowercase()),
+                    "`{folder}` is routable but not reserved"
+                );
+            }
+        }
+    }
+
+    /// 2.0 opens the taxonomy; it must not move anything while doing so.
+    /// A project on `generic` has to keep producing the 1.x layout exactly.
+    ///
+    /// Reads the shipped profile rather than a constant, so this now proves
+    /// what actually ships: editing `profiles/generic/profile.json` breaks it.
+    #[test]
+    fn the_shipped_generic_profile_keeps_the_1_x_layout() {
+        let profile = Profile::load(df_domain::DEFAULT_PROFILE_ID).unwrap();
+        let taxonomy = DestinationTaxonomy::from_profile(&profile);
+        assert_eq!(taxonomy.folder_for(OperationType::CopyActive), None);
+        assert_eq!(
+            taxonomy.folder_for(OperationType::CopyReview),
+            Some("90_DataForge_Review")
+        );
+        assert_eq!(
+            taxonomy.folder_for(OperationType::CopySeparated),
+            Some("95_DataForge_Separated")
+        );
+        assert_eq!(
+            taxonomy.folder_for(OperationType::CopyTemporary),
+            Some("98_DataForge_Temporary")
+        );
+        // A directory creation belongs to the archive it is part of, never
+        // to a bucket of its own.
+        assert_eq!(taxonomy.folder_for(OperationType::CreateDirectory), None);
+    }
 
     fn hashed_project(tmp: &Path) -> Db {
         let origin = tmp.join("origen");
@@ -1909,6 +2147,7 @@ mod tests {
             source_occurrence: None,
             content_id: None,
             destination_relative_path: Some("..\\fuera.txt".to_string()),
+            destination_root_id: Some("active".to_string()),
             confidence: 1.0,
             risk: RiskLevel::Low,
             approval: ApprovalState::Pending,
@@ -2365,6 +2604,13 @@ mod tests {
         assert_eq!(plan_outcome.review_copies, 5);
         let plan = plans::current_plan(&db, project.id).unwrap().unwrap();
         let operations = plans::list_operations(&db, plan.id).unwrap();
+        // The folder comes from the profile that planned this, so renaming it
+        // there moves the assertion with it instead of leaving a stale copy.
+        let profile = Profile::load(project.profile.as_str()).unwrap();
+        let review_folder = DestinationTaxonomy::from_profile(&profile)
+            .folder_for(OperationType::CopyReview)
+            .expect("the profile declares a review root")
+            .to_string();
         let conserved: Vec<_> = operations
             .iter()
             .filter_map(|operation| {
@@ -2380,7 +2626,7 @@ mod tests {
                     .destination_relative_path
                     .as_ref()
                     .expect("a review copy has a destination");
-                assert!(destination.starts_with(REVIEW_BUCKET));
+                assert!(destination.starts_with(review_folder.as_str()));
                 (source_relative.clone(), destination.clone())
             })
             .collect();

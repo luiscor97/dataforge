@@ -1,9 +1,9 @@
-//! `dataforge` — command line client of the DataForge engine.
+//! `dataforge` â€” command line client of the DataForge engine.
 //!
 //! The CLI contains no engine logic: inventory, similarity, content
 //! intelligence, planning, execution and audit all go through `df-facade`
 //! (RFC-0001 rules 16/17).
-//! Exit codes follow RFC-0001 §33.
+//! Exit codes follow RFC-0001 Â§33.
 
 use std::path::PathBuf;
 
@@ -14,12 +14,13 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DuplicateReport, ExecuteOutcome, ExtractionLimits, HashOutcome, MediaOutcome,
-    MediaProjectOptions, MediaReport, MediaSidecars, PlanOutcome, PlanValidationReport,
-    PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus, QueryOptions,
-    RegisteredPluginMetadata, ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest,
-    SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, TreeCloneReport,
-    TreeRelationReport, VerifyOutcome,
+    DuplicateReport, ExecuteOutcome, ExtractionLimits, GraftedTreeReport, HashOutcome,
+    MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport,
+    PlanDestinationTree, PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport,
+    PluginsOutcome, ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary,
+    ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions,
+    SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, TreeCloneReport, TreeRelationReport,
+    VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -36,6 +37,66 @@ struct Cli {
     /// Emit machine-readable JSON instead of human text.
     #[arg(long, global = true)]
     json: bool,
+    /// Who is driving: `cli` (a person, the default) or `agent` (an LLM
+    /// operator acting on a person's behalf).
+    ///
+    /// Recorded verbatim in the append-only ledger. It changes nothing about
+    /// what is permitted â€” the safe action set is identical â€” but an archive
+    /// whose audit trail cannot distinguish a human decision from a model's
+    /// is not an audit trail. An agent driving DataForge must say so.
+    #[arg(long, global = true, default_value = "cli", value_parser = parse_cli_actor)]
+    actor: Actor,
+}
+
+/// One decision as it arrives on the wire.
+#[derive(serde::Deserialize)]
+struct DecisionRow {
+    item: String,
+    decision: String,
+    reason: String,
+}
+
+/// Read a decision batch from a file or stdin.
+///
+/// Parsing is strict and happens before anything touches the project: an
+/// unknown field or a bad action is a caller mistake, and reporting it while
+/// the queue is still untouched is the only useful moment to do so.
+fn read_decision_batch(from: &str) -> DfResult<Vec<df_facade::ReviewDecisionInput>> {
+    let raw = if from == "-" {
+        std::io::read_to_string(std::io::stdin())
+            .map_err(|e| DfError::Validation(format!("cannot read decisions from stdin: {e}")))?
+    } else {
+        std::fs::read_to_string(from)
+            .map_err(|e| DfError::Validation(format!("cannot read `{from}`: {e}")))?
+    };
+    let rows: Vec<DecisionRow> = serde_json::from_str(&raw).map_err(|e| {
+        DfError::Validation(format!(
+            "decision batch must be a JSON array of \
+             {{\"item\", \"decision\", \"reason\"}} objects: {e}"
+        ))
+    })?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(df_facade::ReviewDecisionInput {
+                item_id: row.item,
+                decision: df_facade::RuleAction::parse(&row.decision)?,
+                rationale: row.reason,
+            })
+        })
+        .collect()
+}
+
+/// Only the two actors a caller may legitimately claim. `system` belongs to
+/// the engine and `test` to test code; letting a caller assert either would
+/// let it disguise its own decisions as something else.
+fn parse_cli_actor(value: &str) -> Result<Actor, String> {
+    match value {
+        "cli" => Ok(Actor::Cli),
+        "agent" => Ok(Actor::Agent),
+        other => Err(format!(
+            "unknown actor `{other}` (expected `cli` or `agent`)"
+        )),
+    }
 }
 
 #[derive(Subcommand)]
@@ -61,6 +122,20 @@ enum Command {
         /// mode remains the default and the evidential recommendation.
         #[arg(long)]
         incremental: bool,
+        /// Continue a project stranded in `HASHING` by a run that died
+        /// without pausing (a kill, a power cut, a closed window). Only
+        /// pass this when no other hash run is active: DataForge still
+        /// cannot decide that for you, but `project status` now shows
+        /// `active_run` — who claimed the project, from where, and how long
+        /// since it last reported — so the assertion can be an informed one.
+        /// The interrupted run is closed with its own `HASH_PAUSED` event
+        /// before the queue continues.
+        #[arg(long)]
+        resume_interrupted: bool,
+        /// Stop after this many files, leaving the rest queued. The queue is
+        /// persistent, so running again continues where this stopped.
+        #[arg(long)]
+        max_files: Option<u64>,
     },
     /// Analyse the hashed snapshot (exact duplicate sets).
     Analyze {
@@ -129,7 +204,7 @@ enum Command {
         #[arg(long)]
         path: PathBuf,
         /// Acknowledge a destination filesystem without physical identity
-        /// guarantees (network shares, FAT variants) — ADR-0036.
+        /// guarantees (network shares, FAT variants) â€” ADR-0036.
         #[arg(long)]
         allow_degraded_destination: bool,
     },
@@ -333,11 +408,20 @@ enum PlanCommand {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
-        /// What to do with exact duplicates (RFC-0001 §15.4). The default
+        /// What to do with exact duplicates (RFC-0001 Â§15.4). The default
         /// copies every occurrence. No policy ever consolidates a copy that
         /// lives in a protected context.
         #[arg(long, value_name = "POLICY", default_value = "REPORT_ONLY")]
         duplicate_policy: String,
+    },
+    /// Show the output tree the plan would produce, before approving it.
+    Tree {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// How many path levels to show under the output root.
+        #[arg(long, default_value_t = 2)]
+        depth: u32,
     },
     /// Re-check the plan invariants (destinations, collisions, coverage).
     Validate {
@@ -361,6 +445,18 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// File names standing for different content in different places.
+    NameCollisions {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Grafted subtrees and how much of each places itself.
+    GraftedTrees {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Exact tree clones (folders with byte-for-byte identical subtrees).
     TreeClones {
         /// Project directory.
@@ -373,7 +469,7 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
-    /// Generic low-value folders (Downloads, Backup, copies, …) and penalties.
+    /// Generic low-value folders (Downloads, Backup, copies, â€¦) and penalties.
     Contexts {
         /// Project directory.
         #[arg(long)]
@@ -508,6 +604,16 @@ enum ReviewCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Group the queue by question, with how many decisions each would settle.
+    ///
+    /// The first call to make over a real archive: the flat list is thousands
+    /// of rows that are mostly the same question repeated, and answering it
+    /// once per class is what empties the review bucket.
+    Classes {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Append a human decision before generating the plan.
     Decide {
         /// Project directory.
@@ -523,6 +629,24 @@ enum ReviewCommand {
         /// Human explanation preserved in the append-only ledger.
         #[arg(long)]
         reason: String,
+    },
+    /// Append many decisions at once, read as JSON from a file or stdin.
+    ///
+    /// A queue over a real archive holds thousands of items, most of them
+    /// repetitions of a handful of questions. Deciding them one process at a
+    /// time is not a workflow, and the identifiers alone overflow a command
+    /// line, so the batch arrives as data:
+    ///
+    ///   [{"item": "<id>", "decision": "COPY_ACTIVE", "reason": "â€¦"}, â€¦]
+    ///
+    /// All of them commit together or none does.
+    DecideBatch {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+        /// JSON file with the decisions, or `-` to read stdin.
+        #[arg(long, default_value = "-")]
+        from: String,
     },
 }
 
@@ -551,11 +675,14 @@ enum Output {
     ContentSearch(ContentSearchOutcome),
     ContentQuery(ContentQueryOutcome),
     Plan(PlanOutcome),
+    PlanTree(PlanDestinationTree),
     PlanValidation(PlanValidationReport),
     Approve(ApproveOutcome),
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
     Duplicates(DuplicateReport),
+    NameCollisions(NameCollisionReport),
+    GraftedTrees(GraftedTreeReport),
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
@@ -571,10 +698,15 @@ enum Output {
     AiAssist(Box<AiAssistOutcome>),
     AiAudits(Vec<AssistanceAuditView>),
     Review(ReviewQueue),
+    ReviewClasses(ReviewClassSummary),
     Audit(AuditReport),
 }
 
 fn run(cli: &Cli) -> DfResult<Output> {
+    // Whoever the caller declared itself to be. Every mutating command below
+    // records it, so the ledger says which decisions a person made and which
+    // an agent made.
+    let actor = cli.actor;
     match &cli.command {
         Command::Project { command } => match command {
             ProjectCommand::Create {
@@ -593,7 +725,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     source_roots: source.clone(),
                     profile: Some(profile.clone()),
                 };
-                df_facade::create_project(&request, Actor::Cli)
+                df_facade::create_project(&request, actor)
                     .map(Box::new)
                     .map(Output::Status)
             }
@@ -601,19 +733,24 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Box::new)
                 .map(Output::Status),
         },
-        Command::Scan { path } => df_facade::scan_project(path, Actor::Cli).map(Output::Scan),
-        Command::Hash { path, incremental } => df_facade::hash_project_with_options(
+        Command::Scan { path } => df_facade::scan_project(path, actor).map(Output::Scan),
+        Command::Hash {
             path,
-            Actor::Cli,
+            incremental,
+            resume_interrupted,
+            max_files,
+        } => df_facade::hash_project_with_options(
+            path,
+            actor,
             &df_facade::HashOptions {
                 incremental: *incremental,
+                resume_interrupted: *resume_interrupted,
+                max_files: *max_files,
                 ..df_facade::HashOptions::default()
             },
         )
         .map(Output::Hash),
-        Command::Analyze { path } => {
-            df_facade::analyze_project(path, Actor::Cli).map(Output::Analyze)
-        }
+        Command::Analyze { path } => df_facade::analyze_project(path, actor).map(Output::Analyze),
         Command::Similarity {
             path,
             threshold,
@@ -622,7 +759,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             max_candidates,
         } => df_facade::analyze_similarity_with_options(
             path,
-            Actor::Cli,
+            actor,
             &SimilarityOptions {
                 threshold: *threshold,
                 min_shared_chunks: *min_shared_chunks,
@@ -650,7 +787,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             df_facade::analyze_media_with_options(
                 path,
-                Actor::Cli,
+                actor,
                 &MediaProjectOptions {
                     max_pairs: *max_pairs,
                     sidecars,
@@ -664,7 +801,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 path,
                 package,
                 component,
-            } => df_facade::register_plugin(path, package, component, Actor::Cli)
+            } => df_facade::register_plugin(path, package, component, actor)
                 .map(Box::new)
                 .map(Output::PluginRegistered),
             PluginCommand::List { path } => df_facade::list_plugins(path).map(Output::PluginList),
@@ -681,8 +818,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                         .granted_capabilities
                         .insert(df_facade::PluginCapability::SubjectText);
                 }
-                df_facade::run_plugins_with_options(path, Actor::Cli, &options)
-                    .map(Output::PluginRuns)
+                df_facade::run_plugins_with_options(path, actor, &options).map(Output::PluginRuns)
             }
         },
         Command::Ai { command } => match command {
@@ -750,7 +886,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     item,
                     &choice,
                     accept_disclosure.as_deref(),
-                    Actor::Cli,
+                    actor,
                 )
                 .map(Box::new)
                 .map(Output::AiAssist)
@@ -792,7 +928,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 };
                 df_facade::extract_project_content(
                     path,
-                    Actor::Cli,
+                    actor,
                     &ContentExtractionOptions {
                         limits,
                         page_size: *page_size,
@@ -802,7 +938,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Output::ContentExtraction)
             }
             ContentCommand::Fail { path, run, reason } => {
-                df_facade::fail_content_extraction(path, run, reason, Actor::Cli)
+                df_facade::fail_content_extraction(path, run, reason, actor)
                     .map(Output::ContentExtraction)
             }
             ContentCommand::Build {
@@ -823,7 +959,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     page_size: *analytical_page_size,
                     zstd_level: *zstd_level,
                 },
-                Actor::Cli,
+                actor,
             )
             .map(Output::ContentArtifacts),
             ContentCommand::Search {
@@ -875,13 +1011,16 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 duplicate_policy,
             } => {
                 let policy = df_facade::DuplicatePolicy::parse(duplicate_policy)?;
-                df_facade::create_plan(path, Actor::Cli, policy).map(Output::Plan)
+                df_facade::create_plan(path, actor, policy).map(Output::Plan)
+            }
+            PlanCommand::Tree { path, depth } => {
+                df_facade::plan_destination_tree(path, *depth).map(Output::PlanTree)
             }
             PlanCommand::Validate { path } => {
                 df_facade::validate_plan(path).map(Output::PlanValidation)
             }
             PlanCommand::Approve { path } => {
-                df_facade::approve_plan(path, Actor::Cli).map(Output::Approve)
+                df_facade::approve_plan(path, actor).map(Output::Approve)
             }
         },
         Command::Execute {
@@ -889,7 +1028,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             allow_degraded_destination,
         } => df_facade::execute_plan_with_options(
             path,
-            Actor::Cli,
+            actor,
             &df_facade::ExecuteOptions {
                 allow_degraded_destination: *allow_degraded_destination,
                 ..df_facade::ExecuteOptions::default()
@@ -897,11 +1036,17 @@ fn run(cli: &Cli) -> DfResult<Output> {
         )
         .map(Output::Execute),
         Command::Verify { path } => {
-            df_facade::verify_project_output(path, Actor::Cli).map(Output::Verify)
+            df_facade::verify_project_output(path, actor).map(Output::Verify)
         }
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)
+            }
+            ReportCommand::NameCollisions { path } => {
+                df_facade::name_collision_report(path).map(Output::NameCollisions)
+            }
+            ReportCommand::GraftedTrees { path } => {
+                df_facade::grafted_tree_report(path).map(Output::GraftedTrees)
             }
             ReportCommand::TreeClones { path } => {
                 df_facade::tree_clone_report(path).map(Output::TreeClones)
@@ -929,6 +1074,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             ReviewCommand::List { path } => {
                 df_facade::structural_review_queue(path).map(Output::Review)
             }
+            ReviewCommand::Classes { path } => {
+                df_facade::structural_review_classes(path).map(Output::ReviewClasses)
+            }
             ReviewCommand::Decide {
                 path,
                 item,
@@ -936,7 +1084,12 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 reason,
             } => {
                 let decision = df_facade::RuleAction::parse(decision)?;
-                df_facade::decide_structural_review(path, item, decision, reason, Actor::Cli)
+                df_facade::decide_structural_review(path, item, decision, reason, actor)
+                    .map(Output::Review)
+            }
+            ReviewCommand::DecideBatch { path, from } => {
+                let decisions = read_decision_batch(from)?;
+                df_facade::decide_structural_review_batch(path, &decisions, actor)
                     .map(Output::Review)
             }
         },
@@ -1016,7 +1169,7 @@ fn print_status(status: &ProjectStatus) {
         );
         if diagnostic.candidate_cap_reached {
             println!(
-                "Relation cap: REACHED — structural relations are conservative but not exhaustive"
+                "Relation cap: REACHED â€” structural relations are conservative but not exhaustive"
             );
         }
     }
@@ -1109,7 +1262,7 @@ fn print_similarity(outcome: &SimilarityOutcome) {
     println!(
         "Candidate cap    : {}",
         if outcome.candidate_cap_reached {
-            "REACHED — results are conservative but not exhaustive"
+            "REACHED â€” results are conservative but not exhaustive"
         } else {
             "not reached"
         }
@@ -1147,7 +1300,7 @@ fn print_content_extraction(outcome: &ContentExtractionOutcome) {
     }
     if outcome.counters.limited > 0 || outcome.counters.failed > 0 {
         println!(
-            "Result         : PARTIAL — inspect LIMITED/FAILED evidence; this command exits 3"
+            "Result         : PARTIAL â€” inspect LIMITED/FAILED evidence; this command exits 3"
         );
     }
 }
@@ -1179,7 +1332,7 @@ fn print_content_search(outcome: &ContentSearchOutcome) {
     println!("Hits           : {}", outcome.hits.len());
     for hit in &outcome.hits {
         println!();
-        println!("  {:.4} — {}", hit.score, hit.representative_path);
+        println!("  {:.4} â€” {}", hit.score, hit.representative_path);
         if let Some(virtual_path) = &hit.virtual_path {
             println!("    virtual : {virtual_path}");
         }
@@ -1236,6 +1389,63 @@ fn print_plan(outcome: &PlanOutcome) {
     println!("Next        : review it, then `dataforge plan approve`");
 }
 
+fn print_plan_tree(tree: &PlanDestinationTree) {
+    println!("Plan        : {} (v{})", tree.plan_id, tree.version);
+    println!("Output root : {}", tree.output_root);
+    println!(
+        "Would write : {} file(s), {} directory/ies, {}",
+        tree.files,
+        tree.directories,
+        human_bytes(tree.bytes)
+    );
+    if tree.without_destination > 0 {
+        println!(
+            "WARNING     : {} copy operation(s) have no destination recorded",
+            tree.without_destination
+        );
+    }
+    println!();
+    for node in &tree.nodes {
+        // Two spaces per level so the shape of the output is readable at a
+        // glance; the prefix itself stays absolute-relative for copy/paste.
+        let indent = "  ".repeat((node.depth - 1) as usize);
+        println!(
+            "{indent}{}\\   {} file(s), {}",
+            node.prefix,
+            node.files,
+            human_bytes(node.bytes)
+        );
+        if node.depth == 1 {
+            let breakdown: Vec<String> = node
+                .by_operation
+                .iter()
+                .map(|(op, n)| format!("{op}={n}"))
+                .collect();
+            if !breakdown.is_empty() {
+                println!("{indent}    {}", breakdown.join(", "));
+            }
+            if let Some(sample) = &node.sample {
+                println!("{indent}    e.g. {sample}");
+            }
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn print_plan_validation(report: &PlanValidationReport) {
     println!("Plan       : {} (v{})", report.plan_id, report.version);
     println!("Status     : {}", report.status);
@@ -1286,10 +1496,88 @@ fn print_verify(outcome: &VerifyOutcome) {
         println!("Findings     :");
         for finding in &outcome.findings {
             println!(
-                "  [{}] {} — {}: {}",
+                "  [{}] {} â€” {}: {}",
                 finding.severity, finding.kind, finding.subject, finding.detail
             );
         }
+    }
+}
+
+fn print_grafted_trees(report: &GraftedTreeReport) {
+    println!("Snapshot        : {}", report.snapshot_id);
+    println!("Graft prefixes  : {}", report.prefixes);
+    println!("Files grafted   : {}", report.files);
+    let share = |n: u64| {
+        if report.files == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / report.files as f64
+        }
+    };
+    println!(
+        "Places itself   : {} ({:.1}%)",
+        report.auto_placeable,
+        share(report.auto_placeable)
+    );
+    println!(
+        "Needs a human   : {} ({:.1}%)",
+        report.needs_review,
+        share(report.needs_review)
+    );
+    for graft in &report.grafts {
+        println!();
+        println!("  {}  ({} files)", graft.prefix, graft.files);
+        println!(
+            "    at canonical path, same content : {}",
+            graft.canonical_path_same_hash
+        );
+        println!(
+            "    content lives outside the graft : {}",
+            graft.hash_elsewhere_outside_prefix
+        );
+        println!(
+            "    only copy there is              : {}",
+            graft.unique_hash_not_elsewhere
+        );
+        println!(
+            "    canonical path holds something else: {}",
+            graft.canonical_path_hash_diff
+        );
+    }
+    if report.grafts.is_empty() {
+        println!();
+        println!("No folder in this snapshot carries a grafted prefix.");
+    }
+}
+
+fn print_name_collisions(report: &NameCollisionReport) {
+    println!("Snapshot          : {}", report.snapshot_id);
+    println!("Colliding names   : {}", report.colliding_names);
+    println!("Files involved    : {}", report.occurrences_involved);
+    println!(
+        "Worst name holds  : {} contents",
+        report.worst_name_contents
+    );
+    for collision in &report.collisions {
+        println!();
+        println!(
+            "  {} -> {} contents in {} folders ({} files)",
+            collision.normalized_name, collision.contents, collision.folders, collision.occurrences
+        );
+        for path in &collision.sample_paths {
+            println!("    {path}");
+        }
+    }
+    if report.collisions.is_empty() {
+        println!();
+        println!("No name in this snapshot stands for more than one content.");
+    } else {
+        println!();
+        // The point of the report: these are not duplicates to collapse.
+        println!(
+            "Evidence only. Each name above holds different content in \
+             different places, so merging by name would lose material."
+        );
     }
 }
 
@@ -1303,7 +1591,7 @@ fn print_duplicates(report: &DuplicateReport) {
         println!("  sha256 {} ({} bytes)", set.sha256, set.size_bytes);
         for path in &set.occurrences {
             // The representative is the best canonical location, not a
-            // verdict that the others are dispensable (RFC-0001 §15.5).
+            // verdict that the others are dispensable (RFC-0001 Â§15.5).
             let mark = if set.representative.as_deref() == Some(path.as_str()) {
                 "*"
             } else {
@@ -1325,10 +1613,25 @@ fn print_tree_relations(report: &TreeRelationReport) {
     println!("Partial clones  : {}", report.partial_clones);
     println!("Embedded trees  : {}", report.embedded);
     println!("Repeated parts  : {}", report.repeated_components);
+    if report.embedded_contained_folders > 0 {
+        // The size of the opportunity, which until now meant querying SQLite
+        // by hand. Stated as a lower bound because it is one, and because a
+        // saving that turns out smaller than promised is how a destination
+        // stops fitting. Still evidence: nothing consolidates on it today.
+        println!(
+            "Contained trees : {} folder(s) carry nothing of their own",
+            report.embedded_contained_folders
+        );
+        println!(
+            "                  {} distinct content(s), at least {} that already exist outside",
+            report.embedded_contained_files,
+            human_bytes(report.embedded_redundant_bytes)
+        );
+    }
     for relation in &report.relations {
         println!();
         println!(
-            "  {} — {:.0}% shared ({} file(s), {} bytes)",
+            "  {} â€” {:.0}% shared ({} file(s), {} bytes)",
             relation.relationship,
             relation.similarity * 100.0,
             relation.shared_files,
@@ -1356,7 +1659,7 @@ fn print_tree_relations(report: &TreeRelationReport) {
                 ),
                 _ => println!(
                     "    Only in A: {} file(s) | Only in B: {} file(s) \
-                 — dropping either side loses data (RFC-0001 §19.4)",
+                 â€” dropping either side loses data (RFC-0001 Â§19.4)",
                     relation.unique_a_files, relation.unique_b_files
                 ),
             }
@@ -1378,7 +1681,7 @@ fn print_tree_clones(report: &TreeCloneReport) {
     for set in &report.sets {
         println!();
         println!(
-            "  {} — {} file(s), {} bytes",
+            "  {} â€” {} file(s), {} bytes",
             set.relationship.as_str(),
             set.subtree_files,
             set.subtree_bytes
@@ -1405,7 +1708,7 @@ fn print_contexts(report: &ContextReport) {
     println!("Protected bounds : {}", report.protected_folders.len());
     for folder in &report.protected_folders {
         println!(
-            "  ! [{}] {} — {}",
+            "  ! [{}] {} â€” {}",
             folder.marker, folder.path, folder.reason
         );
     }
@@ -1420,7 +1723,7 @@ fn print_anomalies(report: &AnomalyReport) {
     for anomaly in &report.anomalies {
         println!();
         println!(
-            "  [{}] {} — {}",
+            "  [{}] {} â€” {}",
             anomaly.severity, anomaly.kind, anomaly.summary
         );
         println!("    id: {}", anomaly.id);
@@ -1447,7 +1750,7 @@ fn print_ai_assist(outcome: &AiAssistOutcome) {
     for field in &disclosure.fields {
         println!();
         println!(
-            "  [{}] {} — {} byte(s), {} redaction(s)",
+            "  [{}] {} â€” {} byte(s), {} redaction(s)",
             field.evidence_id, field.field_name, field.visible_bytes, field.redactions
         );
         println!("    {}", field.visible_text);
@@ -1457,7 +1760,7 @@ fn print_ai_assist(outcome: &AiAssistOutcome) {
     if !outcome.executed {
         println!();
         println!(
-            "Preview only — nothing was sent. To consent to exactly this \
+            "Preview only â€” nothing was sent. To consent to exactly this \
              disclosure, repeat with --accept-disclosure {}",
             disclosure.disclosure_sha256
         );
@@ -1487,7 +1790,7 @@ fn print_ai_audits(audits: &[AssistanceAuditView]) {
     }
     for audit in audits {
         println!(
-            "{} — {} {} / {} — {}{}",
+            "{} â€” {} {} / {} â€” {}{}",
             audit.created_at,
             audit.purpose,
             audit.provider,
@@ -1528,7 +1831,7 @@ fn print_plugin_runs(outcome: &PluginsOutcome) {
     println!("Snapshot         : {}", outcome.snapshot_id);
     for run in &outcome.runs {
         println!();
-        println!("  {} — {}", run.plugin, run.status);
+        println!("  {} â€” {}", run.plugin, run.status);
         println!("    run       : {}", run.run_id);
         println!(
             "    subjects  : {} total, {} analysed, {} failed{}",
@@ -1536,7 +1839,7 @@ fn print_plugin_runs(outcome: &PluginsOutcome) {
             run.subjects_analyzed,
             run.subjects_failed,
             if run.subject_cap_reached {
-                " (cap REACHED — not exhaustive)"
+                " (cap REACHED â€” not exhaustive)"
             } else {
                 ""
             }
@@ -1551,14 +1854,14 @@ fn print_plugin_findings(report: &PluginReport) {
     println!("Snapshot : {}", report.snapshot_id);
     for run in &report.runs {
         println!(
-            "  {} — {} finding(s) over {} subject(s)",
+            "  {} â€” {} finding(s) over {} subject(s)",
             run.plugin, run.findings_total, run.subjects_total
         );
     }
     for finding in &report.findings {
         println!();
         println!(
-            "  [{}] {} — {}",
+            "  [{}] {} â€” {}",
             finding.severity, finding.code, finding.plugin
         );
         println!("    subject : {}", finding.subject_id);
@@ -1586,7 +1889,7 @@ fn print_media(outcome: &MediaOutcome) {
     println!(
         "Pair cap         : {}",
         if outcome.pair_cap_reached {
-            "REACHED — results are conservative but not exhaustive"
+            "REACHED â€” results are conservative but not exhaustive"
         } else {
             "not reached"
         }
@@ -1601,12 +1904,12 @@ fn print_media_relations(report: &MediaReport) {
     println!("Relations      : {}", status.counters.relations_total);
     println!("Pairs compared : {}", status.counters.pairs_compared);
     if status.pair_cap_reached {
-        println!("Pair cap       : REACHED — the report is not exhaustive");
+        println!("Pair cap       : REACHED â€” the report is not exhaustive");
     }
     for relation in &status.relations {
         println!();
         println!(
-            "  {} — score {:.1}%",
+            "  {} â€” score {:.1}%",
             relation.relation,
             f64::from(relation.score_millionths) / 10_000.0
         );
@@ -1643,12 +1946,12 @@ fn print_similarities(report: &SimilarityReport) {
     println!("Relationships  : {}", status.counters.relations_total);
     println!("Candidates     : {}", status.counters.candidates_total);
     if status.candidate_cap_reached {
-        println!("Candidate cap  : REACHED — the report is not exhaustive");
+        println!("Candidate cap  : REACHED â€” the report is not exhaustive");
     }
     for relation in &status.relationships {
         println!();
         println!(
-            "  {} — {:.1}% exact shared-byte similarity",
+            "  {} â€” {:.1}% exact shared-byte similarity",
             relation.kind,
             relation.similarity * 100.0
         );
@@ -1672,6 +1975,52 @@ fn print_similarities(report: &SimilarityReport) {
     println!("Evidence only: no relation authorizes deletion or consolidation.");
 }
 
+fn print_review_classes(summary: &ReviewClassSummary) {
+    println!("Snapshot : {}", summary.snapshot_id);
+    println!("Items    : {}", summary.items);
+    println!("Pending  : {}", summary.pending);
+    println!("Decided  : {}", summary.decided);
+    if summary.classes.is_empty() {
+        println!("\nThe review queue is empty.");
+        return;
+    }
+    println!(
+        "\n{} class(es), largest pending first:",
+        summary.classes.len()
+    );
+    for class in &summary.classes {
+        println!();
+        println!("  [{}] {} ({})", class.risk, class.kind, class.source);
+        // Report whichever coverage the class actually has: tree-level
+        // findings name folders and no occurrence at all.
+        let coverage = if class.occurrences > 0 {
+            format!("{} occurrence(s)", class.occurrences)
+        } else if class.folders > 0 {
+            format!("{} folder(s)", class.folders)
+        } else {
+            "no recorded target".to_string()
+        };
+        println!(
+            "    pending    : {} of {} item(s), covering {coverage}",
+            class.pending, class.items
+        );
+        println!("    default    : {}", class.recommended_action);
+        if class.blocked {
+            println!(
+                "    BLOCKED    : unreadable source evidence; repair access and \
+                 rescan rather than deciding"
+            );
+        } else if let Some(sample) = &class.sample_item_id {
+            println!("    inspect    : {sample}");
+        }
+        println!("    reason     : {}", class.sample_reason);
+    }
+    println!(
+        "\nOne decision settles a whole class: `review decide-batch` takes the \
+         item ids as JSON."
+    );
+}
+
 fn print_review(queue: &ReviewQueue) {
     println!("Snapshot : {}", queue.snapshot_id);
     println!("Pending  : {}", queue.pending);
@@ -1679,7 +2028,7 @@ fn print_review(queue: &ReviewQueue) {
     for item in &queue.items {
         println!();
         println!(
-            "  [{}] {} {} — {}",
+            "  [{}] {} {} â€” {}",
             item.risk, item.status, item.kind, item.reason
         );
         println!("    id          : {}", item.id);
@@ -1738,11 +2087,14 @@ fn print_human(output: &Output) {
         Output::ContentSearch(outcome) => print_content_search(outcome),
         Output::ContentQuery(outcome) => print_content_query(outcome),
         Output::Plan(outcome) => print_plan(outcome),
+        Output::PlanTree(tree) => print_plan_tree(tree),
         Output::PlanValidation(report) => print_plan_validation(report),
         Output::Approve(outcome) => print_approve(outcome),
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
         Output::Duplicates(report) => print_duplicates(report),
+        Output::NameCollisions(report) => print_name_collisions(report),
+        Output::GraftedTrees(report) => print_grafted_trees(report),
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
@@ -1766,11 +2118,12 @@ fn print_human(output: &Output) {
         Output::AiAssist(outcome) => print_ai_assist(outcome),
         Output::AiAudits(audits) => print_ai_audits(audits),
         Output::Review(queue) => print_review(queue),
+        Output::ReviewClasses(summary) => print_review_classes(summary),
         Output::Audit(report) => print_audit(report),
     }
 }
 
-/// RFC-0001 §33 exit code for a *successful* command whose result still
+/// RFC-0001 Â§33 exit code for a *successful* command whose result still
 /// signals a problem (failed integrity, broken ledger, partial hash).
 fn verdict_exit_code(output: &Output) -> i32 {
     match output {
@@ -1861,6 +2214,15 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 0
             }
         }
+        // A tree with copies that have nowhere to land is a plan worth
+        // stopping over, not a report that quietly succeeds.
+        Output::PlanTree(tree) => {
+            if tree.without_destination > 0 {
+                3
+            } else {
+                0
+            }
+        }
         Output::PlanValidation(report) => {
             if report.ok {
                 0
@@ -1890,10 +2252,17 @@ fn verdict_exit_code(output: &Output) -> i32 {
         // Evidence reports always succeed: finding duplicates, clones or
         // partial clones is information, not a failure.
         Output::Duplicates(_) => 0,
+        Output::NameCollisions(_) => 0,
+        Output::GraftedTrees(_) => 0,
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,
-        Output::Anomalies(_) | Output::Similarities(_) | Output::Review(_) => 0,
+        // A queue with items pending is the normal state of an analysed
+        // archive, not a failure: it is evidence waiting for a decision.
+        Output::Anomalies(_)
+        | Output::Similarities(_)
+        | Output::Review(_)
+        | Output::ReviewClasses(_) => 0,
     }
 }
 
@@ -2168,7 +2537,7 @@ mod tests {
 
         // Write safety is Windows-only in this version: on POSIX, execution
         // must refuse explicitly (fail closed) with the approved plan and a
-        // valid ledger left intact — that refusal is the pinned behavior.
+        // valid ledger left intact â€” that refusal is the pinned behavior.
         // The Windows half continues through copy and verification.
         #[cfg(not(windows))]
         {

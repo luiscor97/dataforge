@@ -1,6 +1,6 @@
 {
   "schema": "dataforge.profile",
-  "schema_version": "1.1.0",
+  "schema_version": "2.0.0",
   "id": "legal",
   "name": "Jurídico",
   "description": "Perfil para despachos, asesorías y gestorías. Hereda los contenedores genéricos y declara las fronteras protegidas del dominio jurídico: un expediente, una pericial o un procedimiento son límites que la deduplicación no debe disolver, aunque dos de ellos contengan archivos byte a byte idénticos. Dos copias del mismo documento en expedientes distintos NO son redundancia: cada expediente debe poder sostenerse por sí mismo como unidad probatoria (RFC-0001 regla 9, §15.2, §15.3 ACROSS_PROTECTED_CONTEXTS). Los marcadores usan match \"prefix\" porque las carpetas reales se llaman \"Expediente 1234-2020\", no \"Expediente\" a secas; el prefijo exige separador o dígito detrás, de modo que \"expediente\" no engulle \"expedientes\".",
@@ -86,10 +86,37 @@
     {
       "id": "legal.correspondence-eml",
       "version": 1,
-      "match": { "file_name_glob": "*.eml" },
-      "classification": { "category": "correspondence", "confidence": 1.0 },
+      "match": {
+        "file_name_glob": "*.eml"
+      },
+      "classification": {
+        "category": "correspondence",
+        "confidence": 1.0
+      },
       "action": "COPY_ACTIVE",
       "risk": "LOW"
+    }
+  ],
+  "destination_roots": [
+    {
+      "id": "active",
+      "folder": null,
+      "set_aside": false
+    },
+    {
+      "id": "review",
+      "folder": "90_DataForge_Review",
+      "set_aside": false
+    },
+    {
+      "id": "separated",
+      "folder": "95_DataForge_Separated",
+      "set_aside": true
+    },
+    {
+      "id": "temporary",
+      "folder": "98_DataForge_Temporary",
+      "set_aside": true
     }
   ]
 }

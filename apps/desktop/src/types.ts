@@ -282,6 +282,24 @@ export interface ContentQueryOutcome {
   result: QueryResult;
 }
 
+/**
+ * The run holding this project, if one claimed it. Evidence only: there is no
+ * alive/dead field, because whether a run is alive is not something the
+ * database can know — a pid means nothing on another host, and a sleeping
+ * laptop has a stale heartbeat and a live run.
+ */
+export interface RunLiveness {
+  stage: string;
+  pid: number;
+  host: string;
+  started_at: string;
+  heartbeat_at: string;
+  heartbeat_age_seconds: number;
+  /** The claim belongs to the process asking: the one factual answer. */
+  is_this_process: boolean;
+  is_this_host: boolean;
+}
+
 export interface ProjectStatus {
   project_id: string;
   name: string;
@@ -302,6 +320,7 @@ export interface ProjectStatus {
   similarity: SimilarityStatus | null;
   media: MediaStatusReport | null;
   integrity: IntegrityReport | null;
+  active_run: RunLiveness | null;
 }
 
 // --- Reconstruction pipeline outcomes ------------------------------------
@@ -351,6 +370,37 @@ export interface PlanValidationReport {
   operations: number;
   ok: boolean;
   problems: string[];
+}
+
+/** One destination prefix of the projected output tree. */
+export interface PlanDestinationNode {
+  /** Path relative to the output root. */
+  prefix: string;
+  /** Path components in `prefix`; 1 for a top-level root. */
+  depth: number;
+  files: number;
+  directories: number;
+  bytes: number;
+  /** `[operation_type, count]`, most frequent first. */
+  by_operation: [string, number][];
+  sample: string | null;
+}
+
+/**
+ * What the plan would actually write. Approving freezes a manifest, so this
+ * is the last chance to see the shape of the result rather than infer it
+ * from operation counts.
+ */
+export interface PlanDestinationTree {
+  plan_id: string;
+  version: number;
+  output_root: string;
+  files: number;
+  directories: number;
+  bytes: number;
+  /** Copies with no recorded destination: reported, never hidden. */
+  without_destination: number;
+  nodes: PlanDestinationNode[];
 }
 
 export interface ApproveOutcome {

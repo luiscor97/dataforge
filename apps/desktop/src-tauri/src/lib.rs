@@ -8,9 +8,9 @@ use df_error::DfError;
 use df_facade::{
     AnalyzeOutcome, ApproveOutcome, ContentArtifactBuildOutcome, ContentExtractionOptions,
     ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest,
-    DestinationGuarantees, ExecuteOptions, ExecuteOutcome, HashOutcome, MediaOutcome, PlanOutcome,
-    PlanValidationReport, ProjectStatus, QueryOptions, ScanOutcome, SearchRequest,
-    SimilarityOutcome, SnapshotBuildOptions, VerifyOutcome,
+    DestinationGuarantees, ExecuteOptions, ExecuteOutcome, HashOutcome, MediaOutcome,
+    PlanDestinationTree, PlanOutcome, PlanValidationReport, ProjectStatus, QueryOptions,
+    ScanOutcome, SearchRequest, SimilarityOutcome, SnapshotBuildOptions, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -86,10 +86,38 @@ async fn scan_project(project_dir: String) -> Result<ScanOutcome, ErrorDto> {
 }
 
 /// Give every scanned file its content identity (BLAKE3 + SHA-256).
+///
+/// Resumes a project stranded in `HASHING` by a killed run, mirroring how the
+/// executor treats a stranded `EXECUTING`. The desktop shell owns the project
+/// it opened and ADR-0029 excludes concurrent writers, so here the state means
+/// "an earlier run died", not "a run is live" — the ambiguity that makes the
+/// CLI demand `--resume-interrupted` does not arise.
 #[tauri::command]
 async fn hash_project(project_dir: String) -> Result<HashOutcome, ErrorDto> {
     run_blocking_command(move || {
-        df_facade::hash_project(std::path::Path::new(&project_dir), Actor::Desktop)
+        df_facade::hash_project_with_options(
+            std::path::Path::new(&project_dir),
+            Actor::Desktop,
+            &df_facade::HashOptions {
+                resume_interrupted: true,
+                ..df_facade::HashOptions::default()
+            },
+        )
+    })
+    .await
+}
+
+/// The output tree the current plan would produce (read-only).
+///
+/// Approving freezes a manifest, so the shape of the result has to be
+/// visible *before* that, not inferred from operation counts.
+#[tauri::command]
+async fn plan_destination_tree(
+    project_dir: String,
+    depth: u32,
+) -> Result<PlanDestinationTree, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::plan_destination_tree(std::path::Path::new(&project_dir), depth)
     })
     .await
 }
@@ -294,6 +322,7 @@ pub fn run() {
             hash_project,
             analyze_project,
             create_plan,
+            plan_destination_tree,
             validate_plan,
             approve_plan,
             destination_guarantees,

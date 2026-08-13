@@ -35,8 +35,17 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+# The gate's own crate. Storing and reading a rule set is not gating anything —
+# nothing consults these at decision time yet — but the set has to be written
+# and verified through the crate that owns its digest, or a second
+# implementation of that digest appears here and can disagree.
+df-rules = { workspace = true }
 
 [dev-dependencies]
 df-db = { workspace = true, features = ["test-support"] }
+# Dev-only, and a cycle on purpose: `df-tools` is built on this facade, but its
+# tool names are a frozen contract and `frozen_contracts` is where those live.
+df-tools = { workspace = true }
+df-agent = { workspace = true }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "std", "zeroize"] }
 tempfile = { workspace = true }
