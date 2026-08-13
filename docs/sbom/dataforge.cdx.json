@@ -19,11 +19,11 @@
     "properties": [
       {
         "name": "dataforge:workspace-members",
-        "value": "dataforge-cli, dataforge-desktop, df-ai, df-corpus, df-db, df-domain, df-error, df-executor, df-extract, df-extract-worker, df-facade, df-fs-safety, df-hash, df-ledger, df-media, df-media-worker, df-planner, df-plugin, df-process-safety, df-query, df-query-worker, df-scan, df-search, df-similarity, df-verifier"
+        "value": "dataforge-cli, dataforge-desktop, df-agent, df-ai, df-corpus, df-db, df-domain, df-error, df-executor, df-extract, df-extract-worker, df-facade, df-fs-safety, df-hash, df-ledger, df-mcp, df-media, df-media-worker, df-planner, df-plugin, df-process-safety, df-query, df-query-worker, df-rules, df-scan, df-search, df-similarity, df-tools, df-verifier"
       },
       {
         "name": "dataforge:component-count",
-        "value": "786"
+        "value": "790"
       }
     ]
   },
@@ -3334,6 +3334,23 @@
     },
     {
       "type": "library",
+      "name": "df-agent",
+      "version": "1.0.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dataforge:origin",
+          "value": "workspace"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "df-ai",
       "version": "1.0.1",
       "scope": "required",
@@ -3548,6 +3565,23 @@
     },
     {
       "type": "library",
+      "name": "df-mcp",
+      "version": "1.0.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dataforge:origin",
+          "value": "workspace"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "df-media",
       "version": "1.0.1",
       "scope": "required",
@@ -3668,6 +3702,23 @@
     },
     {
       "type": "library",
+      "name": "df-rules",
+      "version": "1.0.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dataforge:origin",
+          "value": "workspace"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "df-scan",
       "version": "1.0.1",
       "scope": "required",
@@ -3707,6 +3758,23 @@
       "version": "1.0.1",
       "scope": "required",
       "description": "Bounded, streaming content-defined chunking and similarity evidence",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dataforge:origin",
+          "value": "workspace"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "df-tools",
+      "version": "1.0.1",
+      "scope": "required",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"

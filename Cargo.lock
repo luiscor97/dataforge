@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "df-agent"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "df-error",
  "serde",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "df-mcp"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "df-error",
  "df-tools",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "df-rules"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "df-domain",
  "df-error",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "df-tools"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "df-error",
  "df-facade",
