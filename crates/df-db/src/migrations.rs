@@ -135,6 +135,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "disclosure_policies",
         sql: include_str!("../migrations/0023_disclosure_policies.sql"),
     },
+    Migration {
+        version: 24,
+        name: "hash_exclusions",
+        sql: include_str!("../migrations/0024_hash_exclusions.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {

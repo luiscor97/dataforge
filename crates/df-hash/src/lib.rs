@@ -493,6 +493,81 @@ mod tests {
         assert_eq!(second.state, "HASHED");
     }
 
+    /// The shape the real archive asked for: a folder named by path, and
+    /// heavy media named by size.
+    #[test]
+    fn a_profile_can_decline_to_read_material_without_losing_it() {
+        use df_domain::{ExclusionMatch, HashExclusion};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom").join("HOME")).unwrap();
+        std::fs::create_dir_all(origin.join("asunto")).unwrap();
+        std::fs::write(origin.join("TomTom").join("HOME").join("mapa.dat"), b"gps").unwrap();
+        std::fs::write(origin.join("asunto").join("escrito.pdf"), b"documento").unwrap();
+        // Heavy enough to match the size rule below.
+        std::fs::write(origin.join("asunto").join("vista.mp4"), vec![0u8; 4096]).unwrap();
+
+        let mut db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let project = Project::new(
+            "Exclusiones",
+            ProfileRef::default(),
+            tmp.path().join("salida"),
+            tmp.path().join("auditoria"),
+            "test",
+        );
+        let roots = vec![SourceRoot::new(project.id, origin)];
+        repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+        scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+
+        let exclusions = vec![
+            HashExclusion {
+                id: "gps.tomtom".to_string(),
+                reason: "navigation data, not case material".to_string(),
+                r#match: ExclusionMatch {
+                    path_glob: Some("TomTom*".to_string()),
+                    ..ExclusionMatch::default()
+                },
+            },
+            HashExclusion {
+                id: "media.heavy".to_string(),
+                reason: "large video; identity would cost hours and settle nothing".to_string(),
+                r#match: ExclusionMatch {
+                    file_name_glob: Some("*.mp4".to_string()),
+                    min_size_bytes: Some(1024),
+                    ..ExclusionMatch::default()
+                },
+            },
+        ];
+        let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+            .unwrap()
+            .unwrap();
+        let outcome = df_db::inventory::enqueue_hash_jobs_with(
+            &mut db,
+            snapshot.id,
+            Actor::Test,
+            &exclusions,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.enqueued, 1, "only the legal document is read");
+        assert_eq!(outcome.excluded, 2);
+
+        // The whole point: excluded is not discarded. All three are still
+        // inventoried, so the snapshot keeps describing the origin.
+        let summary = df_db::inventory::inventory_summary(&db, snapshot.id).unwrap();
+        assert_eq!(summary.files, 3, "nothing left the inventory");
+
+        // And each exclusion carries the wording that caused it, so "why was
+        // this never read?" has an answer a year from now.
+        let recorded = df_db::inventory::hash_exclusions(&db, snapshot.id).unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().any(|e| e.rule_id == "gps.tomtom"
+            && e.reason.contains("navigation")
+            && e.relative_path.contains("mapa.dat")));
+        assert!(recorded.iter().any(|e| e.rule_id == "media.heavy"));
+    }
+
     #[test]
     fn known_test_vectors_for_both_algorithms() {
         let tmp = tempfile::tempdir().unwrap();

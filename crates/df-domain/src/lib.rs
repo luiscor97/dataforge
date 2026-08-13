@@ -64,8 +64,8 @@ pub use plan::{
 };
 pub use plugins::{PluginRun, PluginRunCounters, PluginRunStatus};
 pub use profile::{
-    DestinationRootDef, GenericMarker, Profile, ProtectedMarker, DEFAULT_PROFILE_ID,
-    PROFILE_SCHEMA, PROFILE_SCHEMA_VERSION, REQUIRED_DESTINATION_ROOTS,
+    DestinationRootDef, ExclusionMatch, GenericMarker, HashExclusion, Profile, ProtectedMarker,
+    DEFAULT_PROFILE_ID, PROFILE_SCHEMA, PROFILE_SCHEMA_VERSION, REQUIRED_DESTINATION_ROOTS,
 };
 pub use project::{ProfileRef, Project};
 pub use raw_path::RawPath;

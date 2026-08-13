@@ -21,6 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::glob_matches;
+
 use crate::{context::ContextKind, RuleDefinition};
 
 /// The declarative-profile schema identifier and version. Frozen for 1.0
@@ -161,6 +163,81 @@ pub struct Profile {
     /// ADR-0040 exists to remove. `generic` declares exactly the four the 1.x
     /// engine hardcoded, so its output is unchanged byte for byte.
     pub destination_roots: Vec<DestinationRootDef>,
+    /// Occurrences this profile declines to hash.
+    ///
+    /// Reading 443 GB of video to prove it is video costs hours and answers
+    /// nothing, so a profile may name material the identity pipeline should
+    /// skip. The file is still **inventoried**, and its exclusion is recorded
+    /// with the rule that caused it: RFC-0001's coverage criterion asks that
+    /// nothing be left without representation *or reason*, and this gives it a
+    /// reason. Excluded is not discarded, and the origin is untouched either
+    /// way.
+    #[serde(default)]
+    pub hash_exclusions: Vec<HashExclusion>,
+}
+
+/// One declared reason not to hash something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HashExclusion {
+    pub id: String,
+    /// Why, in the operator's words. Stored with every exclusion it causes,
+    /// because "this was not read" is only acceptable if it comes with why.
+    pub reason: String,
+    pub r#match: ExclusionMatch,
+}
+
+/// What an exclusion matches. Every field that is present must match.
+///
+/// At least one must be present. An exclusion with no criteria matches the
+/// entire archive, and a profile that silently declined to read anything is
+/// the worst failure this engine could have — so it is rejected at load
+/// rather than trusted to be intentional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionMatch {
+    /// Glob over the path relative to its source root, compared case
+    /// insensitively. This is what names a folder — the case `file_name_glob`
+    /// cannot express.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    #[serde(default)]
+    pub file_name_glob: Option<String>,
+    /// Size at or above which this matches. What makes "heavy media"
+    /// expressible without guessing from the extension.
+    #[serde(default)]
+    pub min_size_bytes: Option<u64>,
+}
+
+impl ExclusionMatch {
+    /// Whether this matcher names anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.path_glob.is_none() && self.file_name_glob.is_none() && self.min_size_bytes.is_none()
+    }
+
+    /// Whether an occurrence matches. Conjunctive: every declared criterion
+    /// has to hold, so adding one always narrows and never widens.
+    pub fn matches(&self, relative_path: &str, file_name: &str, size_bytes: u64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        if let Some(glob) = &self.path_glob {
+            if !glob_matches(&glob.to_lowercase(), &relative_path.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(glob) = &self.file_name_glob {
+            if !glob_matches(&glob.to_lowercase(), &file_name.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(minimum) = self.min_size_bytes {
+            if size_bytes < minimum {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Profile {
@@ -310,7 +387,49 @@ impl Profile {
             }
         }
         profile.validate_destination_roots()?;
+        profile.validate_hash_exclusions()?;
         Ok(profile)
+    }
+
+    /// Reject an exclusion that would decline to read the archive.
+    ///
+    /// Fail-closed, and this one is not a formality. A matcher with no
+    /// criteria matches everything, so a profile carrying one would inventory
+    /// a 443 GB archive, hash none of it, and produce a plan that looks
+    /// finished. That failure is silent by construction — there is no error to
+    /// notice — which is exactly why it has to be impossible to load rather
+    /// than merely unlikely to be written.
+    fn validate_hash_exclusions(&self) -> df_error::DfResult<()> {
+        let id = &self.id;
+        let mut ids = std::collections::HashSet::new();
+        for exclusion in &self.hash_exclusions {
+            if exclusion.id.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` has a hash exclusion with no id"
+                )));
+            }
+            if !ids.insert(exclusion.id.as_str()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares hash exclusion `{}` twice",
+                    exclusion.id
+                )));
+            }
+            if exclusion.reason.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` hash exclusion `{}` has no reason; material that \
+                     was never read must say why",
+                    exclusion.id
+                )));
+            }
+            if exclusion.r#match.is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` hash exclusion `{}` matches on nothing, which would \
+                     exclude the entire archive",
+                    exclusion.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Ids of every profile shipped with this build.
@@ -678,5 +797,78 @@ mod tests {
         assert!(profile_with_roots(full_set())
             .validate_destination_roots()
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+
+    fn profile_with(exclusions: Vec<HashExclusion>) -> Profile {
+        let mut profile = Profile::load("generic").expect("generic loads");
+        profile.hash_exclusions = exclusions;
+        profile
+    }
+
+    #[test]
+    fn an_exclusion_that_matches_nothing_in_particular_is_refused() {
+        // It would match every file, so a profile carrying one would inventory
+        // an archive, read none of it, and look finished. There is no error to
+        // notice at run time, which is why it must not be loadable.
+        let error = profile_with(vec![HashExclusion {
+            id: "everything".to_string(),
+            reason: "oops".to_string(),
+            r#match: ExclusionMatch::default(),
+        }])
+        .validate_hash_exclusions()
+        .expect_err("a matcher with no criteria is not a matcher");
+        assert!(error.to_string().contains("entire archive"));
+    }
+
+    #[test]
+    fn an_exclusion_without_a_reason_is_refused() {
+        let error = profile_with(vec![HashExclusion {
+            id: "silent".to_string(),
+            reason: "  ".to_string(),
+            r#match: ExclusionMatch {
+                file_name_glob: Some("*.mp4".to_string()),
+                ..ExclusionMatch::default()
+            },
+        }])
+        .validate_hash_exclusions()
+        .expect_err("material never read must say why");
+        assert!(error.to_string().contains("no reason"));
+    }
+
+    #[test]
+    fn every_declared_criterion_has_to_hold() {
+        // Conjunctive, so adding a criterion always narrows. If it widened,
+        // a rule meant for large videos would start taking small ones.
+        let matcher = ExclusionMatch {
+            file_name_glob: Some("*.mp4".to_string()),
+            min_size_bytes: Some(1000),
+            ..ExclusionMatch::default()
+        };
+        assert!(matcher.matches("a/b/vista.mp4", "vista.mp4", 2000));
+        assert!(
+            !matcher.matches("a/b/vista.mp4", "vista.mp4", 999),
+            "too small"
+        );
+        assert!(
+            !matcher.matches("a/b/nota.txt", "nota.txt", 2000),
+            "wrong name"
+        );
+        // Case-insensitive, because Windows paths are.
+        assert!(matcher.matches("A/B/VISTA.MP4", "VISTA.MP4", 2000));
+    }
+
+    #[test]
+    fn a_path_glob_names_a_folder_that_a_file_name_glob_cannot() {
+        let matcher = ExclusionMatch {
+            path_glob: Some("TomTom*".to_string()),
+            ..ExclusionMatch::default()
+        };
+        assert!(matcher.matches("TomTom/HOME/mapa.dat", "mapa.dat", 10));
+        assert!(!matcher.matches("asunto/escrito.pdf", "escrito.pdf", 10));
     }
 }
