@@ -467,9 +467,25 @@ total que la invocación **produciría**, no contra el ya gastado, así que la
 llamada que cruzaría la línea no la cruza; y `0` significa «no permitido», nunca
 «ilimitado» — un presupuesto que nadie fijó no puede ser un presupuesto sin fin.
 
-**Pendiente del hito:** persistir la política y su auditoría de consumo
-(migración 0022) y conectar `authorize` a la ruta de transporte de `df-ai`,
-que hoy sigue usando el token por petición de ADR-0034.
+**Persistencia hecha (2026-08-11), migración 0023.** Y la decisión que la
+vertebra es que **el consumo es una suma, no un total guardado**. No hay
+columna `spend_cents` que incrementar: lo gastado se suma sobre
+`disclosure_charges`. Un total guardado está a un `UPDATE` de ser un
+presupuesto que nunca se agota; un libro de cargos solo se rebobina borrando
+filas, y los triggers lo impiden. El número que protege al operador tiene que
+ser **reconstruible desde la evidencia**, no afirmado.
+
+Un cargo nombra el **digest** de la política, no su id y versión, así que
+renovar una política deja los cargos viejos apuntando a los términos que
+realmente se pactaron — y los términos nuevos empiezan sin gastar, que es el
+sentido de aprobarlos.
+
+`approved_by` se registra porque una política es un acto humano: el registro
+tiene que distinguir «una persona aceptó esto» de «un proceso escribió una
+fila».
+
+**Pendiente del hito:** conectar `authorize` a la ruta de transporte de
+`df-ai`, que hoy sigue usando el token por petición de ADR-0034.
 
 ### M2.6 — `df-agent`
 
