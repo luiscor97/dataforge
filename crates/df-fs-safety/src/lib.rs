@@ -746,6 +746,57 @@ pub fn classify_filesystem(path: &Path) -> df_domain::FileSystemKind {
     }
 }
 
+/// Bytes still writable at `path`, or `None` where this build cannot ask.
+///
+/// `None` means **unknown**, never "none left" and never "plenty". A caller
+/// that cannot measure must not refuse work on that basis: refusing a run
+/// because the platform has no answer would turn a missing feature into a
+/// broken product, and the engine already stops cleanly on a real ENOSPC.
+///
+/// Measured for the calling process, so a volume with a per-user quota
+/// reports what this user may write rather than what the disk holds — which
+/// is the number that decides whether a copy finishes.
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        windows_available_bytes(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_available_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // The path need not exist for the API, but its directory must resolve, so
+    // walk up to the first ancestor that is actually there. A destination root
+    // about to be created is the normal case here.
+    let existing = path.ancestors().find(|candidate| candidate.exists())?;
+    let mut wide: Vec<u16> = existing.as_os_str().encode_wide().collect();
+    if wide.last() != Some(&(b'\\' as u16)) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
+
+    let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer that outlives the
+    // call, and the out parameter is a stack u64 the API writes at most once.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
 #[cfg(windows)]
 fn classify_windows_volume(path: &Path) -> df_domain::FileSystemKind {
     use std::os::windows::ffi::OsStrExt;

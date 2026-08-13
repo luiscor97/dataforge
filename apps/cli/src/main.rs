@@ -19,8 +19,8 @@ use df_facade::{
     PlanDestinationTree, PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport,
     PluginsOutcome, ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary,
     ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions,
-    SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, TreeCloneReport, TreeRelationReport,
-    VerifyOutcome,
+    SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, SpacePreflight, TreeCloneReport,
+    TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -451,6 +451,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Whether the destination has room for what is left to copy.
+    SpacePreflight {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Grafted subtrees and how much of each places itself.
     GraftedTrees {
         /// Project directory.
@@ -683,6 +689,7 @@ enum Output {
     Duplicates(DuplicateReport),
     NameCollisions(NameCollisionReport),
     GraftedTrees(GraftedTreeReport),
+    SpacePreflight(SpacePreflight),
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
@@ -1044,6 +1051,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::NameCollisions { path } => {
                 df_facade::name_collision_report(path).map(Output::NameCollisions)
+            }
+            ReportCommand::SpacePreflight { path } => {
+                df_facade::plan_space_preflight(path).map(Output::SpacePreflight)
             }
             ReportCommand::GraftedTrees { path } => {
                 df_facade::grafted_tree_report(path).map(Output::GraftedTrees)
@@ -1500,6 +1510,23 @@ fn print_verify(outcome: &VerifyOutcome) {
                 finding.severity, finding.kind, finding.subject, finding.detail
             );
         }
+    }
+}
+
+fn print_space_preflight(report: &SpacePreflight) {
+    println!("Plan            : {}", report.plan_id);
+    println!("Destination     : {}", report.output_root);
+    println!("Still to write  : {} bytes", report.required_bytes);
+    match report.available_bytes {
+        Some(available) => println!("Room there      : {available} bytes"),
+        // Unknown is said plainly. Reporting it as a number would let a
+        // caller act on a measurement nobody took.
+        None => println!("Room there      : unknown on this platform"),
+    }
+    match report.sufficient {
+        Some(true) => println!("Verdict         : there is room"),
+        Some(false) => println!("Verdict         : NOT enough room for what is left"),
+        None => println!("Verdict         : not checkable here; the run stops cleanly if it fills"),
     }
 }
 
@@ -2095,6 +2122,7 @@ fn print_human(output: &Output) {
         Output::Duplicates(report) => print_duplicates(report),
         Output::NameCollisions(report) => print_name_collisions(report),
         Output::GraftedTrees(report) => print_grafted_trees(report),
+        Output::SpacePreflight(report) => print_space_preflight(report),
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
@@ -2254,6 +2282,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
         Output::Duplicates(_) => 0,
         Output::NameCollisions(_) => 0,
         Output::GraftedTrees(_) => 0,
+        Output::SpacePreflight(_) => 0,
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,
