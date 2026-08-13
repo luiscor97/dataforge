@@ -1097,6 +1097,28 @@ pub struct PlanProgress {
     pub blocked: u64,
 }
 
+/// Bytes the operations still to be attempted would write.
+///
+/// Counts what is left, not what the plan describes: resuming a half-finished
+/// execution must not demand room for the copies already on disk, or a run
+/// that only needs a few gigabytes would be refused for wanting hundreds.
+///
+/// Read from the **frozen manifest**, so it is the size that was approved
+/// rather than whatever the source measures now.
+pub fn pending_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
+    db.conn()
+        .query_row(
+            "SELECT COALESCE(SUM(m.expected_size_bytes), 0)
+             FROM execution_manifest m
+             JOIN plan_operations p ON p.id = m.operation_id
+             WHERE m.plan_id = ?1
+               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')",
+            params![plan_id.to_string()],
+            |row| row.get::<_, i64>(0).map(|bytes| bytes as u64),
+        )
+        .map_err(db_err)
+}
+
 pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
     let mut progress = PlanProgress::default();
     db.conn()

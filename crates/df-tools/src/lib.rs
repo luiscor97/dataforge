@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.5.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.6.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +208,11 @@ pub const TOOLS: &[Tool] = &[
         name: "plan_destination_tree",
         capability: Capability::Observe,
         summary: "Where the current plan would put the data, before approving it.",
+    },
+    Tool {
+        name: "plan_space_preflight",
+        capability: Capability::Observe,
+        summary: "Whether the destination has room for what is left to copy.",
     },
     Tool {
         name: "destination_guarantees",
@@ -680,6 +685,10 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
                 df_facade::plan_destination_tree(&input.project_dir, input.depth)?,
             )
         }
+        "plan_space_preflight" => {
+            let input: ProjectInput = parse(name, input)?;
+            encode(name, df_facade::plan_space_preflight(&input.project_dir)?)
+        }
         "destination_guarantees" => {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::destination_guarantees(&input.project_dir)?)
@@ -937,6 +946,7 @@ mod tests {
                 ("structural_review_queue", Capability::Observe),
                 ("structural_review_classes", Capability::Observe),
                 ("plan_destination_tree", Capability::Observe),
+                ("plan_space_preflight", Capability::Observe),
                 ("destination_guarantees", Capability::Observe),
                 ("verify_audit", Capability::Observe),
                 ("content_search", Capability::Observe),
@@ -956,7 +966,7 @@ mod tests {
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.5.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.6.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.

@@ -2344,6 +2344,51 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     })
 }
 
+/// Whether the destination has room for what is left to copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpacePreflight {
+    pub plan_id: String,
+    pub output_root: String,
+    /// Bytes the operations still to be attempted would write.
+    pub required_bytes: u64,
+    /// Bytes writable at the destination, or `None` where this build cannot
+    /// ask. `None` is **unknown**, never zero and never plenty.
+    pub available_bytes: Option<u64>,
+    /// True when there is measurably room; false when there measurably is not.
+    /// `None` when nothing could be measured, so a caller cannot mistake
+    /// "could not check" for "checked and fine".
+    pub sufficient: Option<bool>,
+}
+
+/// Check the destination has room before a long copy starts.
+///
+/// On a real archive a copy runs for hours, and finding out at hour six that
+/// the volume was always too small costs the whole run. The engine already
+/// stops cleanly on a real ENOSPC — this is about not starting.
+///
+/// It reports and refuses nothing by itself. Where free space cannot be
+/// measured the answer is `None`, and a caller must not read that as
+/// permission or as denial: turning "this platform has no answer" into a
+/// refusal would make a missing feature look like a full disk.
+pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+
+    let required_bytes = df_db::plans::pending_bytes(&db, plan.id)?;
+    let available_bytes = df_fs_safety::available_bytes(&project.output_root);
+    Ok(SpacePreflight {
+        plan_id: plan.id.to_string(),
+        output_root: project.output_root.display().to_string(),
+        required_bytes,
+        available_bytes,
+        sufficient: available_bytes.map(|available| available >= required_bytes),
+    })
+}
+
 /// What an exported delivery package contains.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryPackage {
@@ -3407,6 +3452,47 @@ mod tests {
     }
 
     #[test]
+    fn the_preflight_counts_what_is_left_and_never_guesses_what_it_cannot_measure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"doce bytes!!").unwrap();
+        std::fs::write(origin.join("dos.txt"), b"otros doce!!").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let before = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert!(before.required_bytes >= 24, "both files are still to copy");
+
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+
+        // The property that keeps a resume usable: what is already on disk is
+        // not demanded again. Without this, resuming a half-done 443 GB run
+        // would be refused for wanting room it no longer needs.
+        let after = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(
+            after.required_bytes, 0,
+            "nothing is left to copy, so nothing is required"
+        );
+
+        // `sufficient` is only ever an answer when something was measured.
+        match after.available_bytes {
+            Some(_) => assert_eq!(after.sufficient, Some(true)),
+            None => assert_eq!(
+                after.sufficient, None,
+                "unknown must not be reported as fine"
+            ),
+        }
+    }
+
+    #[test]
     fn a_delivery_package_covers_every_manifest_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
@@ -4185,9 +4271,9 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.5.0"
+            "dataforge.tool-surface/0.6.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 27, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 28, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling
