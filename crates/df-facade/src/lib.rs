@@ -2344,6 +2344,78 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     })
 }
 
+/// Store a rule set version in the project (ADR-0041).
+///
+/// Storing is not gating: nothing consults these at decision time yet. What it
+/// establishes is that a set has an identity — an id, a version and a digest
+/// over its exact bytes — before anything is allowed to cite one.
+///
+/// The digest is computed by `df-rules`, never here. Persistence keeps bytes;
+/// deciding what they mean belongs to the crate that owns the format, and a
+/// second implementation of the digest is a second thing that can disagree.
+pub fn save_rule_set(project_dir: &Path, set: &df_rules::RuleSet) -> DfResult<()> {
+    // Refuse a set whose digest no longer matches its params before it is
+    // written, so a set that drifted between being built and being stored
+    // never becomes the record other decisions cite.
+    set.verify()?;
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let params = df_ledger::canonical_json(
+        &serde_json::to_value(&set.params)
+            .map_err(|error| DfError::Serialization(format!("rule params: {error}")))?,
+    );
+    df_db::rules::save(
+        &db,
+        &df_db::rules::RuleSetRecord {
+            id: set.id.clone(),
+            version: set.version,
+            schema: df_rules::RULE_SET_SCHEMA_VERSION.to_string(),
+            params,
+            digest: set.digest.clone(),
+            created_at: String::new(),
+        },
+    )
+}
+
+/// Read a stored rule set back, refusing one whose bytes no longer match its
+/// digest.
+///
+/// Verified on read and not once at startup: a set that drifted between being
+/// loaded and being used is exactly the case a check at load time cannot see
+/// (ADR-0041, threat A4).
+pub fn rule_set(project_dir: &Path, id: &str, version: Option<u32>) -> DfResult<df_rules::RuleSet> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let record = match version {
+        Some(version) => df_db::rules::load(&db, id, version)?,
+        None => df_db::rules::latest(&db, id)?,
+    }
+    .ok_or_else(|| DfError::Validation(format!("no rule set `{id}` stored in this project")))?;
+
+    if record.schema != df_rules::RULE_SET_SCHEMA_VERSION {
+        return Err(DfError::Validation(format!(
+            "rule set `{}` version {} was written for schema {}, and this build speaks {}",
+            record.id,
+            record.version,
+            record.schema,
+            df_rules::RULE_SET_SCHEMA_VERSION
+        )));
+    }
+
+    let params: df_rules::RuleParams = serde_json::from_str(&record.params)
+        .map_err(|error| DfError::Serialization(format!("stored rule params: {error}")))?;
+    let set = df_rules::RuleSet {
+        id: record.id,
+        version: record.version,
+        params,
+        digest: record.digest,
+    };
+    set.verify()?;
+    Ok(set)
+}
+
 /// Absolute paths sampled per colliding name, one per distinct content.
 ///
 /// Enough to make a collision concrete in a report without turning the
@@ -3180,6 +3252,34 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_set_survives_a_round_trip_and_a_tampered_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let set = df_rules::RuleSet::new("legal", 1, df_rules::RuleParams::default())
+            .expect("a valid set");
+        save_rule_set(&req.project_dir, &set).expect("stored");
+
+        let read = rule_set(&req.project_dir, "legal", None).expect("read back");
+        assert_eq!(read.version, 1);
+        assert_eq!(read.digest, set.digest);
+        assert_eq!(read.params, set.params);
+
+        // A set whose digest no longer covers its params is refused on the way
+        // in. Storing it would make it the record other decisions cite, and a
+        // decision citing parameters nobody can reproduce is not auditable.
+        let mut tampered = set.clone();
+        tampered.params.auto_approve_confidence = 0.01;
+        save_rule_set(&req.project_dir, &tampered)
+            .expect_err("a digest that no longer matches is not storable");
+
+        // Version 1 still says what it said.
+        let again = rule_set(&req.project_dir, "legal", Some(1)).expect("still there");
+        assert_eq!(again.params, set.params);
+    }
+
+    #[test]
     fn scan_hash_analyze_and_reports_through_the_facade() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
@@ -3787,9 +3887,9 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 21, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 22, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[20].name, "run_liveness");
+        assert_eq!(df_db::migrations::MIGRATIONS[21].name, "rule_sets");
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");

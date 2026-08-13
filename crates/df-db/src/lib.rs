@@ -17,6 +17,7 @@ pub mod migrations;
 pub mod plans;
 pub mod plugins;
 pub mod repository;
+pub mod rules;
 pub mod similarity;
 pub mod structure;
 

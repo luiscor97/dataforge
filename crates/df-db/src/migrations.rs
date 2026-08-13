@@ -125,6 +125,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "run_liveness",
         sql: include_str!("../migrations/0021_run_liveness.sql"),
     },
+    Migration {
+        version: 22,
+        name: "rule_sets",
+        sql: include_str!("../migrations/0022_rule_sets.sql"),
+    },
 ];
 
 fn sql_checksum(sql: &str) -> String {
