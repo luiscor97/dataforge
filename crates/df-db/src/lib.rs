@@ -6,6 +6,7 @@
 
 pub mod analysis;
 pub mod assistance;
+pub mod consent;
 pub mod context;
 pub mod dedup;
 pub mod extraction;

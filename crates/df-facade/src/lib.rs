@@ -3887,9 +3887,12 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 22, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 23, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[21].name, "rule_sets");
+        assert_eq!(
+            df_db::migrations::MIGRATIONS[22].name,
+            "disclosure_policies"
+        );
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");
