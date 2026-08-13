@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.6.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.7.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +163,11 @@ pub const TOOLS: &[Tool] = &[
         name: "duplicate_report",
         capability: Capability::Observe,
         summary: "Exact-duplicate sets, their representatives and their weight.",
+    },
+    Tool {
+        name: "hash_exclusion_report",
+        capability: Capability::Observe,
+        summary: "What the profile declined to read, and why.",
     },
     Tool {
         name: "name_collision_report",
@@ -542,6 +547,7 @@ fn window_field(name: &str, value: &mut Value, field: &str, window: Window) -> D
 pub fn report_collections(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
         "duplicate_report" | "tree_clone_report" => &["sets"],
+        "hash_exclusion_report" => &["exclusions"],
         "name_collision_report" => &["collisions"],
         "grafted_tree_report" => &["grafts"],
         "tree_relation_report" => &["relations"],
@@ -612,6 +618,14 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             encode_report(
                 name,
                 df_facade::duplicate_report(&input.project_dir)?,
+                input.window(),
+            )
+        }
+        "hash_exclusion_report" => {
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::hash_exclusion_report(&input.project_dir)?,
                 input.window(),
             )
         }
@@ -937,6 +951,7 @@ mod tests {
             vec![
                 ("project_status", Capability::Observe),
                 ("duplicate_report", Capability::Observe),
+                ("hash_exclusion_report", Capability::Observe),
                 ("name_collision_report", Capability::Observe),
                 ("grafted_tree_report", Capability::Observe),
                 ("tree_clone_report", Capability::Observe),
@@ -966,7 +981,7 @@ mod tests {
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.6.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.7.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.
