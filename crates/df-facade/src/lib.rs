@@ -2482,6 +2482,37 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         ));
     }
 
+    // What the profile declined to read belongs in a document that claims
+    // nothing was lost. An exclusion is a legitimate decision; leaving it out
+    // of the delivery would make the claim broader than the evidence, which is
+    // the one thing this package must not do.
+    let skipped = match df_db::inventory::latest_complete_snapshot(&db, project.id)? {
+        Some(snapshot) => df_db::inventory::hash_exclusions(&db, snapshot.id)?,
+        None => Vec::new(),
+    };
+    let not_read = if skipped.is_empty() {
+        "Everything in the origin was read and identified by hash.".to_string()
+    } else {
+        let mut counts: std::collections::BTreeMap<&str, (u64, &str)> =
+            std::collections::BTreeMap::new();
+        for exclusion in &skipped {
+            let entry = counts
+                .entry(exclusion.rule_id.as_str())
+                .or_insert((0, exclusion.reason.as_str()));
+            entry.0 += 1;
+        }
+        let mut lines = format!(
+            "**{} files were deliberately not read** and carry no hash here. They \
+             remain in the origin, untouched, and stay listed in the project's \
+             inventory:\n",
+            skipped.len()
+        );
+        for (rule, (count, reason)) in counts {
+            lines.push_str(&format!("\n- `{rule}` — {count} files: {reason}"));
+        }
+        lines
+    };
+
     // Deliberately not asserting a verification verdict. Nothing in `df-db`
     // reads verification runs back yet, and a document whose entire purpose is
     // to be trusted must not carry a claim its author could not check. It
@@ -2494,6 +2525,8 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
          - Of those, carrying a SHA-256 anyone can check: **{}**\n\
          - Without a recorded destination: **{}**\n\
          - Bytes described: **{}**\n\n\
+         ## What was not read\n\n\
+         {}\n\n\
          Independent verification is a separate step (`verify`), and its \
          verdict is recorded in the project's chained ledger rather than \
          asserted here.\n\n\
@@ -2513,6 +2546,7 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         checksummed,
         without_destination,
         bytes,
+        not_read,
     );
 
     write_delivery_file(&directory, "traceability.csv", &csv)?;
@@ -2628,6 +2662,45 @@ const NAME_COLLISION_SAMPLES: usize = 4;
 /// The evidence behind a rule the engine already follows and could not
 /// previously show: a name is not an identity. Report only — it proposes
 /// nothing (RFC-0001 §15.2).
+/// What the profile declined to read, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct HashExclusionReport {
+    pub snapshot_id: String,
+    pub excluded: u64,
+    /// `[rule_id, count]`, most excluded first.
+    pub by_rule: Vec<(String, u64)>,
+    pub exclusions: Vec<df_db::inventory::HashExclusionView>,
+}
+
+/// Report the occurrences this project's profile declined to hash.
+///
+/// The answer to "was anything skipped?", which an operator is entitled to ask
+/// before trusting a delivery and which the inventory alone cannot give. An
+/// exclusion is a legitimate decision; an *undisclosed* one is not.
+pub fn hash_exclusion_report(project_dir: &Path) -> DfResult<HashExclusionReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let exclusions = df_db::inventory::hash_exclusions(&db, snapshot.id)?;
+
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for exclusion in &exclusions {
+        *counts.entry(exclusion.rule_id.clone()).or_default() += 1;
+    }
+    let mut by_rule: Vec<(String, u64)> = counts.into_iter().collect();
+    by_rule.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(HashExclusionReport {
+        snapshot_id: snapshot.id.to_string(),
+        excluded: exclusions.len() as u64,
+        by_rule,
+        exclusions,
+    })
+}
+
 pub fn name_collision_report(
     project_dir: &Path,
 ) -> DfResult<df_db::inventory::NameCollisionReport> {
@@ -3540,8 +3613,73 @@ mod tests {
 
         let summary = std::fs::read_to_string(directory.join("delivery.md")).expect("summary");
         assert!(summary.contains("The origin was never written to"));
+        // Nothing was excluded here, and the package says so rather than
+        // leaving the reader to assume it.
+        assert!(summary.contains("Everything in the origin was read"));
         // No verdict is claimed, because none can be read back yet.
         assert!(!summary.contains("COMPLETED"));
+    }
+
+    #[test]
+    fn a_delivery_discloses_what_was_never_read() {
+        // The property that keeps "nothing was lost" honest. Excluding is a
+        // legitimate decision; an undisclosed exclusion makes the claim
+        // broader than the evidence, which is the one thing this document
+        // must never do.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom")).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"material").unwrap();
+        std::fs::write(origin.join("TomTom").join("mapa.dat"), b"gps").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+
+        // Exclude by path, then hash: the GPS folder is never read.
+        {
+            let marker = read_marker(&req.project_dir).unwrap();
+            let mut db = open_db(&req.project_dir, &marker).unwrap();
+            let project = repository::load_project(&db).unwrap();
+            let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+                .unwrap()
+                .unwrap();
+            df_db::inventory::enqueue_hash_jobs_with(
+                &mut db,
+                snapshot.id,
+                Actor::Test,
+                &[df_domain::HashExclusion {
+                    id: "gps.tomtom".to_string(),
+                    reason: "navigation data, not case material".to_string(),
+                    r#match: df_domain::ExclusionMatch {
+                        path_glob: Some("TomTom*".to_string()),
+                        ..df_domain::ExclusionMatch::default()
+                    },
+                }],
+            )
+            .unwrap();
+        }
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let report = hash_exclusion_report(&req.project_dir).expect("exclusions");
+        assert_eq!(report.excluded, 1);
+        assert_eq!(report.by_rule, vec![("gps.tomtom".to_string(), 1)]);
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&package.directory).join("delivery.md"))
+                .expect("summary");
+        assert!(
+            summary.contains("deliberately not read"),
+            "the delivery must disclose the skip: {summary}"
+        );
+        // With the rule's own words, so the reader can judge the decision
+        // rather than only learn that one was taken.
+        assert!(summary.contains("navigation data, not case material"));
     }
 
     /// Count CSV fields honouring quoting.
@@ -4268,9 +4406,9 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.6.0"
+            "dataforge.tool-surface/0.7.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 28, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 29, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling
