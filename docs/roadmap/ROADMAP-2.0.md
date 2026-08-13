@@ -409,9 +409,31 @@ El digest se **reverifica en cada llamada**, no una vez al cargar: un conjunto
 que derivó entre leerse y usarse es exactamente el caso que una comprobación al
 cargar no ve (amenaza A4).
 
-**Pendiente del hito:** la tabla `rule_sets` persistida (migración 0021) y
-conectar los pesos afinables al `location_cost` que hoy usa constantes en
-`df-db`. La clasificación de estado de injerto (ADR-0041 §3) espera a que se
+**Persistencia hecha (2026-08-11).** `rule_sets` en la migración **0022** —la
+0021 se la llevó la vitalidad—, y es **append-only** a propósito: cada decisión
+del gate nombra el conjunto que la produjo, así que editar una versión
+reescribiría lo que significó una decisión ya auditada. Guardar la misma
+versión con parámetros distintos da `Conflict`; con los mismos bytes es
+idempotente, porque dos procesos coincidiendo no son un conflicto.
+
+`df-db` guarda **JSON canónico opaco**: no parsea, no sabe qué es un peso y no
+puede recalcular un digest. Una segunda implementación del digest ahí sería una
+segunda cosa capaz de discrepar. La fachada verifica a través de `df-rules` al
+escribir y **en cada lectura** — no una vez al cargar, porque un conjunto que
+deriva entre leerse y usarse es justo lo que un chequeo al arranque no ve
+(amenaza A4).
+
+Eso promueve `df-rules` a dependencia real de la fachada. Guardar un conjunto
+**no es gatear**: nada lo consulta al decidir, y la clase `commit` sigue
+cerrada.
+
+**Pendiente, y no es cableado:** conectar los pesos afinables al
+`location_cost`. Al ir a hacerlo resulta que **no son la misma fórmula** —
+`location_cost` usa penalización, marcador de copia y profundidad;
+`RepresentativeWeights` usa profundidad, longitud de ruta y mtime más antiguo.
+Alinearlas es una decisión de diseño sobre qué mide realmente el coste de una
+ubicación, no un empalme de constantes, y forzarla habría metido dos fórmulas
+distintas bajo un mismo nombre. La clasificación de estado de injerto (ADR-0041 §3) espera a que se
 resuelva la precedencia de ADR-0045: sin eso, sus veredictos serían correctos e
 inalcanzables, igual que le pasa hoy a `ContainedTreeReplica`.
 
