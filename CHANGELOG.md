@@ -5,8 +5,67 @@ Versionado: [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
-Endurecimiento del asistente guiado y del motor antes de la primera prueba
-en entorno real. Nada de esto cambia las garantías de reconstrucción.
+_Nada pendiente; el trabajo post-1.0.1 se anotará aquí._
+
+## [1.0.1] — 2026-08-09
+
+Primera versión publicable. La 1.0.0 llegó a estar taggeada y con release en
+borrador, pero **nunca se publicó**, y en los quince días siguientes entraron
+en `main` un aviso de seguridad, un fallo real del motor y toda la interfaz
+que hace la herramienta usable sin conocer el pipeline. Publicar aquel
+borrador habría entregado software peor que el que ya existía, así que la
+1.0.0 queda como un tag histórico sin release y **la 1.0.1 es la primera
+versión que se publica**.
+
+Ninguna garantía de reconstrucción cambia respecto a la 1.0.0.
+
+#### Seguridad
+
+- **wasmtime 36.0.12 → 36.0.13**, que cierra
+  [RUSTSEC-2026-0222](https://rustsec.org/advisories/RUSTSEC-2026-0222)
+  (CVSS 3.8, bajo): stores que podían confundir índices de tipo entre
+  engines. Alcanzable solo por `df-plugin`. Se mantiene la línea LTS 36, que
+  es la restricción que el pin ya llevaba; el lock mueve 62 líneas, todas
+  versiones de las familias `wasmtime` y `wasmparser`, sin añadir ni quitar
+  paquetes.
+
+#### Corregido
+
+- **Validar una raíz de origen ya no la crea.** La ruta de extracción
+  llamaba a `validate`, que hace `create_dir_all`, sobre una raíz de
+  *origen*: apuntar a una carpeta que no existía la creaba, escribiendo
+  dentro del territorio que la regla 1 declara intocable. `validate_existing`
+  no crea nada.
+- **Un destino lleno detiene la ejecución** en vez de intentar todas las
+  operaciones restantes. Lo pendiente queda `PENDING`, la que topó queda
+  `FAILED_RETRYABLE`, y el proyecto pausa: el estado del que parte reanudar
+  tras liberar espacio.
+- **Soltar una carpeta cae donde apuntas**, no en el campo que tuviera el
+  foco.
+- El asistente ya no continúa un proyecto que describe otras carpetas.
+
+#### Añadido
+
+- **Asistente guiado**: tres decisiones en lugar de siete comandos. Elegir
+  las dos carpetas, mirar lo encontrado y decir que sí, recoger el resultado
+  verificado. Reanuda un trabajo interrumpido en lugar de negarse, pregunta
+  por un destino sin identidad física *antes* de copiar (ADR-0036), y no
+  enseña ningún número que no haya obtenido del motor en esa ejecución.
+- **La pantalla avanzada ejecuta el pipeline**: ofrece el único stage que el
+  motor aceptaría, derivado de la misma tabla con la que el asistente
+  reanuda.
+- `ExecuteOutcome.out_of_space`; comandos de escritorio `validate_plan` y
+  `destination_guarantees`.
+- Manual de usuario con sección de escritorio y
+  `docs/release/field-test-readiness.md`: qué está probado, qué no, y qué
+  recoger si algo falla.
+
+#### Calidad
+
+- `DF_REQUIRE_HARDENING=1` convierte en fallo cualquier test de
+  endurecimiento que no pueda ejecutarse. Trece imprimían `SKIP` y pasaban,
+  así que el job de CI de Windows podía dar verde sin haber probado nada de
+  lo que promete. CI lo fija.
 
 #### Añadido
 
