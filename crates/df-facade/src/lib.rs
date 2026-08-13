@@ -2344,6 +2344,161 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     })
 }
 
+/// What an exported delivery package contains.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryPackage {
+    pub plan_id: String,
+    /// Directory the files were written to, under the audit root.
+    pub directory: String,
+    /// Rows in the traceability map: one per manifest entry, always.
+    pub entries: u64,
+    /// Entries carrying an expected SHA-256, and therefore checkable.
+    pub checksummed: u64,
+    /// Entries with no destination recorded. Reported, never dropped.
+    pub without_destination: u64,
+    pub bytes: u64,
+}
+
+/// Export the evidence that nothing was lost.
+///
+/// The original this engine was built against was not accepted on a metric.
+/// It was accepted, in the client's words, when the adviser had no doubt that
+/// material could have gone missing — and what removed the doubt was a
+/// traceability map, a checksum manifest and a plain statement of guarantees
+/// they could check themselves. The engine already held every one of those
+/// facts and had no way to hand them over.
+///
+/// Three files, all derived from the **frozen manifest** rather than from a
+/// walk of the output, so the package describes what was approved and not
+/// merely what happens to be on disk:
+///
+/// - `traceability.csv` — origin → destination, one row per manifest entry.
+/// - `SHA256SUMS` — in `sha256sum -c` format, so it is checkable with a tool
+///   the recipient already trusts rather than only with this one.
+/// - `delivery.md` — the guarantees, in prose, with the counts behind them.
+///
+/// # Why it lands in the audit root and not in the output
+///
+/// The delivered folder is described by a manifest that was frozen before
+/// anything was copied, and the verifier re-reads the output against exactly
+/// that. Writing three files into it would add files the manifest never
+/// described and the verifier never expected. So the package is produced
+/// beside the output, and copying it in afterwards is the operator's call,
+/// taken knowingly.
+pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let entries = df_db::plans::manifest(&db, plan.id)?;
+    if entries.is_empty() {
+        return Err(DfError::Validation(
+            "the plan has no frozen manifest; approve it before exporting a delivery package"
+                .to_string(),
+        ));
+    }
+
+    let directory = project.audit_root.join("delivery");
+    std::fs::create_dir_all(&directory).map_err(|error| DfError::io(&directory, error))?;
+
+    let mut csv = String::from(
+        "source_root,source_relative_path,destination_relative_path,operation,sha256,bytes\n",
+    );
+    let mut sums = String::new();
+    let mut checksummed = 0u64;
+    let mut without_destination = 0u64;
+    let mut bytes = 0u64;
+
+    for entry in &entries {
+        let destination = entry.destination_relative_path.clone().unwrap_or_default();
+        if entry.destination_relative_path.is_none() {
+            without_destination += 1;
+        }
+        bytes += entry.expected_size_bytes.unwrap_or(0);
+        let sha = entry.expected_sha256.clone().unwrap_or_default();
+        if let (Some(sha), Some(destination)) = (
+            entry.expected_sha256.as_deref(),
+            entry.destination_relative_path.as_deref(),
+        ) {
+            checksummed += 1;
+            // The two-space form `sha256sum -c` expects for a binary file.
+            sums.push_str(&format!("{sha}  {destination}\n"));
+        }
+        csv.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            csv_field(entry.source_root_path_snapshot.as_deref().unwrap_or("")),
+            csv_field(entry.source_relative_path_exact.as_deref().unwrap_or("")),
+            csv_field(&destination),
+            entry.operation_type.as_str(),
+            sha,
+            entry.expected_size_bytes.unwrap_or(0),
+        ));
+    }
+
+    // Deliberately not asserting a verification verdict. Nothing in `df-db`
+    // reads verification runs back yet, and a document whose entire purpose is
+    // to be trusted must not carry a claim its author could not check. It
+    // points at where the answer actually lives instead.
+    let summary = format!(
+        "# Delivery package\n\n\
+         Plan `{}`, version {}.\n\n\
+         ## What this says\n\n\
+         - Entries in the frozen manifest: **{}**\n\
+         - Of those, carrying a SHA-256 anyone can check: **{}**\n\
+         - Without a recorded destination: **{}**\n\
+         - Bytes described: **{}**\n\n\
+         Independent verification is a separate step (`verify`), and its \
+         verdict is recorded in the project's chained ledger rather than \
+         asserted here.\n\n\
+         ## Guarantees\n\n\
+         The origin was never written to: no code in this engine renames, \
+         deletes or modifies anything inside a source root. Nothing was \
+         overwritten in the destination. Every row of `traceability.csv` names \
+         where a file came from and where it went, and `SHA256SUMS` can be \
+         checked with `sha256sum -c` against the delivered folder — with a \
+         tool of your choosing, not only with this one.\n\n\
+         This package is derived from the manifest frozen at approval, not \
+         from a walk of the delivered folder, so it describes what was agreed \
+         rather than what happens to be present.\n",
+        plan.id,
+        plan.version,
+        entries.len(),
+        checksummed,
+        without_destination,
+        bytes,
+    );
+
+    write_delivery_file(&directory, "traceability.csv", &csv)?;
+    write_delivery_file(&directory, "SHA256SUMS", &sums)?;
+    write_delivery_file(&directory, "delivery.md", &summary)?;
+
+    Ok(DeliveryPackage {
+        plan_id: plan.id.to_string(),
+        directory: directory.display().to_string(),
+        entries: entries.len() as u64,
+        checksummed,
+        without_destination,
+        bytes,
+    })
+}
+
+fn write_delivery_file(directory: &Path, name: &str, contents: &str) -> DfResult<()> {
+    let path = directory.join(name);
+    std::fs::write(&path, contents).map_err(|error| DfError::io(&path, error))
+}
+
+/// Quote a CSV field so a path containing a comma or a quote cannot shift the
+/// columns. A traceability map whose rows can be misread is worse than none.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 /// Store a rule set version in the project (ADR-0041).
 ///
 /// Storing is not gating: nothing consults these at decision time yet. What it
@@ -3249,6 +3404,72 @@ mod tests {
             matches!(&error, DfError::Validation(message) if message.contains("legla")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn a_delivery_package_covers_every_manifest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("dos, con coma.txt"), b"contenido dos").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+
+        let directory = std::path::Path::new(&package.directory);
+        let csv = std::fs::read_to_string(directory.join("traceability.csv")).expect("csv");
+        // Header plus one row per entry, always. A package that quietly
+        // omitted rows would defeat the only thing it exists to show.
+        assert_eq!(
+            csv.lines().count() as u64,
+            package.entries + 1,
+            "every manifest entry has a row"
+        );
+        // A path with a comma must not shift the columns; every row has the
+        // same field count as the header.
+        let columns = csv.lines().next().expect("header").split(',').count();
+        for line in csv.lines().skip(1) {
+            assert_eq!(
+                csv_columns(line),
+                columns,
+                "a quoted path changed the column count: {line}"
+            );
+        }
+
+        let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).expect("sums");
+        assert_eq!(sums.lines().count() as u64, package.checksummed);
+        // `sha256sum -c` format: 64 hex chars, two spaces, then the path.
+        for line in sums.lines() {
+            assert!(line.len() > 66 && &line[64..66] == "  ", "bad line: {line}");
+        }
+
+        let summary = std::fs::read_to_string(directory.join("delivery.md")).expect("summary");
+        assert!(summary.contains("The origin was never written to"));
+        // No verdict is claimed, because none can be read back yet.
+        assert!(!summary.contains("COMPLETED"));
+    }
+
+    /// Count CSV fields honouring quoting.
+    fn csv_columns(line: &str) -> usize {
+        let mut fields = 1;
+        let mut quoted = false;
+        for character in line.chars() {
+            match character {
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields += 1,
+                _ => {}
+            }
+        }
+        fields
     }
 
     #[test]
