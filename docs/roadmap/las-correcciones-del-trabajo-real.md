@@ -160,6 +160,63 @@ Las dos últimas filas son errores de concepto, no de implementación:
   música, películas, vídeo personal. Para el motor es *esto es una caché de
   miniaturas*. Comparten nombre y no comparten concepto.
 
+## Cuánta de la cola es ambigüedad real (medido, 2026-08-15)
+
+Antes de construir M2.7 conviene saber cuánto arregla. La pregunta se puede
+contestar hoy, sin escribir motor: para cada anomalía que nombra dos carpetas,
+comparar el **conjunto de contenidos** de los dos subárboles. El motor ya tiene
+la identidad SHA-256 de los 158.219 archivos; «¿es B una copia de A?» no es una
+duda, es una comparación de conjuntos que nadie hace.
+
+Sobre las 4.604 preguntas de carpeta del corpus real:
+
+| Veredicto | Casos | |
+| --- | ---: | ---: |
+| B contenido en A | 2.155 | 46,8% |
+| A contenido en B | 1.547 | 33,6% |
+| Parcial, único en ambos | 902 | 19,6% |
+
+**El tipo de anomalía predice el veredicto con exactitud perfecta.** Los 3.702
+`EMBEDDED_TREE` son contención estricta, los 3.702, sin una excepción. Los 902
+`PARTIAL_TREE_UNIQUE_CONTENT` son parciales, los 902. Ninguna de las 4.604 cae
+fuera de lo que su etiqueta ya anunciaba.
+
+Y los «parciales» casi no lo son. Contenidos únicos en el lado más contenido:
+
+| Únicos | Casos | |
+| --- | ---: | ---: |
+| 1 archivo | 426 | 47,2% |
+| 2–5 | 313 | 34,7% |
+| 6–20 | 94 | 10,4% |
+| 21–100 | 54 | 6,0% |
+| más de 100 | 15 | 1,7% |
+
+Casi la mitad se separan de la contención total **por un solo archivo**.
+`PARTIAL_TREE_UNIQUE_CONTENT` no es un juicio: es una etiqueta al filo, que un
+archivo despistado hace saltar.
+
+De donde sale el tamaño de M2.7:
+
+| Cola de revisión | Ítems |
+| --- | ---: |
+| Preguntas de carpeta | 4.604 |
+| − contención estricta, resoluble midiendo | −3.702 |
+| − difieren en ≤5 archivos, resoluble con tolerancia y lista de excepciones | −739 |
+| **Ambigüedad real** | **163** |
+| − `EXTREME_PATH`, que no debería ser pregunta | −724 |
+| Regla de extensión de backup | 6 |
+| **Cola resultante** | **169** |
+
+**El trabajo humano terminó con 175 ítems para revisión.** Este cálculo llega a
+169 por un camino que no comparte nada con aquél: comparación de conjuntos de
+hashes, sin criterio jurídico y sin diez días de correcciones. Dos métodos
+independientes coinciden en que **la ambigüedad real de este archivo son unos
+170 casos**. Los otros 5.165 ítems de la cola de la 1.0 son trabajo que el
+motor ya había hecho y se negaba a usar.
+
+Eso también fija el umbral de M2.7: no «reducir la cola», sino **dejarla en el
+orden de 170**, que es donde la dejó una persona.
+
 ## Dónde entra en la 2.0
 
 **M2.3 — Clasificación** ya demuestra que sin contexto no hay deduplicación.
@@ -188,11 +245,38 @@ Nada de esto relaja una garantía: el origen sigue sin tocarse, no se
 sobrescribe nada, todo pasa por plan, manifiesto y verificación. Lo que cambia
 es qué puede *expresar* un plan.
 
+## Cabos sueltos de la prueba de campo
+
+Medidos o vistos durante la ejecución del 14–15 de agosto y sin sitio propio
+todavía. Se anotan aquí para que no vivan solo en una conversación.
+
+- **El cuello del disco era la fragmentación del origen, no su ancho de banda.**
+  Mismo volumen, tres etapas: hash 20,9 MB/s leyendo el archivo original,
+  execute 19,7 MB/s leyendo y escribiendo a la vez, **verify 53,4 MB/s**
+  releyendo el árbol que el ejecutor acababa de escribir de una sentada. La
+  salida quedó contigua; el origen son diez años de fragmentación. El aviso de
+  `device_preflight` sobre origen y destino en el mismo disco es correcto en
+  dirección y exagerado en magnitud: costó un 6%, no la mitad. Merece una
+  matización en el texto, con más medidas antes de tocarlo.
+- **Un plan descartado deja sus operaciones `PENDING` para siempre.** El
+  ejecutor filtra por `plan_id`, así que es inofensivo, pero cualquier conteo
+  global de `plan_operations` las suma. En el corpus real son 205.811 filas
+  fantasma tras un solo descarte.
+- **La parada temprana por ENOSPC del coordinador paralelo** informa `false` en
+  vez de arriesgar una suposición. Correcto y pendiente de cerrar.
+- **Ejemplo de contención al 100%**: dos carpetas de imágenes con nombre en dos
+  idiomas, 3.797 y 3.624 contenidos, intersección 3.624. Ni un byte del segundo
+  falta en el primero. Es el caso que mejor ilustra por qué la pregunta no
+  necesitaba a nadie.
+
 ## Comprobación pendiente
 
-El contraste de arriba cruza el entregable con el snapshot por **(nombre,
-tamaño)**, no por SHA-256, y un 4,1% de los archivos entregados no está en
-este origen. Es señal fuerte, no prueba. El cruce por hash cuesta unas 1,5 h
-de disco y está sin hacer.
+El contraste con el entregable humano cruza por **(nombre, tamaño)**, no por
+SHA-256, y un 4,1% de los archivos entregados no está en este origen. Es señal
+fuerte, no prueba. El cruce por hash cuesta unas 1,5 h de disco y está sin
+hacer.
+
+La medición de solapamiento sí es exacta: usa las identidades SHA-256 del
+propio snapshot, no heurísticas de nombre.
 
 [ADR-0041]: ../adr/ADR-0041-df-rules-canonical-recovery.md

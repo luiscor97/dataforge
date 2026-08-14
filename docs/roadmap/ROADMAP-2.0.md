@@ -570,10 +570,25 @@ M2.3 demuestra que sin clasificación no hay deduplicación. Éste es su hermano
 **sin correspondencia no hay colocación**. Clasificar dice *qué es* algo;
 colocarlo exige además decidir *dónde va*, y son dos capacidades.
 
+**Umbral, medido antes de construir nada.** Comparando el conjunto de
+contenidos de los dos subárboles de cada una de las 4.604 preguntas de carpeta
+del corpus real: 3.702 son contención estricta —el tipo de anomalía predice el
+veredicto sin una sola excepción— y de los 902 «parciales», 739 se separan de
+la contención total por **cinco archivos o menos**, 426 de ellos por uno solo.
+Quitando además `EXTREME_PATH`, la cola baja de 5.334 ítems a **169**. El
+trabajo humano terminó con **175**. Dos métodos sin nada en común coinciden en
+que la ambigüedad real de ese archivo son ~170 casos, así que el criterio de
+M2.7 no es «reducir la cola» sino **dejarla en ese orden**.
+
 - Detección de **árboles paralelos**: dos subárboles cuyos hijos se
   corresponden por nombre y describen las mismas entidades. La evidencia ya se
   calcula —`tree_relation_report` y el solapamiento por contenido— y no se usa
   para decidir.
+- **Contención estricta no es una pregunta**: si el contenido de B está entero
+  dentro de A, eso es un hecho medido y la operación es mecánica. Con
+  tolerancia declarada para los casos al filo, y la lista explícita de las
+  excepciones que la tolerancia perdona — una tolerancia que oculta lo que
+  perdona no es tolerancia, es una pérdida.
 - La fusión se propone como **operaciones de plan**, nunca como efecto
   inmediato: origen, destino y motivo por archivo, aprobable y verificable
   como cualquier otra operación.
