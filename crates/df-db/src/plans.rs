@@ -23,6 +23,7 @@ use crate::{db_err, Db};
 pub const EVENT_ANALYSIS_COMPLETED: &str = "ANALYSIS_COMPLETED";
 pub const EVENT_PLAN_CREATED: &str = "PLAN_CREATED";
 pub const EVENT_PLAN_APPROVED: &str = "PLAN_APPROVED";
+pub const EVENT_PLAN_DISCARDED: &str = "PLAN_DISCARDED";
 pub const EVENT_EXECUTION_COMPLETED: &str = "EXECUTION_COMPLETED";
 pub const EVENT_EXECUTION_PAUSED: &str = "EXECUTION_PAUSED";
 pub const EVENT_VERIFICATION_COMPLETED: &str = "VERIFICATION_COMPLETED";
@@ -550,6 +551,48 @@ pub fn approve_plan(
         "serialized_sha256": serialized_sha256,
     });
     append_event(&tx, plan.project_id, EVENT_PLAN_APPROVED, &payload, actor)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Supersede a plan that was never approved, so another can be built.
+///
+/// The status already existed — `SUPERSEDED` means "replaced by a newer
+/// version before approval" — and `insert_plan` has always set it when a new
+/// version lands. What was missing is the deliberate move: a way to say "this
+/// plan is not the one" *without* having to produce a replacement in the same
+/// breath. Comparing two duplicate policies before committing to one is the
+/// most ordinary thing an operator does, and until now the only exits from
+/// `PLAN_READY` were to approve or to edit the database by hand.
+///
+/// An `APPROVED` plan is refused here and always will be. Approval freezes the
+/// manifest (§26.4, ADR-0018); after it, the plan is evidence of a decision,
+/// and evidence is not discarded because someone changed their mind. The way
+/// back from an approved plan is a new snapshot, not a quieter database.
+///
+/// Nothing on disk is touched: the operations were never executed, and the
+/// superseded plan stays in the table with its ledger entry. This removes a
+/// plan from the *future*, never from the record.
+pub fn discard_plan(db: &mut Db, plan: &Plan, actor: Actor) -> DfResult<()> {
+    if plan.status != PlanStatus::Ready {
+        return Err(DfError::Validation(format!(
+            "only READY plans can be discarded (plan v{} is {})",
+            plan.version,
+            plan.status.as_str()
+        )));
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    tx.execute(
+        "UPDATE plans SET status = 'SUPERSEDED' WHERE id = ?1 AND status = 'READY'",
+        [plan.id.to_string()],
+    )
+    .map_err(db_err)?;
+    let payload = serde_json::json!({
+        "plan_id": plan.id.to_string(),
+        "version": plan.version,
+        "snapshot_id": plan.snapshot_id.to_string(),
+    });
+    append_event(&tx, plan.project_id, EVENT_PLAN_DISCARDED, &payload, actor)?;
     tx.commit().map_err(db_err)?;
     Ok(())
 }
@@ -1117,6 +1160,107 @@ pub fn pending_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
             |row| row.get::<_, i64>(0).map(|bytes| bytes as u64),
         )
         .map_err(db_err)
+}
+
+/// Bytes a plan would still write, for a plan that has not been approved.
+///
+/// [`pending_bytes`] sums the frozen manifest, which is the right source once
+/// it exists — but it only exists from approval onwards, so before then it
+/// sums nothing and answers zero. That zero was found in the field by running
+/// `report space-preflight` on a 444 GB plan: it reported "0 bytes still to
+/// write, there is room", which is the answer it would also have given on a
+/// full disk. A preflight exists to be consulted *before* committing, so
+/// being blind until after approval defeats it.
+///
+/// Sizes come from `content_objects` — the size recorded at hash time,
+/// alongside the identity — so this measures the same bytes the manifest will
+/// freeze. Directory operations contribute nothing, which is why the join is
+/// on `content_id`.
+pub fn planned_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
+    db.conn()
+        .query_row(
+            "SELECT COALESCE(SUM(c.size_bytes), 0)
+             FROM plan_operations p
+             JOIN content_objects c ON c.id = p.content_id
+             WHERE p.plan_id = ?1
+               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')",
+            params![plan_id.to_string()],
+            |row| row.get::<_, i64>(0).map(|bytes| bytes as u64),
+        )
+        .map_err(db_err)
+}
+
+/// One operation that did not complete, and what stopped it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FailedOperationView {
+    /// Source path, as the manifest recorded it.
+    pub source_relative_path: String,
+    /// Where it would have gone.
+    pub destination_relative_path: String,
+    /// Current state: `FAILED_RETRYABLE` or `FAILED_FINAL`.
+    pub execution_state: String,
+    /// `SOURCE_MISSING`, `PERMISSION_DENIED`, `IO_ERROR`, …
+    pub error_code: String,
+    pub detail: String,
+    /// Attempts recorded for this operation.
+    pub attempts: u64,
+}
+
+/// Everything a plan could not copy, worst first.
+///
+/// An old disk is the normal case here, not the exception: a run over failing
+/// media completes — per-file errors never abort it — and then the operator
+/// has to find out what did not make it. The engine recorded every attempt and
+/// its error code from the start and never read them back, so the answer
+/// existed only in the log of the run that happened to be watched.
+///
+/// Final failures before retryable ones, because a caller asking what went
+/// wrong wants what will not fix itself.
+pub fn failed_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: usize,
+) -> DfResult<Vec<FailedOperationView>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(m.source_relative_path_exact, ''),
+                    COALESCE(m.destination_relative_path, ''),
+                    p.execution_state,
+                    COALESCE(r.error_code, 'UNKNOWN'),
+                    COALESCE(r.detail, ''),
+                    (SELECT COUNT(*) FROM operation_results a
+                      WHERE a.operation_id = p.id)
+             FROM plan_operations p
+             JOIN execution_manifest m ON m.operation_id = p.id
+             LEFT JOIN operation_results r ON r.id = (
+                 SELECT r2.id FROM operation_results r2
+                  WHERE r2.operation_id = p.id
+                  ORDER BY r2.finished_at DESC, r2.created_at DESC
+                  LIMIT 1
+             )
+             WHERE p.plan_id = ?1
+               AND p.execution_state IN ('FAILED_FINAL', 'FAILED_RETRYABLE')
+             ORDER BY CASE p.execution_state WHEN 'FAILED_FINAL' THEN 0 ELSE 1 END,
+                      m.source_relative_path_exact
+             LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![plan_id.to_string(), limit as i64], |row| {
+            Ok(FailedOperationView {
+                source_relative_path: row.get(0)?,
+                destination_relative_path: row.get(1)?,
+                execution_state: row.get(2)?,
+                error_code: row.get(3)?,
+                detail: row.get(4)?,
+                attempts: row.get::<_, i64>(5)? as u64,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
 }
 
 /// One completed verification run, as recorded.

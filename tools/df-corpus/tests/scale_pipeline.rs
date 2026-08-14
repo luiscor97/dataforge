@@ -73,6 +73,7 @@ fn run_pipeline(base: &Path, files: u64) -> PipelineReport {
         audit_root: None,
         source_roots: vec![origin.clone()],
         profile: Some("generic".to_string()),
+        hash_exclusions: Vec::new(),
     };
     df_facade::create_project(&request, Actor::Test).expect("create");
 
@@ -316,6 +317,7 @@ fn a_small_corpus_stops_closed_at_execution() {
             audit_root: None,
             source_roots: vec![origin],
             profile: Some("generic".to_string()),
+            hash_exclusions: Vec::new(),
         },
         Actor::Test,
     )

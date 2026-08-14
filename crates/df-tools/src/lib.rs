@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.7.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.10.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +225,11 @@ pub const TOOLS: &[Tool] = &[
         summary: "What the destination root guarantees about identity and safety.",
     },
     Tool {
+        name: "execution_failure_report",
+        capability: Capability::Observe,
+        summary: "What the plan could not copy, and why.",
+    },
+    Tool {
         name: "verify_audit",
         capability: Capability::Observe,
         summary: "Ledger chain verification and the audit trail it yields.",
@@ -285,6 +290,11 @@ pub const TOOLS: &[Tool] = &[
         capability: Capability::Build,
         summary: "Re-check the plan invariants against the stored plan.",
     },
+    Tool {
+        name: "discard_plan",
+        capability: Capability::Build,
+        summary: "Throw away an unapproved plan and return to ANALYZED. The way back.",
+    },
     // ---- commit --------------------------------------------------------
     Tool {
         name: "approve_plan",
@@ -300,6 +310,11 @@ pub const TOOLS: &[Tool] = &[
         name: "verify_project_output",
         capability: Capability::Commit,
         summary: "Re-read and re-hash the output, trusting neither agent nor executor.",
+    },
+    Tool {
+        name: "export_delivery_package",
+        capability: Capability::Build,
+        summary: "Write the traceability map, checksum manifest and guarantees. The handover.",
     },
 ];
 
@@ -553,6 +568,7 @@ pub fn report_collections(name: &str) -> Option<&'static [&'static str]> {
         "tree_relation_report" => &["relations"],
         "context_report" => &["generic_folders", "protected_folders"],
         "structural_anomaly_report" => &["anomalies"],
+        "execution_failure_report" => &["failures"],
         "structural_review_queue" => &["items"],
         _ => return None,
     })
@@ -707,6 +723,14 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::destination_guarantees(&input.project_dir)?)
         }
+        "execution_failure_report" => {
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::execution_failure_report(&input.project_dir)?,
+                input.window(),
+            )
+        }
         "verify_audit" => {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::verify_audit(&input.project_dir)?)
@@ -822,6 +846,10 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::validate_plan(&input.project_dir)?)
         }
+        "discard_plan" => {
+            let input: ProjectInput = parse(name, input)?;
+            encode(name, df_facade::discard_plan(&input.project_dir, actor)?)
+        }
 
         // ---- commit ----------------------------------------------------
         "approve_plan" => {
@@ -831,6 +859,13 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
         "execute_plan" => {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::execute_plan(&input.project_dir, actor)?)
+        }
+        "export_delivery_package" => {
+            let input: ProjectInput = parse(name, input)?;
+            encode(
+                name,
+                df_facade::export_delivery_package(&input.project_dir)?,
+            )
         }
         "verify_project_output" => {
             let input: ProjectInput = parse(name, input)?;
@@ -924,6 +959,28 @@ mod tests {
     }
 
     #[test]
+    fn the_pipeline_ends_somewhere_a_caller_can_reach() {
+        // `export_delivery_package` existed in the facade for a whole
+        // milestone and was reachable from nowhere: not this surface, not the
+        // CLI, not the desktop. Only its own unit tests ever called it.
+        //
+        // It is not a peripheral function. The original job this engine was
+        // built against was accepted when the adviser stopped doubting that
+        // material could have gone missing, and what removed the doubt was
+        // exactly these three artefacts. The engine computed them and had no
+        // way to hand them over.
+        //
+        // Asserted as "the pipeline has an exit", not as "this name exists",
+        // because the failure mode is a stage nobody can call, whatever it
+        // ends up being named.
+        assert!(
+            tool("export_delivery_package").is_some(),
+            "the last stage of the pipeline must be callable, or the engine \
+             can do the work and not deliver it"
+        );
+    }
+
+    #[test]
     fn the_commit_class_is_exactly_the_three_gated_calls() {
         // If a tool ever joins this class, that is a decision that has to be
         // made deliberately: it is the set a human (or df-rules) authorises.
@@ -963,6 +1020,7 @@ mod tests {
                 ("plan_destination_tree", Capability::Observe),
                 ("plan_space_preflight", Capability::Observe),
                 ("destination_guarantees", Capability::Observe),
+                ("execution_failure_report", Capability::Observe),
                 ("verify_audit", Capability::Observe),
                 ("content_search", Capability::Observe),
                 ("content_query", Capability::Observe),
@@ -975,13 +1033,15 @@ mod tests {
                 ("decide_structural_review_batch", Capability::Build),
                 ("create_plan", Capability::Build),
                 ("validate_plan", Capability::Build),
+                ("discard_plan", Capability::Build),
                 ("approve_plan", Capability::Commit),
                 ("execute_plan", Capability::Commit),
                 ("verify_project_output", Capability::Commit),
+                ("export_delivery_package", Capability::Build),
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.7.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.10.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.

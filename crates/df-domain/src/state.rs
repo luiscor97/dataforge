@@ -99,6 +99,15 @@ impl ProjectState {
                 | (Planning, PlanReady | Failed)
                 | (PlanReady, PlanReview)
                 | (PlanReview, PlanReview | PlanApproved)
+                // Discarding an unapproved plan (`plan discard`). The only
+                // backward edge in the pipeline, and it is bounded on both
+                // ends: it starts before approval, so nothing is frozen and
+                // nothing was executed, and it lands on Analyzed, so the next
+                // step is planning again. There is deliberately no edge out of
+                // PlanApproved — approval froze a manifest, and the way back
+                // from that is a new snapshot, not a quieter database.
+                | (PlanReady, Analyzed)
+                | (PlanReview, Analyzed)
                 | (PlanApproved, Executing)
                 | (Executing, ExecutionPaused | Executed | Failed)
                 | (ExecutionPaused, Executing | Failed)
