@@ -1613,7 +1613,14 @@ fn print_devices(report: &DevicePreflight) {
 fn print_space_preflight(report: &SpacePreflight) {
     println!("Plan            : {}", report.plan_id);
     println!("Destination     : {}", report.output_root);
-    println!("Still to write  : {} bytes", report.required_bytes);
+    println!(
+        "Still to write  : {} bytes (from the {})",
+        report.required_bytes,
+        match report.source {
+            "MANIFEST" => "frozen manifest",
+            _ => "plan, not yet approved",
+        }
+    );
     match report.available_bytes {
         Some(available) => println!("Room there      : {available} bytes"),
         // Unknown is said plainly. Reporting it as a number would let a

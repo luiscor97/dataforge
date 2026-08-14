@@ -2553,6 +2553,15 @@ pub struct SpacePreflight {
     /// `None` when nothing could be measured, so a caller cannot mistake
     /// "could not check" for "checked and fine".
     pub sufficient: Option<bool>,
+    /// Where `required_bytes` came from: `"MANIFEST"` once approval has frozen
+    /// one, `"PLAN"` before that.
+    ///
+    /// Not decoration. The manifest is the execution contract and the better
+    /// answer, but it does not exist until approval, and a preflight is most
+    /// useful *before* deciding to approve. Saying which source answered lets
+    /// a caller tell a figure taken from the frozen contract from one taken
+    /// from a plan that can still change.
+    pub source: &'static str,
 }
 
 /// Check the destination has room before a long copy starts.
@@ -2573,7 +2582,17 @@ pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
     let plan = df_db::plans::current_plan(&db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
 
-    let required_bytes = df_db::plans::pending_bytes(&db, plan.id)?;
+    // The frozen manifest is the better source, but it exists only from
+    // approval onwards. Falling back to the plan is what makes this answerable
+    // at the moment it is worth asking — before committing to the copy.
+    // Keyed on approval, not on the byte count: a run that has finished also
+    // has zero bytes pending, and calling that "the plan says zero" would be
+    // true by accident and wrong in meaning.
+    let (required_bytes, source) = if plan.status == df_domain::PlanStatus::Approved {
+        (df_db::plans::pending_bytes(&db, plan.id)?, "MANIFEST")
+    } else {
+        (df_db::plans::planned_bytes(&db, plan.id)?, "PLAN")
+    };
     let available_bytes = df_fs_safety::available_bytes(&project.output_root);
     Ok(SpacePreflight {
         plan_id: plan.id.to_string(),
@@ -2581,6 +2600,7 @@ pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
         required_bytes,
         available_bytes,
         sufficient: available_bytes.map(|available| available >= required_bytes),
+        source,
     })
 }
 
@@ -3798,9 +3818,27 @@ mod tests {
         hash_project(&req.project_dir, Actor::Test).expect("hash");
         analyze_project(&req.project_dir, Actor::Test).expect("analyze");
         create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+
+        // Before approval, and this is the case that matters: a preflight is
+        // consulted to decide *whether* to approve. It used to sum the frozen
+        // manifest, which approval creates, so an unapproved plan reported
+        // "0 bytes still to write, there is room" — the same answer it would
+        // give on a full disk. Found on a 444 GB plan; this test approved
+        // first and so asked the only question that already worked.
+        let unapproved = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(unapproved.source, "PLAN");
+        assert!(
+            unapproved.required_bytes >= 24,
+            "an unapproved plan still knows what it would write"
+        );
+
         approve_plan(&req.project_dir, Actor::Test).expect("approve");
 
         let before = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(
+            before.source, "MANIFEST",
+            "approval freezes the better source"
+        );
         assert!(before.required_bytes >= 24, "both files are still to copy");
 
         execute_plan(&req.project_dir, Actor::Test).expect("execute");

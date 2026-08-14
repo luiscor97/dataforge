@@ -1162,6 +1162,34 @@ pub fn pending_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
         .map_err(db_err)
 }
 
+/// Bytes a plan would still write, for a plan that has not been approved.
+///
+/// [`pending_bytes`] sums the frozen manifest, which is the right source once
+/// it exists — but it only exists from approval onwards, so before then it
+/// sums nothing and answers zero. That zero was found in the field by running
+/// `report space-preflight` on a 444 GB plan: it reported "0 bytes still to
+/// write, there is room", which is the answer it would also have given on a
+/// full disk. A preflight exists to be consulted *before* committing, so
+/// being blind until after approval defeats it.
+///
+/// Sizes come from `content_objects` — the size recorded at hash time,
+/// alongside the identity — so this measures the same bytes the manifest will
+/// freeze. Directory operations contribute nothing, which is why the join is
+/// on `content_id`.
+pub fn planned_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
+    db.conn()
+        .query_row(
+            "SELECT COALESCE(SUM(c.size_bytes), 0)
+             FROM plan_operations p
+             JOIN content_objects c ON c.id = p.content_id
+             WHERE p.plan_id = ?1
+               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')",
+            params![plan_id.to_string()],
+            |row| row.get::<_, i64>(0).map(|bytes| bytes as u64),
+        )
+        .map_err(db_err)
+}
+
 /// One operation that did not complete, and what stopped it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FailedOperationView {
