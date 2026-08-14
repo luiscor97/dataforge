@@ -402,8 +402,20 @@ enum ProjectCommand {
         #[arg(long)]
         exclusions: Option<PathBuf>,
     },
-    /// Show the state, roots, ledger summary and integrity of a project.
+    /// Show the state, roots, ledger summary and who is running it.
+    ///
+    /// Cheap: safe to run while a long stage is working. Use
+    /// `project integrity` for the full database and ledger pass.
     Status {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Full database and ledger integrity pass.
+    ///
+    /// Costs a scan of the whole database. Worth running before a delivery
+    /// and after any interruption; not worth running to watch a hash.
+    Integrity {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
@@ -763,6 +775,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     .map(Box::new)
                     .map(Output::Status)
             }
+            ProjectCommand::Integrity { path } => df_facade::project_integrity(path)
+                .map(Box::new)
+                .map(Output::Status),
             ProjectCommand::Status { path } => df_facade::project_status(path)
                 .map(Box::new)
                 .map(Output::Status),
@@ -2443,6 +2458,21 @@ mod tests {
             _ => panic!("status returns a status"),
         };
         assert_eq!(report.project_id, created.project_id);
+        // `status` is the cheap question and no longer runs an integrity pass;
+        // asking for one is `project integrity`.
+        assert!(report.integrity.is_none());
+
+        let checked = Cli::parse_from([
+            "dataforge",
+            "project",
+            "integrity",
+            "--path",
+            project_dir.to_str().unwrap(),
+        ]);
+        let report = match run(&checked).expect("integrity succeeds") {
+            Output::Status(status) => status,
+            _ => panic!("integrity returns a status"),
+        };
         assert!(report.integrity.as_ref().expect("integrity ran").is_ok());
     }
 

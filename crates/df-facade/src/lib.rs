@@ -984,8 +984,30 @@ pub fn open_project(project_dir: &Path) -> DfResult<ProjectStatus> {
     status_from_db(&db, &project_dir, None)
 }
 
-/// Full status of a project, including a database + ledger integrity pass.
+/// Status of a project: state, roots, counters and who is running it.
+///
+/// Cheap on purpose, and it did not use to be. This ran `PRAGMA
+/// integrity_check` on every call — a full pass over every page — so the one
+/// command an operator uses to watch a long stage was the one doing the most
+/// work, and it got slower exactly as the archive got bigger. On a 293 MB
+/// database mid-hash it did not return within five minutes.
+///
+/// Integrity is a question you ask deliberately: [`project_integrity`]. The
+/// `integrity` field is `Option` precisely because it was always meant to be
+/// answered only when asked.
 pub fn project_status(project_dir: &Path) -> DfResult<ProjectStatus> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    status_from_db(&db, &project_dir, None)
+}
+
+/// Status plus a full database and ledger integrity pass.
+///
+/// Costs a scan of the whole database, so it is a thing you ask for rather
+/// than something every status call pays for. Worth running before a delivery
+/// and after any interruption; not worth running to see how a hash is going.
+pub fn project_integrity(project_dir: &Path) -> DfResult<ProjectStatus> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let db = open_db(&project_dir, &marker)?;
@@ -3462,7 +3484,9 @@ mod tests {
         assert!(opened.integrity.is_none());
 
         let status = project_status(&req.project_dir).expect("status");
-        let integrity = status.integrity.expect("status runs integrity");
+        assert!(status.integrity.is_none(), "status is the cheap question");
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        let integrity = checked.integrity.expect("asked for, so answered");
         assert!(integrity.is_ok(), "{:?}", integrity.problems);
         assert_eq!(
             status.last_event.as_ref().map(|e| e.event_type.as_str()),
@@ -3666,6 +3690,28 @@ mod tests {
                 "unknown must not be reported as fine"
             ),
         }
+    }
+
+    #[test]
+    fn status_is_cheap_and_integrity_is_something_you_ask_for() {
+        // Found watching a real hash: `project_status` ran PRAGMA
+        // integrity_check on every call — a pass over every page — so the
+        // command an operator uses to see how a long stage is going was the
+        // one doing the most work, and got slower as the archive grew. On a
+        // 293 MB database mid-hash it did not return within five minutes.
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let status = project_status(&req.project_dir).expect("status");
+        assert!(
+            status.integrity.is_none(),
+            "status must not pay for an integrity pass nobody asked for"
+        );
+
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        let report = checked.integrity.expect("asked for, so answered");
+        assert!(report.database_ok && report.ledger_ok);
     }
 
     #[test]
@@ -4004,7 +4050,8 @@ mod tests {
         let inventory = status.inventory.expect("inventory populated after scan");
         assert_eq!(inventory.files, 3);
         assert_eq!(inventory.hash_done, 3);
-        assert!(status.integrity.expect("integrity ran").is_ok());
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        assert!(checked.integrity.expect("integrity ran").is_ok());
 
         let audit = verify_audit(&req.project_dir).expect("audit");
         assert!(audit.ledger_ok);
