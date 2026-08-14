@@ -30,6 +30,7 @@ fn analyzed_project(base: &Path) -> std::path::PathBuf {
             audit_root: None,
             source_roots: vec![origin],
             profile: Some("generic".to_string()),
+            hash_exclusions: Vec::new(),
         },
         Actor::Test,
     )

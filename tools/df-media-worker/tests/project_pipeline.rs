@@ -73,6 +73,7 @@ fn media_run_relates_renditions_and_seals_its_evidence() {
             audit_root: None,
             source_roots: vec![origin],
             profile: Some("generic".to_string()),
+            hash_exclusions: Vec::new(),
         },
         Actor::Test,
     )
@@ -148,6 +149,7 @@ fn missing_image_worker_fails_closed_as_explicit_evidence() {
             audit_root: None,
             source_roots: vec![origin],
             profile: Some("generic".to_string()),
+            hash_exclusions: Vec::new(),
         },
         Actor::Test,
     )

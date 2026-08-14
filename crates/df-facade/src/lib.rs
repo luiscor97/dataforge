@@ -95,6 +95,15 @@ pub struct CreateProjectRequest {
     /// Profile name; defaults to `generic`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Material this project declines to hash, declared by the operator.
+    ///
+    /// Profiles can carry these too, but profiles are compiled into the
+    /// binary, so a profile rule is only reachable by whoever builds
+    /// DataForge. This is how the person holding the archive says "do not
+    /// spend six hours reading the video". Declared once, stored in the
+    /// project, and applied on top of whatever the profile already declares.
+    #[serde(default)]
+    pub hash_exclusions: Vec<df_domain::HashExclusion>,
 }
 
 /// Serializable view of a source root.
@@ -883,9 +892,31 @@ fn build_project_in(
         .collect();
     project.source_roots = roots.iter().map(|r| r.id).collect();
 
+    // Reject an unusable exclusion before the project exists, not on the
+    // first hash run. One that matches on nothing would decline to read the
+    // whole archive, and finding that out after a scan is finding it out too
+    // late to be a rejection.
+    for exclusion in &request.hash_exclusions {
+        if exclusion.r#match.is_empty() {
+            return Err(DfError::Validation(format!(
+                "hash exclusion `{}` matches on nothing, which would exclude the \
+                 entire archive",
+                exclusion.id
+            )));
+        }
+        if exclusion.reason.trim().is_empty() {
+            return Err(DfError::Validation(format!(
+                "hash exclusion `{}` has no reason; material that was never read \
+                 must say why",
+                exclusion.id
+            )));
+        }
+    }
+
     // Opening applies the migrations.
     let mut db = Db::open(&db_path)?;
     repository::create_project(&mut db, &project, &roots, actor)?;
+    df_db::inventory::set_project_hash_exclusions(&mut db, project.id, &request.hash_exclusions)?;
 
     // Prove it is sound before advertising it as a project.
     let report = df_db::integrity::check(&db)?;
@@ -3355,6 +3386,7 @@ mod tests {
             audit_root: None,
             source_roots: vec![],
             profile: None,
+            hash_exclusions: Vec::new(),
         }
     }
 
@@ -3634,6 +3666,57 @@ mod tests {
                 "unknown must not be reported as fine"
             ),
         }
+    }
+
+    #[test]
+    fn an_operator_can_declare_exclusions_without_rebuilding_the_binary() {
+        // Migration 0024 taught a *profile* to decline reading material, and
+        // profiles are compiled in — so that feature was only ever reachable
+        // by whoever builds DataForge, never by the person holding the
+        // archive. Found by trying to use it on a real one.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom")).unwrap();
+        std::fs::write(origin.join("escrito.pdf"), b"material").unwrap();
+        std::fs::write(origin.join("TomTom").join("mapa.dat"), b"gps").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        req.hash_exclusions = vec![df_domain::HashExclusion {
+            id: "gps.tomtom".to_string(),
+            reason: "navigation data, not case material".to_string(),
+            r#match: df_domain::ExclusionMatch {
+                path_glob: Some("TomTom*".to_string()),
+                ..df_domain::ExclusionMatch::default()
+            },
+        }];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        let hash = hash_project(&req.project_dir, Actor::Test).expect("hash");
+
+        assert_eq!(hash.hashed, 1, "only the document was read");
+        let report = hash_exclusion_report(&req.project_dir).expect("exclusions");
+        assert_eq!(report.excluded, 1);
+        assert_eq!(report.exclusions[0].rule_id, "gps.tomtom");
+        // Excluded is not discarded: it stays in the inventory.
+        let status = project_status(&req.project_dir).expect("status");
+        assert_eq!(status.inventory.expect("inventory").files, 2);
+    }
+
+    #[test]
+    fn an_exclusion_that_would_swallow_the_archive_is_refused_at_creation() {
+        // Rejected before the project exists, not on the first hash run:
+        // finding out after a 16-minute scan is finding out too late for it
+        // to be a rejection.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = request(tmp.path());
+        req.hash_exclusions = vec![df_domain::HashExclusion {
+            id: "everything".to_string(),
+            reason: "oops".to_string(),
+            r#match: df_domain::ExclusionMatch::default(),
+        }];
+        let error = create_project(&req, Actor::Test).expect_err("must refuse");
+        assert!(error.to_string().contains("entire archive"));
     }
 
     #[test]
@@ -4490,9 +4573,12 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 24, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 25, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[23].name, "hash_exclusions");
+        assert_eq!(
+            df_db::migrations::MIGRATIONS[24].name,
+            "project_hash_exclusions"
+        );
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");

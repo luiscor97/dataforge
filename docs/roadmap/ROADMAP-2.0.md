@@ -565,7 +565,7 @@ se alcanzó con scripts y criterio humano a lo largo de diez días**:
 | Mapa origen→destino | Completo y exportable |
 | Paquete de entrega | Informe + trazabilidad + manifiesto SHA-256 en la salida |
 
-Referencia de escala: 158.219 archivos, 443,9 GB, 28.537 conjuntos de
+Referencia de escala: 158.219 archivos, 443,9 GiB (476,7 GB), 28.537 conjuntos de
 duplicados, 239,7 GB redundantes. La cola de revisión tiene 5.334 elementos y
 3.702 son la misma clase, que es el dato que justifica decidir por clase y no
 por elemento.

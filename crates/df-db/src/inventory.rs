@@ -529,6 +529,80 @@ pub struct HashExclusionView {
     pub reason: String,
 }
 
+/// Record the exclusions an operator declared for a project.
+///
+/// Written once, at creation. The trigger refuses an update: a project whose
+/// rules changed halfway would have a snapshot no single set of rules
+/// explains.
+pub fn set_project_hash_exclusions(
+    db: &mut Db,
+    project_id: ProjectId,
+    exclusions: &[df_domain::HashExclusion],
+) -> DfResult<()> {
+    if exclusions.is_empty() {
+        return Ok(());
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    let now = to_stored_timestamp(chrono::Utc::now());
+    for exclusion in exclusions {
+        let matcher = serde_json::to_string(&exclusion.r#match).map_err(|error| {
+            DfError::Serialization(format!("hash exclusion `{}`: {error}", exclusion.id))
+        })?;
+        tx.execute(
+            "INSERT INTO project_hash_exclusions
+                (project_id, id, reason, match_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                project_id.to_string(),
+                exclusion.id,
+                exclusion.reason,
+                matcher,
+                now
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// The exclusions a project declared, if any.
+pub fn project_hash_exclusions(
+    db: &Db,
+    project_id: ProjectId,
+) -> DfResult<Vec<df_domain::HashExclusion>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT id, reason, match_json FROM project_hash_exclusions
+             WHERE project_id = ?1 ORDER BY id",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([project_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    rows.into_iter()
+        .map(|(id, reason, matcher)| {
+            Ok(df_domain::HashExclusion {
+                id,
+                reason,
+                r#match: serde_json::from_str(&matcher).map_err(|error| {
+                    DfError::Serialization(format!("stored hash exclusion: {error}"))
+                })?,
+            })
+        })
+        .collect()
+}
+
 /// Queue a hash job for every scanned-OK occurrence that has none yet.
 /// Idempotent: rerunning after an interruption only fills the gaps.
 ///
@@ -557,7 +631,14 @@ pub fn enqueue_hash_jobs(
             |row| row.get(0),
         )
         .map_err(db_err)?;
-    let exclusions = df_domain::Profile::load(&configured)?.hash_exclusions;
+    // The profile's rules and the operator's, together. A profile ships what
+    // is true of a domain; a project declares what is true of this archive,
+    // and only the second is reachable without recompiling.
+    let mut exclusions = df_domain::Profile::load(&configured)?.hash_exclusions;
+    exclusions.extend(project_hash_exclusions(
+        db,
+        ProjectId::from_str(&project_id)?,
+    )?);
     enqueue_hash_jobs_with(db, snapshot_id, actor, &exclusions)
 }
 

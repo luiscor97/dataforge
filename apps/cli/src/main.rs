@@ -392,6 +392,15 @@ enum ProjectCommand {
         /// Profile name.
         #[arg(long, default_value = "generic")]
         profile: String,
+        /// JSON file listing material this project will not hash.
+        ///
+        /// Read once, now, and stored in the project; the file is not
+        /// consulted again. Each entry needs an `id`, a `reason` and a
+        /// `match` of `path_glob`, `file_name_glob` and/or `min_size_bytes`.
+        /// The files stay in the inventory with that reason recorded — they
+        /// are simply never read.
+        #[arg(long)]
+        exclusions: Option<PathBuf>,
     },
     /// Show the state, roots, ledger summary and integrity of a project.
     Status {
@@ -723,7 +732,24 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 audit_root,
                 source,
                 profile,
+                exclusions,
             } => {
+                // Read once, here, and stored in the project. After this the
+                // file is irrelevant: behaviour must not depend on a path that
+                // could drift, be edited by something else, or vanish.
+                let hash_exclusions = match exclusions {
+                    Some(path) => {
+                        let text = std::fs::read_to_string(path)
+                            .map_err(|error| DfError::io(path, error))?;
+                        serde_json::from_str(&text).map_err(|error| {
+                            DfError::Validation(format!(
+                                "{}: not a list of hash exclusions: {error}",
+                                path.display()
+                            ))
+                        })?
+                    }
+                    None => Vec::new(),
+                };
                 let request = CreateProjectRequest {
                     name: name.clone(),
                     project_dir: path.clone(),
@@ -731,6 +757,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     audit_root: audit_root.clone(),
                     source_roots: source.clone(),
                     profile: Some(profile.clone()),
+                    hash_exclusions,
                 };
                 df_facade::create_project(&request, actor)
                     .map(Box::new)
