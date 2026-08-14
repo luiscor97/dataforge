@@ -769,6 +769,15 @@ pub struct DeviceProfile {
     /// so the parallelism that measured 2.46× on NVMe can measure *less than
     /// one* here. Nothing else about the machine — core count, RAM, GPU —
     /// changes the answer as much.
+    ///
+    /// Measured in the field, hashing 444 GB off an external USB platter while
+    /// the counters were sampled: the device sat at **99–100% busy** for the
+    /// whole run at **6–39 MB/s** across 38–57 reads/s — roughly 330 KB moved
+    /// per read, the rest of the time being the head travelling. Writes were
+    /// ~0. The same engine reads 4.3 GB/s off this machine's NVMe. A device
+    /// already spending its time seeking has no spare capacity for a second
+    /// reader to use, so on this volume the honest worker count is one, and no
+    /// amount of CPU changes it.
     pub incurs_seek_penalty: Option<bool>,
 }
 
