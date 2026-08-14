@@ -5032,12 +5032,14 @@ mod frozen_contracts {
         // precisely for this.
         // 0.9.0 adds `discard_plan`: the way back from an unapproved plan,
         // added after a real archive produced one whose shape was wrong and
-        // PLAN_READY turned out to be a dead end.
+        // PLAN_READY turned out to be a dead end. 0.10.0 adds
+        // `export_delivery_package`, which had been reachable from nowhere —
+        // the last stage of the pipeline, callable only from its own tests.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.9.0"
+            "dataforge.tool-surface/0.10.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 31, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 32, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling

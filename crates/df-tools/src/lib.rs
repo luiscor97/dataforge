@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.9.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.10.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +310,11 @@ pub const TOOLS: &[Tool] = &[
         name: "verify_project_output",
         capability: Capability::Commit,
         summary: "Re-read and re-hash the output, trusting neither agent nor executor.",
+    },
+    Tool {
+        name: "export_delivery_package",
+        capability: Capability::Build,
+        summary: "Write the traceability map, checksum manifest and guarantees. The handover.",
     },
 ];
 
@@ -855,6 +860,13 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::execute_plan(&input.project_dir, actor)?)
         }
+        "export_delivery_package" => {
+            let input: ProjectInput = parse(name, input)?;
+            encode(
+                name,
+                df_facade::export_delivery_package(&input.project_dir)?,
+            )
+        }
         "verify_project_output" => {
             let input: ProjectInput = parse(name, input)?;
             encode(
@@ -947,6 +959,28 @@ mod tests {
     }
 
     #[test]
+    fn the_pipeline_ends_somewhere_a_caller_can_reach() {
+        // `export_delivery_package` existed in the facade for a whole
+        // milestone and was reachable from nowhere: not this surface, not the
+        // CLI, not the desktop. Only its own unit tests ever called it.
+        //
+        // It is not a peripheral function. The original job this engine was
+        // built against was accepted when the adviser stopped doubting that
+        // material could have gone missing, and what removed the doubt was
+        // exactly these three artefacts. The engine computed them and had no
+        // way to hand them over.
+        //
+        // Asserted as "the pipeline has an exit", not as "this name exists",
+        // because the failure mode is a stage nobody can call, whatever it
+        // ends up being named.
+        assert!(
+            tool("export_delivery_package").is_some(),
+            "the last stage of the pipeline must be callable, or the engine \
+             can do the work and not deliver it"
+        );
+    }
+
+    #[test]
     fn the_commit_class_is_exactly_the_three_gated_calls() {
         // If a tool ever joins this class, that is a decision that has to be
         // made deliberately: it is the set a human (or df-rules) authorises.
@@ -1003,10 +1037,11 @@ mod tests {
                 ("approve_plan", Capability::Commit),
                 ("execute_plan", Capability::Commit),
                 ("verify_project_output", Capability::Commit),
+                ("export_delivery_package", Capability::Build),
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.9.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.10.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.

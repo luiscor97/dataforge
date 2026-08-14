@@ -14,13 +14,13 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DevicePreflight, DiscardOutcome, DuplicateReport, ExecuteOutcome, ExtractionLimits,
-    GraftedTreeReport, HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars,
-    NameCollisionReport, PlanDestinationTree, PlanOutcome, PlanValidationReport,
-    PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus, QueryOptions,
-    RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome, SearchBuildOptions,
-    SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions,
-    SpacePreflight, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    DeliveryPackage, DevicePreflight, DiscardOutcome, DuplicateReport, ExecuteOutcome,
+    ExtractionLimits, GraftedTreeReport, HashOutcome, MediaOutcome, MediaProjectOptions,
+    MediaReport, MediaSidecars, NameCollisionReport, PlanDestinationTree, PlanOutcome,
+    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
+    QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome,
+    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
+    SnapshotBuildOptions, SpacePreflight, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -210,6 +210,13 @@ enum Command {
     },
     /// Verify the executed plan from primary evidence.
     Verify {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Export the delivery package: traceability map, checksum manifest and
+    /// the statement of guarantees, all derived from the frozen manifest.
+    Deliver {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
@@ -721,6 +728,7 @@ enum Output {
     Approve(ApproveOutcome),
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
+    Deliver(DeliveryPackage),
     Duplicates(DuplicateReport),
     NameCollisions(NameCollisionReport),
     GraftedTrees(GraftedTreeReport),
@@ -1105,6 +1113,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Verify { path } => {
             df_facade::verify_project_output(path, actor).map(Output::Verify)
         }
+        Command::Deliver { path } => df_facade::export_delivery_package(path).map(Output::Deliver),
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)
@@ -1564,6 +1573,18 @@ fn print_execute(outcome: &ExecuteOutcome) {
     } else if outcome.cancelled || outcome.pending > 0 || outcome.failed_retryable > 0 {
         println!("Next            : run `dataforge execute` again to resume");
     }
+}
+
+fn print_deliver(package: &DeliveryPackage) {
+    println!("Plan         : {}", package.plan_id);
+    println!("Directory    : {}", package.directory);
+    println!("Entries      : {}", package.entries);
+    println!("Checksummed  : {}", package.checksummed);
+    // Said even when zero. An entry with no destination is the one thing a
+    // recipient of this package would want flagged, and reporting it only
+    // when convenient is how it stops being reported at all.
+    println!("No destination: {}", package.without_destination);
+    println!("Bytes        : {}", package.bytes);
 }
 
 fn print_verify(outcome: &VerifyOutcome) {
@@ -2224,6 +2245,7 @@ fn print_human(output: &Output) {
         Output::Approve(outcome) => print_approve(outcome),
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
+        Output::Deliver(package) => print_deliver(package),
         Output::Duplicates(report) => print_duplicates(report),
         Output::NameCollisions(report) => print_name_collisions(report),
         Output::GraftedTrees(report) => print_grafted_trees(report),
@@ -2383,6 +2405,11 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 0
             }
         }
+        // Exporting the package succeeds even when it reports entries with no
+        // destination: the package's job is to state what is there, and a
+        // non-zero exit would push a caller to discard the very evidence that
+        // names the gap.
+        Output::Deliver(_) => 0,
         // Evidence reports always succeed: finding duplicates, clones or
         // partial clones is information, not a failure.
         Output::Duplicates(_) => 0,
