@@ -14,13 +14,13 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DuplicateReport, ExecuteOutcome, ExtractionLimits, GraftedTreeReport, HashOutcome,
-    MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport,
-    PlanDestinationTree, PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport,
-    PluginsOutcome, ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary,
-    ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions,
-    SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, SpacePreflight, TreeCloneReport,
-    TreeRelationReport, VerifyOutcome,
+    DeliveryPackage, DevicePreflight, DiscardOutcome, DuplicateReport, ExecuteOutcome,
+    ExtractionLimits, GraftedTreeReport, HashOutcome, MediaOutcome, MediaProjectOptions,
+    MediaReport, MediaSidecars, NameCollisionReport, PlanDestinationTree, PlanOutcome,
+    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
+    QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome,
+    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
+    SnapshotBuildOptions, SpacePreflight, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -232,6 +232,13 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         workers: usize,
     },
+    /// Export the delivery package: traceability map, checksum manifest and
+    /// the statement of guarantees, all derived from the frozen manifest.
+    Deliver {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Evidence reports derived from the inventory.
     Report {
         #[command(subcommand)]
@@ -410,9 +417,30 @@ enum ProjectCommand {
         /// Profile name.
         #[arg(long, default_value = "generic")]
         profile: String,
+        /// JSON file listing material this project will not hash.
+        ///
+        /// Read once, now, and stored in the project; the file is not
+        /// consulted again. Each entry needs an `id`, a `reason` and a
+        /// `match` of `path_glob`, `file_name_glob` and/or `min_size_bytes`.
+        /// The files stay in the inventory with that reason recorded — they
+        /// are simply never read.
+        #[arg(long)]
+        exclusions: Option<PathBuf>,
     },
-    /// Show the state, roots, ledger summary and integrity of a project.
+    /// Show the state, roots, ledger summary and who is running it.
+    ///
+    /// Cheap: safe to run while a long stage is working. Use
+    /// `project integrity` for the full database and ledger pass.
     Status {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Full database and ledger integrity pass.
+    ///
+    /// Costs a scan of the whole database. Worth running before a delivery
+    /// and after any interruption; not worth running to watch a hash.
+    Integrity {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
@@ -447,6 +475,13 @@ enum PlanCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Discard the unapproved plan and go back to ANALYZED, so another
+    /// duplicate policy can be tried. Copies nothing; deletes nothing.
+    Discard {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Approve and freeze the plan (canonical SHA-256).
     Approve {
         /// Project directory.
@@ -471,6 +506,12 @@ enum ReportCommand {
     },
     /// Whether the destination has room for what is left to copy.
     SpacePreflight {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// What storage this project sits on, and what parallelism it can take.
+    Devices {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
@@ -701,13 +742,16 @@ enum Output {
     Plan(PlanOutcome),
     PlanTree(PlanDestinationTree),
     PlanValidation(PlanValidationReport),
+    Discard(DiscardOutcome),
     Approve(ApproveOutcome),
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
+    Deliver(DeliveryPackage),
     Duplicates(DuplicateReport),
     NameCollisions(NameCollisionReport),
     GraftedTrees(GraftedTreeReport),
     SpacePreflight(SpacePreflight),
+    Devices(DevicePreflight),
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
@@ -741,7 +785,24 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 audit_root,
                 source,
                 profile,
+                exclusions,
             } => {
+                // Read once, here, and stored in the project. After this the
+                // file is irrelevant: behaviour must not depend on a path that
+                // could drift, be edited by something else, or vanish.
+                let hash_exclusions = match exclusions {
+                    Some(path) => {
+                        let text = std::fs::read_to_string(path)
+                            .map_err(|error| DfError::io(path, error))?;
+                        serde_json::from_str(&text).map_err(|error| {
+                            DfError::Validation(format!(
+                                "{}: not a list of hash exclusions: {error}",
+                                path.display()
+                            ))
+                        })?
+                    }
+                    None => Vec::new(),
+                };
                 let request = CreateProjectRequest {
                     name: name.clone(),
                     project_dir: path.clone(),
@@ -749,11 +810,15 @@ fn run(cli: &Cli) -> DfResult<Output> {
                     audit_root: audit_root.clone(),
                     source_roots: source.clone(),
                     profile: Some(profile.clone()),
+                    hash_exclusions,
                 };
                 df_facade::create_project(&request, actor)
                     .map(Box::new)
                     .map(Output::Status)
             }
+            ProjectCommand::Integrity { path } => df_facade::project_integrity(path)
+                .map(Box::new)
+                .map(Output::Status),
             ProjectCommand::Status { path } => df_facade::project_status(path)
                 .map(Box::new)
                 .map(Output::Status),
@@ -1046,6 +1111,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             PlanCommand::Validate { path } => {
                 df_facade::validate_plan(path).map(Output::PlanValidation)
             }
+            PlanCommand::Discard { path } => {
+                df_facade::discard_plan(path, actor).map(Output::Discard)
+            }
             PlanCommand::Approve { path } => {
                 df_facade::approve_plan(path, actor).map(Output::Approve)
             }
@@ -1073,12 +1141,16 @@ fn run(cli: &Cli) -> DfResult<Output> {
             },
         )
         .map(Output::Verify),
+        Command::Deliver { path } => df_facade::export_delivery_package(path).map(Output::Deliver),
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {
                 df_facade::duplicate_report(path).map(Output::Duplicates)
             }
             ReportCommand::NameCollisions { path } => {
                 df_facade::name_collision_report(path).map(Output::NameCollisions)
+            }
+            ReportCommand::Devices { path } => {
+                df_facade::device_preflight(path).map(Output::Devices)
             }
             ReportCommand::SpacePreflight { path } => {
                 df_facade::plan_space_preflight(path).map(Output::SpacePreflight)
@@ -1498,6 +1570,13 @@ fn print_plan_validation(report: &PlanValidationReport) {
     }
 }
 
+fn print_discard(outcome: &DiscardOutcome) {
+    println!("Discarded  : {} (v{})", outcome.plan_id, outcome.version);
+    println!("Operations : {} dropped", outcome.operations_discarded);
+    println!("State      : {}", outcome.state);
+    println!("Next       : `dataforge plan create` with another policy");
+}
+
 fn print_approve(outcome: &ApproveOutcome) {
     println!("Plan       : {} (v{})", outcome.plan_id, outcome.version);
     println!("Approved   : {} operation(s)", outcome.operations_approved);
@@ -1524,6 +1603,18 @@ fn print_execute(outcome: &ExecuteOutcome) {
     }
 }
 
+fn print_deliver(package: &DeliveryPackage) {
+    println!("Plan         : {}", package.plan_id);
+    println!("Directory    : {}", package.directory);
+    println!("Entries      : {}", package.entries);
+    println!("Checksummed  : {}", package.checksummed);
+    // Said even when zero. An entry with no destination is the one thing a
+    // recipient of this package would want flagged, and reporting it only
+    // when convenient is how it stops being reported at all.
+    println!("No destination: {}", package.without_destination);
+    println!("Bytes        : {}", package.bytes);
+}
+
 fn print_verify(outcome: &VerifyOutcome) {
     println!("Verification : {}", outcome.verification_run_id);
     println!("Plan         : {}", outcome.plan_id);
@@ -1541,10 +1632,44 @@ fn print_verify(outcome: &VerifyOutcome) {
     }
 }
 
+fn print_devices(report: &DevicePreflight) {
+    for source in &report.sources {
+        println!(
+            "Origin      : {} [{}] disk {:?}, seek penalty {:?}",
+            source.path,
+            source.filesystem,
+            source.device.device_number,
+            source.device.incurs_seek_penalty
+        );
+    }
+    println!(
+        "Destination : {} [{}] disk {:?}, seek penalty {:?}",
+        report.destination.path,
+        report.destination.filesystem,
+        report.destination.device.device_number,
+        report.destination.device.incurs_seek_penalty
+    );
+    match report.source_shares_destination_device {
+        Some(true) => println!("Shared disk : YES — reads and writes share one queue"),
+        Some(false) => println!("Shared disk : no"),
+        None => println!("Shared disk : unknown"),
+    }
+    println!("Workers     : {} recommended", report.recommended_workers);
+    println!();
+    println!("{}", report.rationale);
+}
+
 fn print_space_preflight(report: &SpacePreflight) {
     println!("Plan            : {}", report.plan_id);
     println!("Destination     : {}", report.output_root);
-    println!("Still to write  : {} bytes", report.required_bytes);
+    println!(
+        "Still to write  : {} bytes (from the {})",
+        report.required_bytes,
+        match report.source {
+            "MANIFEST" => "frozen manifest",
+            _ => "plan, not yet approved",
+        }
+    );
     match report.available_bytes {
         Some(available) => println!("Room there      : {available} bytes"),
         // Unknown is said plainly. Reporting it as a number would let a
@@ -2144,13 +2269,16 @@ fn print_human(output: &Output) {
         Output::Plan(outcome) => print_plan(outcome),
         Output::PlanTree(tree) => print_plan_tree(tree),
         Output::PlanValidation(report) => print_plan_validation(report),
+        Output::Discard(outcome) => print_discard(outcome),
         Output::Approve(outcome) => print_approve(outcome),
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
+        Output::Deliver(package) => print_deliver(package),
         Output::Duplicates(report) => print_duplicates(report),
         Output::NameCollisions(report) => print_name_collisions(report),
         Output::GraftedTrees(report) => print_grafted_trees(report),
         Output::SpacePreflight(report) => print_space_preflight(report),
+        Output::Devices(report) => print_devices(report),
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
@@ -2286,7 +2414,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 2
             }
         }
-        Output::Approve(_) => 0,
+        Output::Discard(_) | Output::Approve(_) => 0,
         Output::Execute(outcome) => {
             if outcome.cancelled
                 || outcome.pending > 0
@@ -2305,12 +2433,18 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 0
             }
         }
+        // Exporting the package succeeds even when it reports entries with no
+        // destination: the package's job is to state what is there, and a
+        // non-zero exit would push a caller to discard the very evidence that
+        // names the gap.
+        Output::Deliver(_) => 0,
         // Evidence reports always succeed: finding duplicates, clones or
         // partial clones is information, not a failure.
         Output::Duplicates(_) => 0,
         Output::NameCollisions(_) => 0,
         Output::GraftedTrees(_) => 0,
         Output::SpacePreflight(_) => 0,
+        Output::Devices(_) => 0,
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,
@@ -2444,6 +2578,21 @@ mod tests {
             _ => panic!("status returns a status"),
         };
         assert_eq!(report.project_id, created.project_id);
+        // `status` is the cheap question and no longer runs an integrity pass;
+        // asking for one is `project integrity`.
+        assert!(report.integrity.is_none());
+
+        let checked = Cli::parse_from([
+            "dataforge",
+            "project",
+            "integrity",
+            "--path",
+            project_dir.to_str().unwrap(),
+        ]);
+        let report = match run(&checked).expect("integrity succeeds") {
+            Output::Status(status) => status,
+            _ => panic!("integrity returns a status"),
+        };
         assert!(report.integrity.as_ref().expect("integrity ran").is_ok());
     }
 

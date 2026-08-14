@@ -146,6 +146,12 @@ pub fn verify_project(
         .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
 
     repository::update_project_state(db, ProjectState::Verifying, actor)?;
+    // Verification re-reads and re-hashes every artefact, so on a real archive
+    // it is the second-longest stage there is: 438 GB took hours. Without a
+    // claim, `project_status` answered `active_run: null` for the whole of it
+    // — the positive claim that the project is free, made while a process
+    // holds it. Found by running `verify` on the D: archive and looking.
+    df_db::liveness::claim(db, project.id, df_db::liveness::RunStage::Verify, actor)?;
     let started_at = chrono::Utc::now();
 
     let mut findings: Vec<VerificationFinding> = Vec::new();
@@ -358,6 +364,7 @@ pub fn verify_project(
     let run_id = plans::record_verification_run(
         db, project.id, plan.id, verdict, checked, &findings, started_at, actor,
     )?;
+    df_db::liveness::release(db, project.id)?;
     let project = repository::update_project_state(db, next_state, actor)?;
 
     Ok(VerifyOutcome {

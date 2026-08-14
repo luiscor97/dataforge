@@ -50,7 +50,9 @@ pub use df_db::inventory::{NameCollision, NameCollisionReport};
 pub use df_db::liveness::{RunLiveness, RunStage};
 pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
-pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
+pub use df_planner::{
+    AnalyzeOutcome, ApproveOutcome, DiscardOutcome, PlanOutcome, PlanValidationReport,
+};
 pub use df_plugin::{
     Capability as PluginCapability, PluginProjectOptions, PluginsOutcome, RegisteredPluginMetadata,
 };
@@ -95,6 +97,15 @@ pub struct CreateProjectRequest {
     /// Profile name; defaults to `generic`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Material this project declines to hash, declared by the operator.
+    ///
+    /// Profiles can carry these too, but profiles are compiled into the
+    /// binary, so a profile rule is only reachable by whoever builds
+    /// DataForge. This is how the person holding the archive says "do not
+    /// spend six hours reading the video". Declared once, stored in the
+    /// project, and applied on top of whatever the profile already declares.
+    #[serde(default)]
+    pub hash_exclusions: Vec<df_domain::HashExclusion>,
 }
 
 /// Serializable view of a source root.
@@ -869,13 +880,45 @@ fn build_project_in(
     let roots: Vec<SourceRoot> = request
         .source_roots
         .iter()
-        .map(|path| SourceRoot::new(project.id, path.clone()))
+        .map(|path| {
+            let mut root = SourceRoot::new(project.id, path.clone());
+            // `SourceRoot::new` cannot classify: `df-domain` sits below
+            // `df-fs-safety`, so the constructor has to default to Unknown and
+            // somebody above has to fill it in. Nobody did, so every project
+            // ever created recorded its origins as UNKNOWN — including origins
+            // on a network share, which then claimed `is_network: false`.
+            root.filesystem = df_fs_safety::classify_filesystem(path);
+            root.is_network = root.filesystem == df_domain::FileSystemKind::Network;
+            root
+        })
         .collect();
     project.source_roots = roots.iter().map(|r| r.id).collect();
+
+    // Reject an unusable exclusion before the project exists, not on the
+    // first hash run. One that matches on nothing would decline to read the
+    // whole archive, and finding that out after a scan is finding it out too
+    // late to be a rejection.
+    for exclusion in &request.hash_exclusions {
+        if exclusion.r#match.is_empty() {
+            return Err(DfError::Validation(format!(
+                "hash exclusion `{}` matches on nothing, which would exclude the \
+                 entire archive",
+                exclusion.id
+            )));
+        }
+        if exclusion.reason.trim().is_empty() {
+            return Err(DfError::Validation(format!(
+                "hash exclusion `{}` has no reason; material that was never read \
+                 must say why",
+                exclusion.id
+            )));
+        }
+    }
 
     // Opening applies the migrations.
     let mut db = Db::open(&db_path)?;
     repository::create_project(&mut db, &project, &roots, actor)?;
+    df_db::inventory::set_project_hash_exclusions(&mut db, project.id, &request.hash_exclusions)?;
 
     // Prove it is sound before advertising it as a project.
     let report = df_db::integrity::check(&db)?;
@@ -943,8 +986,30 @@ pub fn open_project(project_dir: &Path) -> DfResult<ProjectStatus> {
     status_from_db(&db, &project_dir, None)
 }
 
-/// Full status of a project, including a database + ledger integrity pass.
+/// Status of a project: state, roots, counters and who is running it.
+///
+/// Cheap on purpose, and it did not use to be. This ran `PRAGMA
+/// integrity_check` on every call — a full pass over every page — so the one
+/// command an operator uses to watch a long stage was the one doing the most
+/// work, and it got slower exactly as the archive got bigger. On a 293 MB
+/// database mid-hash it did not return within five minutes.
+///
+/// Integrity is a question you ask deliberately: [`project_integrity`]. The
+/// `integrity` field is `Option` precisely because it was always meant to be
+/// answered only when asked.
 pub fn project_status(project_dir: &Path) -> DfResult<ProjectStatus> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    status_from_db(&db, &project_dir, None)
+}
+
+/// Status plus a full database and ledger integrity pass.
+///
+/// Costs a scan of the whole database, so it is a thing you ask for rather
+/// than something every status call pays for. Worth running before a delivery
+/// and after any interruption; not worth running to see how a hash is going.
+pub fn project_integrity(project_dir: &Path) -> DfResult<ProjectStatus> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let db = open_db(&project_dir, &marker)?;
@@ -2118,6 +2183,21 @@ pub fn create_plan(
     df_planner::create_plan(&mut db, actor, policy)
 }
 
+/// Discard the current unapproved plan and return to `ANALYZED` (§26).
+///
+/// The way back from a plan you do not want. Reversible in the only sense
+/// that matters: nothing was executed, and the superseded plan keeps its row
+/// and its ledger entry, so the record still shows it was built and rejected.
+///
+/// An approved plan cannot be discarded — approval froze a manifest, and that
+/// is evidence of a decision (ADR-0018).
+pub fn discard_plan(project_dir: &Path, actor: Actor) -> DfResult<DiscardOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    df_planner::discard_plan(&mut db, actor)
+}
+
 /// The output tree the current plan would produce, `depth` levels deep.
 ///
 /// Read-only. Answers the question the counts cannot: *where does my data
@@ -2354,6 +2434,121 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     })
 }
 
+/// One path and the device underneath it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceView {
+    pub path: String,
+    pub filesystem: String,
+    pub device: df_fs_safety::DeviceProfile,
+}
+
+/// What the machine can be expected to do with this project.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicePreflight {
+    pub sources: Vec<DeviceView>,
+    pub destination: DeviceView,
+    /// Whether an origin and the destination share one physical device.
+    /// `None` when either could not be identified.
+    pub source_shares_destination_device: Option<bool>,
+    /// Workers this machine should use for reading, and why.
+    pub recommended_workers: u32,
+    pub rationale: String,
+}
+
+/// Recommended read parallelism, and the sentence that explains it.
+///
+/// The measured sweeps (M1.0.1) put bounded parallelism at 2.46× on NVMe and
+/// saturating by 8 workers. Every one of those numbers was taken on
+/// solid-state storage, and none of them transfers to a platter: concurrent
+/// readers there make the head travel between requests instead of reading, so
+/// the same setting that wins on NVMe can lose outright.
+///
+/// So the recommendation follows the one fact that decides it — seek penalty —
+/// and says so in words. It is advice, never an override: nothing here changes
+/// what a run does, because a caller who asked for eight workers on a spinning
+/// disk may have a reason, and silently disagreeing with them is worse than
+/// telling them.
+fn recommend_workers(destination: &df_fs_safety::DeviceProfile) -> (u32, String) {
+    match destination.incurs_seek_penalty {
+        Some(true) => (
+            1,
+            "this volume reports a seek penalty, so it is a spinning disk. \
+             Concurrent readers make the head travel instead of read, and the \
+             parallelism that measured 2.46x on NVMe can measure less than one \
+             here. One worker, and expect the device — not the CPU — to set the \
+             pace."
+                .to_string(),
+        ),
+        Some(false) => (
+            8,
+            "solid-state: no seek penalty, so concurrent reads overlap. The \
+             measured sweeps saturate at 8 workers (2.46x hash, 2.59x verify); \
+             more threads bought nothing beyond that."
+                .to_string(),
+        ),
+        None => (
+            1,
+            "this build could not ask the volume whether its reads pay a seek \
+             penalty. One worker is the setting that is never actively wrong: \
+             it cannot thrash a platter, and on solid-state it only forgoes an \
+             improvement rather than causing a regression."
+                .to_string(),
+        ),
+    }
+}
+
+/// Report the storage this project sits on, before a long stage starts.
+///
+/// The engine has always taken its parallelism from a flag and its buffer
+/// sizes from constants, and looked at the machine not at all. That is fine
+/// until the archive turns out to live on an external spinning disk, where the
+/// setting measured as a 2.46x win becomes a loss — and nothing in the run
+/// would have said so.
+///
+/// Advice only. It changes no behaviour; it makes the decision visible before
+/// it costs hours.
+pub fn device_preflight(project_dir: &Path) -> DfResult<DevicePreflight> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let roots = repository::load_source_roots(&db, project.id)?;
+
+    let view = |path: &Path| DeviceView {
+        path: path.display().to_string(),
+        filesystem: df_fs_safety::classify_filesystem(path).as_str().to_string(),
+        device: df_fs_safety::device_profile(path),
+    };
+
+    let sources: Vec<DeviceView> = roots.iter().map(|r| view(&r.absolute_path)).collect();
+    let destination = view(&project.output_root);
+    // True if *any* origin shares the destination's device: one origin doing
+    // that is enough for reads and writes to contend.
+    let shared = sources
+        .iter()
+        .filter_map(|source| source.device.same_device_as(&destination.device))
+        .fold(None, |acc: Option<bool>, same| {
+            Some(acc.unwrap_or(false) || same)
+        });
+
+    let (recommended_workers, mut rationale) = recommend_workers(&destination.device);
+    if shared == Some(true) {
+        rationale.push_str(
+            " An origin and the destination are on the same physical device, so \
+             the copy stage will read and write through one queue; expect it to \
+             run slower than either would alone.",
+        );
+    }
+
+    Ok(DevicePreflight {
+        sources,
+        destination,
+        source_shares_destination_device: shared,
+        recommended_workers,
+        rationale,
+    })
+}
+
 /// Whether the destination has room for what is left to copy.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpacePreflight {
@@ -2368,6 +2563,15 @@ pub struct SpacePreflight {
     /// `None` when nothing could be measured, so a caller cannot mistake
     /// "could not check" for "checked and fine".
     pub sufficient: Option<bool>,
+    /// Where `required_bytes` came from: `"MANIFEST"` once approval has frozen
+    /// one, `"PLAN"` before that.
+    ///
+    /// Not decoration. The manifest is the execution contract and the better
+    /// answer, but it does not exist until approval, and a preflight is most
+    /// useful *before* deciding to approve. Saying which source answered lets
+    /// a caller tell a figure taken from the frozen contract from one taken
+    /// from a plan that can still change.
+    pub source: &'static str,
 }
 
 /// Check the destination has room before a long copy starts.
@@ -2388,7 +2592,17 @@ pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
     let plan = df_db::plans::current_plan(&db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
 
-    let required_bytes = df_db::plans::pending_bytes(&db, plan.id)?;
+    // The frozen manifest is the better source, but it exists only from
+    // approval onwards. Falling back to the plan is what makes this answerable
+    // at the moment it is worth asking — before committing to the copy.
+    // Keyed on approval, not on the byte count: a run that has finished also
+    // has zero bytes pending, and calling that "the plan says zero" would be
+    // true by accident and wrong in meaning.
+    let (required_bytes, source) = if plan.status == df_domain::PlanStatus::Approved {
+        (df_db::plans::pending_bytes(&db, plan.id)?, "MANIFEST")
+    } else {
+        (df_db::plans::planned_bytes(&db, plan.id)?, "PLAN")
+    };
     let available_bytes = df_fs_safety::available_bytes(&project.output_root);
     Ok(SpacePreflight {
         plan_id: plan.id.to_string(),
@@ -2396,6 +2610,7 @@ pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
         required_bytes,
         available_bytes,
         sufficient: available_bytes.map(|available| available >= required_bytes),
+        source,
     })
 }
 
@@ -2681,6 +2896,58 @@ const NAME_COLLISION_SAMPLES: usize = 4;
 /// The evidence behind a rule the engine already follows and could not
 /// previously show: a name is not an identity. Report only — it proposes
 /// nothing (RFC-0001 §15.2).
+/// What a plan could not copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionFailureReport {
+    pub plan_id: String,
+    /// Failures that will not fix themselves.
+    pub failed_final: u64,
+    /// Failures a later run may still resolve.
+    pub failed_retryable: u64,
+    /// `[error_code, count]`, most frequent first — the shape of the damage.
+    pub by_error: Vec<(String, u64)>,
+    pub failures: Vec<df_db::plans::FailedOperationView>,
+}
+
+/// Report everything the current plan could not copy, and why.
+///
+/// A run over failing media finishes: per-file errors never abort it, which is
+/// what makes an old disk workable at all. The cost of that is that the run
+/// ends looking successful, and the operator has to be able to ask what did
+/// not make it. Every attempt and its error code were already recorded; this
+/// is what reads them back.
+pub fn execution_failure_report(project_dir: &Path) -> DfResult<ExecutionFailureReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+
+    let progress = df_db::plans::plan_progress(&db, plan.id)?;
+    // Bounded: a plan over a dying disk can fail as many times as it has
+    // files, and a caller asking what went wrong wants the shape of it.
+    let failures = df_db::plans::failed_operations(&db, plan.id, MAX_REPORTED_FAILURES)?;
+
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for failure in &failures {
+        *counts.entry(failure.error_code.clone()).or_default() += 1;
+    }
+    let mut by_error: Vec<(String, u64)> = counts.into_iter().collect();
+    by_error.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(ExecutionFailureReport {
+        plan_id: plan.id.to_string(),
+        failed_final: progress.failed_final,
+        failed_retryable: progress.failed_retryable,
+        by_error,
+        failures,
+    })
+}
+
+/// Failures listed in one report. The counts above are never truncated.
+const MAX_REPORTED_FAILURES: usize = 1_000;
+
 /// What the profile declined to read, and why.
 #[derive(Debug, Clone, Serialize)]
 pub struct HashExclusionReport {
@@ -3303,6 +3570,7 @@ mod tests {
             audit_root: None,
             source_roots: vec![],
             profile: None,
+            hash_exclusions: Vec::new(),
         }
     }
 
@@ -3378,7 +3646,9 @@ mod tests {
         assert!(opened.integrity.is_none());
 
         let status = project_status(&req.project_dir).expect("status");
-        let integrity = status.integrity.expect("status runs integrity");
+        assert!(status.integrity.is_none(), "status is the cheap question");
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        let integrity = checked.integrity.expect("asked for, so answered");
         assert!(integrity.is_ok(), "{:?}", integrity.problems);
         assert_eq!(
             status.last_event.as_ref().map(|e| e.event_type.as_str()),
@@ -3558,9 +3828,27 @@ mod tests {
         hash_project(&req.project_dir, Actor::Test).expect("hash");
         analyze_project(&req.project_dir, Actor::Test).expect("analyze");
         create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+
+        // Before approval, and this is the case that matters: a preflight is
+        // consulted to decide *whether* to approve. It used to sum the frozen
+        // manifest, which approval creates, so an unapproved plan reported
+        // "0 bytes still to write, there is room" — the same answer it would
+        // give on a full disk. Found on a 444 GB plan; this test approved
+        // first and so asked the only question that already worked.
+        let unapproved = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(unapproved.source, "PLAN");
+        assert!(
+            unapproved.required_bytes >= 24,
+            "an unapproved plan still knows what it would write"
+        );
+
         approve_plan(&req.project_dir, Actor::Test).expect("approve");
 
         let before = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(
+            before.source, "MANIFEST",
+            "approval freezes the better source"
+        );
         assert!(before.required_bytes >= 24, "both files are still to copy");
 
         execute_plan(&req.project_dir, Actor::Test).expect("execute");
@@ -3582,6 +3870,314 @@ mod tests {
                 "unknown must not be reported as fine"
             ),
         }
+    }
+
+    #[test]
+    fn advice_never_recommends_parallelism_it_cannot_justify() {
+        use df_fs_safety::DeviceProfile;
+
+        let platter = DeviceProfile {
+            device_number: Some(1),
+            incurs_seek_penalty: Some(true),
+        };
+        let solid = DeviceProfile {
+            device_number: Some(0),
+            incurs_seek_penalty: Some(false),
+        };
+        let unknown = DeviceProfile::default();
+
+        assert_eq!(recommend_workers(&platter).0, 1, "a platter thrashes");
+        assert_eq!(recommend_workers(&solid).0, 8, "the sweeps saturate at 8");
+        // The case that matters most: not knowing must land on the setting
+        // that cannot be actively wrong. Recommending 8 into the dark risks a
+        // regression; recommending 1 only forgoes an improvement.
+        assert_eq!(recommend_workers(&unknown).0, 1);
+
+        // And the reason travels with the number, because "use 1 worker" that
+        // a caller cannot argue with is an order, not advice.
+        assert!(recommend_workers(&platter).1.contains("seek penalty"));
+    }
+
+    #[test]
+    fn not_knowing_the_device_is_not_the_same_as_knowing_they_differ() {
+        use df_fs_safety::DeviceProfile;
+
+        let one = DeviceProfile {
+            device_number: Some(3),
+            incurs_seek_penalty: None,
+        };
+        let same = DeviceProfile {
+            device_number: Some(3),
+            incurs_seek_penalty: None,
+        };
+        let other = DeviceProfile {
+            device_number: Some(4),
+            incurs_seek_penalty: None,
+        };
+        let unknown = DeviceProfile::default();
+
+        assert_eq!(one.same_device_as(&same), Some(true));
+        assert_eq!(one.same_device_as(&other), Some(false));
+        // Collapsing this to `false` is what would let a caller read and write
+        // flat out on one platter believing they were on two.
+        assert_eq!(one.same_device_as(&unknown), None);
+    }
+
+    #[test]
+    fn status_is_cheap_and_integrity_is_something_you_ask_for() {
+        // Found watching a real hash: `project_status` ran PRAGMA
+        // integrity_check on every call — a pass over every page — so the
+        // command an operator uses to see how a long stage is going was the
+        // one doing the most work, and got slower as the archive grew. On a
+        // 293 MB database mid-hash it did not return within five minutes.
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let status = project_status(&req.project_dir).expect("status");
+        assert!(
+            status.integrity.is_none(),
+            "status must not pay for an integrity pass nobody asked for"
+        );
+
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        let report = checked.integrity.expect("asked for, so answered");
+        assert!(report.database_ok && report.ledger_ok);
+    }
+
+    #[test]
+    fn an_operator_can_declare_exclusions_without_rebuilding_the_binary() {
+        // Migration 0024 taught a *profile* to decline reading material, and
+        // profiles are compiled in — so that feature was only ever reachable
+        // by whoever builds DataForge, never by the person holding the
+        // archive. Found by trying to use it on a real one.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom")).unwrap();
+        std::fs::write(origin.join("escrito.pdf"), b"material").unwrap();
+        std::fs::write(origin.join("TomTom").join("mapa.dat"), b"gps").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        req.hash_exclusions = vec![df_domain::HashExclusion {
+            id: "gps.tomtom".to_string(),
+            reason: "navigation data, not case material".to_string(),
+            r#match: df_domain::ExclusionMatch {
+                path_glob: Some("TomTom*".to_string()),
+                ..df_domain::ExclusionMatch::default()
+            },
+        }];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        let hash = hash_project(&req.project_dir, Actor::Test).expect("hash");
+
+        assert_eq!(hash.hashed, 1, "only the document was read");
+        let report = hash_exclusion_report(&req.project_dir).expect("exclusions");
+        assert_eq!(report.excluded, 1);
+        assert_eq!(report.exclusions[0].rule_id, "gps.tomtom");
+        // Excluded is not discarded: it stays in the inventory.
+        let status = project_status(&req.project_dir).expect("status");
+        assert_eq!(status.inventory.expect("inventory").files, 2);
+    }
+
+    #[test]
+    fn an_exclusion_that_would_swallow_the_archive_is_refused_at_creation() {
+        // Rejected before the project exists, not on the first hash run:
+        // finding out after a 16-minute scan is finding out too late for it
+        // to be a rejection.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = request(tmp.path());
+        req.hash_exclusions = vec![df_domain::HashExclusion {
+            id: "everything".to_string(),
+            reason: "oops".to_string(),
+            r#match: df_domain::ExclusionMatch::default(),
+        }];
+        let error = create_project(&req, Actor::Test).expect_err("must refuse");
+        assert!(error.to_string().contains("entire archive"));
+    }
+
+    #[test]
+    fn a_source_root_records_the_filesystem_it_actually_sits_on() {
+        // Found by running the engine on a real archive: every origin ever
+        // registered reported UNKNOWN, because `SourceRoot::new` has to
+        // default — `df-domain` sits below `df-fs-safety` — and nothing above
+        // ever filled it in. Harmless-looking, except an origin on a network
+        // share also claimed `is_network: false`.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+
+        let status = project_status(&req.project_dir).expect("status");
+        let root = &status.source_roots[0];
+        assert_eq!(
+            root.filesystem,
+            df_fs_safety::classify_filesystem(&origin).as_str(),
+            "the recorded filesystem must be the one the path is on"
+        );
+        // On any machine that can run this test the answer is knowable, so
+        // UNKNOWN here means the classification never happened.
+        assert_ne!(root.filesystem, "UNKNOWN");
+    }
+
+    #[test]
+    fn a_run_over_failing_media_finishes_and_says_what_it_could_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("bueno.txt"), b"se copia").unwrap();
+        std::fs::write(origin.join("roto.txt"), b"desaparece").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        // The disk loses one file between approval and the copy. This is what
+        // failing media looks like from the engine's side.
+        std::fs::remove_file(origin.join("roto.txt")).unwrap();
+
+        let outcome = execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        // The property that makes failing media workable: one unreadable file
+        // costs that file and nothing else. Both halves are asserted together,
+        // because either alone would pass for the wrong reason — a run that
+        // aborted, or one that quietly succeeded at nothing.
+        assert!(
+            outcome.failed_retryable + outcome.failed_final >= 1,
+            "the missing file must be recorded as a failure"
+        );
+        assert!(outcome.completed >= 1, "and the rest of the plan still ran");
+
+        let report = execution_failure_report(&req.project_dir).expect("failures");
+        assert_eq!(report.failures.len(), 1);
+        let failure = &report.failures[0];
+        assert!(failure.source_relative_path.contains("roto.txt"));
+        // Named by its cause, not merely counted: "one file failed" is not
+        // something an operator can act on.
+        assert_eq!(failure.error_code, "SOURCE_MISSING");
+        assert!(failure.attempts >= 1);
+        assert_eq!(report.by_error, vec![("SOURCE_MISSING".to_string(), 1)]);
+    }
+
+    #[test]
+    fn every_long_stage_says_it_is_running() {
+        // `RunStage` declared five stages and only three ever claimed one.
+        // Scan was fixed when a real scan reported `active_run: null`; Analyze
+        // and Verify kept the same defect for months, because a variant
+        // existing in the enum makes the stage look covered. Caught by running
+        // `verify` on a 438 GB archive and finding the table empty while a
+        // process held the project.
+        //
+        // The match below is exhaustive on purpose: adding a sixth stage will
+        // not compile until someone names what claims it. That is the part
+        // that stops this recurring — the previous fix left no such question
+        // behind, so nobody was ever asked it again.
+        fn claimant(stage: df_db::liveness::RunStage) -> &'static str {
+            use df_db::liveness::RunStage::*;
+            match stage {
+                Scan => "df-scan",
+                Hash => "df-hash",
+                Analyze => "df-planner",
+                Execute => "df-executor",
+                Verify => "df-verifier",
+            }
+        }
+
+        use df_db::liveness::RunStage;
+        for stage in [
+            RunStage::Scan,
+            RunStage::Hash,
+            RunStage::Analyze,
+            RunStage::Execute,
+            RunStage::Verify,
+        ] {
+            let crate_name = claimant(stage);
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(crate_name)
+                .join("src/lib.rs");
+            let text = std::fs::read_to_string(&source)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source.display()));
+            let claim = format!("RunStage::{}", stage.as_str_pascal());
+            assert!(
+                text.contains(&claim) && text.contains("liveness::claim"),
+                "{crate_name} runs the {} stage without claiming the project; \
+                 `project_status` would report nobody is working while it does",
+                stage.as_str()
+            );
+            assert!(
+                text.contains("liveness::release"),
+                "{crate_name} claims the project and never releases it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
+        // Found on a 444 GB archive: `plan create` produced a tree whose shape
+        // was wrong, and there was no way to build a second one. `create_plan`
+        // accepts only ANALYZED/PLANNING, so PLAN_READY was a dead end whose
+        // only exits were approving a plan nobody wanted or editing SQLite by
+        // hand. Four minutes to reach it; no way back.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("copias")).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("copias/uno.txt"), b"contenido uno").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+
+        let first =
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        assert_eq!(first.state, "PLAN_READY");
+        assert!(
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::PreserveAll).is_err(),
+            "re-planning over a READY plan must stay refused; discarding is the way back"
+        );
+
+        let discarded = discard_plan(&req.project_dir, Actor::Test).expect("discard");
+        assert_eq!(discarded.plan_id, first.plan_id);
+        assert_eq!(discarded.state, "ANALYZED");
+        assert_eq!(discarded.operations_discarded, first.operations);
+
+        let second = create_plan(
+            &req.project_dir,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateWithinContext,
+        )
+        .expect("re-plan");
+        assert_eq!(second.version, first.version + 1);
+        assert_ne!(second.plan_id, first.plan_id);
+        assert_eq!(second.duplicate_policy, "CONSOLIDATE_WITHIN_CONTEXT");
+
+        // The discarded plan is superseded, not erased: the record still shows
+        // it was built and rejected, and the ledger says who did it.
+        let audit = verify_audit(&req.project_dir).expect("audit");
+        assert!(
+            audit.ledger_ok,
+            "discarding must not break the ledger chain"
+        );
+
+        // And once approval has frozen a manifest, there is no way back at
+        // all. That is the line this feature must never cross.
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+        let refused = discard_plan(&req.project_dir, Actor::Test);
+        assert!(
+            refused.is_err(),
+            "an approved plan is evidence of a decision, not a draft"
+        );
     }
 
     #[test]
@@ -3799,7 +4395,8 @@ mod tests {
         let inventory = status.inventory.expect("inventory populated after scan");
         assert_eq!(inventory.files, 3);
         assert_eq!(inventory.hash_done, 3);
-        assert!(status.integrity.expect("integrity ran").is_ok());
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        assert!(checked.integrity.expect("integrity ran").is_ok());
 
         let audit = verify_audit(&req.project_dir).expect("audit");
         assert!(audit.ledger_ok);
@@ -4368,9 +4965,12 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 24, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 25, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[23].name, "hash_exclusions");
+        assert_eq!(
+            df_db::migrations::MIGRATIONS[24].name,
+            "project_hash_exclusions"
+        );
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");
@@ -4440,11 +5040,16 @@ mod frozen_contracts {
         // to fail when a contract moves. The dependency is a dev-dependency
         // cycle — `df-tools` sits on top of the facade — which Cargo permits
         // precisely for this.
+        // 0.9.0 adds `discard_plan`: the way back from an unapproved plan,
+        // added after a real archive produced one whose shape was wrong and
+        // PLAN_READY turned out to be a dead end. 0.10.0 adds
+        // `export_delivery_package`, which had been reachable from nowhere —
+        // the last stage of the pipeline, callable only from its own tests.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.7.0"
+            "dataforge.tool-surface/0.10.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 29, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 32, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling

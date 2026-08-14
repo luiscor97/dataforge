@@ -20,6 +20,11 @@ thiserror = { workspace = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # Device queries: which physical disk a path lives on, and whether its
+    # reads pay a seek penalty. Both are ioctls on a volume handle — no new
+    # crate, just two more modules of one already here.
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]

@@ -154,6 +154,11 @@ pub fn scan_project(
 
     let roots = repository::load_source_roots(db, project.id)?;
     repository::update_project_state(db, ProjectState::Scanning, actor)?;
+    // Without this a scan of a large archive runs for minutes while
+    // `project_status` reports `active_run: null` — not "no information", but
+    // the positive claim that nobody is working, which is exactly what a
+    // second operator would act on. Found by running the engine and asking.
+    df_db::liveness::claim(db, project.id, df_db::liveness::RunStage::Scan, actor)?;
     let (snapshot, run) = inventory::start_scan(db, project.id, actor)?;
 
     let mut walker = Walker {
@@ -193,6 +198,7 @@ pub fn scan_project(
         (ScanRunStatus::Completed, ProjectState::Scanned)
     };
     inventory::finish_scan(db, &run, run_status, counters, actor)?;
+    df_db::liveness::release(db, project.id)?;
     let project = repository::update_project_state(db, next_state, actor)?;
 
     Ok(ScanOutcome {
@@ -245,7 +251,10 @@ impl Walker<'_> {
             return Ok(());
         }
         let batch = std::mem::take(&mut self.batch);
-        inventory::insert_scan_batch(self.db, self.run.id, &batch, self.counters)
+        inventory::insert_scan_batch(self.db, self.run.id, &batch, self.counters)?;
+        // One beat per committed batch, so the heartbeat tracks progress that
+        // reached the database rather than merely that the walker is spinning.
+        df_db::liveness::beat(self.db, self.run.project_id)
     }
 
     fn flush_if_full(&mut self) -> DfResult<()> {

@@ -48,6 +48,18 @@ impl RunStage {
             Self::Verify => "VERIFY",
         }
     }
+
+    /// The variant's own spelling, for tests that have to look for
+    /// `RunStage::Verify` in source rather than for the stored `"VERIFY"`.
+    pub fn as_str_pascal(self) -> &'static str {
+        match self {
+            Self::Scan => "Scan",
+            Self::Hash => "Hash",
+            Self::Analyze => "Analyze",
+            Self::Execute => "Execute",
+            Self::Verify => "Verify",
+        }
+    }
 }
 
 /// What the database knows about the run holding this project.
