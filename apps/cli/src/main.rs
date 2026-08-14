@@ -14,13 +14,13 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DuplicateReport, ExecuteOutcome, ExtractionLimits, GraftedTreeReport, HashOutcome,
-    MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport,
-    PlanDestinationTree, PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport,
-    PluginsOutcome, ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary,
-    ReviewQueue, ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions,
-    SimilarityOutcome, SimilarityReport, SnapshotBuildOptions, SpacePreflight, TreeCloneReport,
-    TreeRelationReport, VerifyOutcome,
+    DevicePreflight, DuplicateReport, ExecuteOutcome, ExtractionLimits, GraftedTreeReport,
+    HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars,
+    NameCollisionReport, PlanDestinationTree, PlanOutcome, PlanValidationReport,
+    PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus, QueryOptions,
+    RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome, SearchBuildOptions,
+    SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport, SnapshotBuildOptions,
+    SpacePreflight, TreeCloneReport, TreeRelationReport, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -478,6 +478,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// What storage this project sits on, and what parallelism it can take.
+    Devices {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Grafted subtrees and how much of each places itself.
     GraftedTrees {
         /// Project directory.
@@ -711,6 +717,7 @@ enum Output {
     NameCollisions(NameCollisionReport),
     GraftedTrees(GraftedTreeReport),
     SpacePreflight(SpacePreflight),
+    Devices(DevicePreflight),
     TreeClones(TreeCloneReport),
     TreeRelations(TreeRelationReport),
     Contexts(ContextReport),
@@ -1093,6 +1100,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::NameCollisions { path } => {
                 df_facade::name_collision_report(path).map(Output::NameCollisions)
+            }
+            ReportCommand::Devices { path } => {
+                df_facade::device_preflight(path).map(Output::Devices)
             }
             ReportCommand::SpacePreflight { path } => {
                 df_facade::plan_space_preflight(path).map(Output::SpacePreflight)
@@ -1553,6 +1563,33 @@ fn print_verify(outcome: &VerifyOutcome) {
             );
         }
     }
+}
+
+fn print_devices(report: &DevicePreflight) {
+    for source in &report.sources {
+        println!(
+            "Origin      : {} [{}] disk {:?}, seek penalty {:?}",
+            source.path,
+            source.filesystem,
+            source.device.device_number,
+            source.device.incurs_seek_penalty
+        );
+    }
+    println!(
+        "Destination : {} [{}] disk {:?}, seek penalty {:?}",
+        report.destination.path,
+        report.destination.filesystem,
+        report.destination.device.device_number,
+        report.destination.device.incurs_seek_penalty
+    );
+    match report.source_shares_destination_device {
+        Some(true) => println!("Shared disk : YES — reads and writes share one queue"),
+        Some(false) => println!("Shared disk : no"),
+        None => println!("Shared disk : unknown"),
+    }
+    println!("Workers     : {} recommended", report.recommended_workers);
+    println!();
+    println!("{}", report.rationale);
 }
 
 fn print_space_preflight(report: &SpacePreflight) {
@@ -2165,6 +2202,7 @@ fn print_human(output: &Output) {
         Output::NameCollisions(report) => print_name_collisions(report),
         Output::GraftedTrees(report) => print_grafted_trees(report),
         Output::SpacePreflight(report) => print_space_preflight(report),
+        Output::Devices(report) => print_devices(report),
         Output::TreeClones(report) => print_tree_clones(report),
         Output::TreeRelations(report) => print_tree_relations(report),
         Output::Contexts(report) => print_contexts(report),
@@ -2325,6 +2363,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
         Output::NameCollisions(_) => 0,
         Output::GraftedTrees(_) => 0,
         Output::SpacePreflight(_) => 0,
+        Output::Devices(_) => 0,
         Output::TreeClones(_) => 0,
         Output::TreeRelations(_) => 0,
         Output::Contexts(_) => 0,

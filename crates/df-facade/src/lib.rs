@@ -2407,6 +2407,121 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
     })
 }
 
+/// One path and the device underneath it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceView {
+    pub path: String,
+    pub filesystem: String,
+    pub device: df_fs_safety::DeviceProfile,
+}
+
+/// What the machine can be expected to do with this project.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicePreflight {
+    pub sources: Vec<DeviceView>,
+    pub destination: DeviceView,
+    /// Whether an origin and the destination share one physical device.
+    /// `None` when either could not be identified.
+    pub source_shares_destination_device: Option<bool>,
+    /// Workers this machine should use for reading, and why.
+    pub recommended_workers: u32,
+    pub rationale: String,
+}
+
+/// Recommended read parallelism, and the sentence that explains it.
+///
+/// The measured sweeps (M1.0.1) put bounded parallelism at 2.46× on NVMe and
+/// saturating by 8 workers. Every one of those numbers was taken on
+/// solid-state storage, and none of them transfers to a platter: concurrent
+/// readers there make the head travel between requests instead of reading, so
+/// the same setting that wins on NVMe can lose outright.
+///
+/// So the recommendation follows the one fact that decides it — seek penalty —
+/// and says so in words. It is advice, never an override: nothing here changes
+/// what a run does, because a caller who asked for eight workers on a spinning
+/// disk may have a reason, and silently disagreeing with them is worse than
+/// telling them.
+fn recommend_workers(destination: &df_fs_safety::DeviceProfile) -> (u32, String) {
+    match destination.incurs_seek_penalty {
+        Some(true) => (
+            1,
+            "this volume reports a seek penalty, so it is a spinning disk. \
+             Concurrent readers make the head travel instead of read, and the \
+             parallelism that measured 2.46x on NVMe can measure less than one \
+             here. One worker, and expect the device — not the CPU — to set the \
+             pace."
+                .to_string(),
+        ),
+        Some(false) => (
+            8,
+            "solid-state: no seek penalty, so concurrent reads overlap. The \
+             measured sweeps saturate at 8 workers (2.46x hash, 2.59x verify); \
+             more threads bought nothing beyond that."
+                .to_string(),
+        ),
+        None => (
+            1,
+            "this build could not ask the volume whether its reads pay a seek \
+             penalty. One worker is the setting that is never actively wrong: \
+             it cannot thrash a platter, and on solid-state it only forgoes an \
+             improvement rather than causing a regression."
+                .to_string(),
+        ),
+    }
+}
+
+/// Report the storage this project sits on, before a long stage starts.
+///
+/// The engine has always taken its parallelism from a flag and its buffer
+/// sizes from constants, and looked at the machine not at all. That is fine
+/// until the archive turns out to live on an external spinning disk, where the
+/// setting measured as a 2.46x win becomes a loss — and nothing in the run
+/// would have said so.
+///
+/// Advice only. It changes no behaviour; it makes the decision visible before
+/// it costs hours.
+pub fn device_preflight(project_dir: &Path) -> DfResult<DevicePreflight> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let roots = repository::load_source_roots(&db, project.id)?;
+
+    let view = |path: &Path| DeviceView {
+        path: path.display().to_string(),
+        filesystem: df_fs_safety::classify_filesystem(path).as_str().to_string(),
+        device: df_fs_safety::device_profile(path),
+    };
+
+    let sources: Vec<DeviceView> = roots.iter().map(|r| view(&r.absolute_path)).collect();
+    let destination = view(&project.output_root);
+    // True if *any* origin shares the destination's device: one origin doing
+    // that is enough for reads and writes to contend.
+    let shared = sources
+        .iter()
+        .filter_map(|source| source.device.same_device_as(&destination.device))
+        .fold(None, |acc: Option<bool>, same| {
+            Some(acc.unwrap_or(false) || same)
+        });
+
+    let (recommended_workers, mut rationale) = recommend_workers(&destination.device);
+    if shared == Some(true) {
+        rationale.push_str(
+            " An origin and the destination are on the same physical device, so \
+             the copy stage will read and write through one queue; expect it to \
+             run slower than either would alone.",
+        );
+    }
+
+    Ok(DevicePreflight {
+        sources,
+        destination,
+        source_shares_destination_device: shared,
+        recommended_workers,
+        rationale,
+    })
+}
+
 /// Whether the destination has room for what is left to copy.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpacePreflight {
@@ -3690,6 +3805,57 @@ mod tests {
                 "unknown must not be reported as fine"
             ),
         }
+    }
+
+    #[test]
+    fn advice_never_recommends_parallelism_it_cannot_justify() {
+        use df_fs_safety::DeviceProfile;
+
+        let platter = DeviceProfile {
+            device_number: Some(1),
+            incurs_seek_penalty: Some(true),
+        };
+        let solid = DeviceProfile {
+            device_number: Some(0),
+            incurs_seek_penalty: Some(false),
+        };
+        let unknown = DeviceProfile::default();
+
+        assert_eq!(recommend_workers(&platter).0, 1, "a platter thrashes");
+        assert_eq!(recommend_workers(&solid).0, 8, "the sweeps saturate at 8");
+        // The case that matters most: not knowing must land on the setting
+        // that cannot be actively wrong. Recommending 8 into the dark risks a
+        // regression; recommending 1 only forgoes an improvement.
+        assert_eq!(recommend_workers(&unknown).0, 1);
+
+        // And the reason travels with the number, because "use 1 worker" that
+        // a caller cannot argue with is an order, not advice.
+        assert!(recommend_workers(&platter).1.contains("seek penalty"));
+    }
+
+    #[test]
+    fn not_knowing_the_device_is_not_the_same_as_knowing_they_differ() {
+        use df_fs_safety::DeviceProfile;
+
+        let one = DeviceProfile {
+            device_number: Some(3),
+            incurs_seek_penalty: None,
+        };
+        let same = DeviceProfile {
+            device_number: Some(3),
+            incurs_seek_penalty: None,
+        };
+        let other = DeviceProfile {
+            device_number: Some(4),
+            incurs_seek_penalty: None,
+        };
+        let unknown = DeviceProfile::default();
+
+        assert_eq!(one.same_device_as(&same), Some(true));
+        assert_eq!(one.same_device_as(&other), Some(false));
+        // Collapsing this to `false` is what would let a caller read and write
+        // flat out on one platter believing they were on two.
+        assert_eq!(one.same_device_as(&unknown), None);
     }
 
     #[test]
