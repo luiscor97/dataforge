@@ -23,6 +23,7 @@ use crate::{db_err, Db};
 pub const EVENT_ANALYSIS_COMPLETED: &str = "ANALYSIS_COMPLETED";
 pub const EVENT_PLAN_CREATED: &str = "PLAN_CREATED";
 pub const EVENT_PLAN_APPROVED: &str = "PLAN_APPROVED";
+pub const EVENT_PLAN_DISCARDED: &str = "PLAN_DISCARDED";
 pub const EVENT_EXECUTION_COMPLETED: &str = "EXECUTION_COMPLETED";
 pub const EVENT_EXECUTION_PAUSED: &str = "EXECUTION_PAUSED";
 pub const EVENT_VERIFICATION_COMPLETED: &str = "VERIFICATION_COMPLETED";
@@ -550,6 +551,48 @@ pub fn approve_plan(
         "serialized_sha256": serialized_sha256,
     });
     append_event(&tx, plan.project_id, EVENT_PLAN_APPROVED, &payload, actor)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Supersede a plan that was never approved, so another can be built.
+///
+/// The status already existed — `SUPERSEDED` means "replaced by a newer
+/// version before approval" — and `insert_plan` has always set it when a new
+/// version lands. What was missing is the deliberate move: a way to say "this
+/// plan is not the one" *without* having to produce a replacement in the same
+/// breath. Comparing two duplicate policies before committing to one is the
+/// most ordinary thing an operator does, and until now the only exits from
+/// `PLAN_READY` were to approve or to edit the database by hand.
+///
+/// An `APPROVED` plan is refused here and always will be. Approval freezes the
+/// manifest (§26.4, ADR-0018); after it, the plan is evidence of a decision,
+/// and evidence is not discarded because someone changed their mind. The way
+/// back from an approved plan is a new snapshot, not a quieter database.
+///
+/// Nothing on disk is touched: the operations were never executed, and the
+/// superseded plan stays in the table with its ledger entry. This removes a
+/// plan from the *future*, never from the record.
+pub fn discard_plan(db: &mut Db, plan: &Plan, actor: Actor) -> DfResult<()> {
+    if plan.status != PlanStatus::Ready {
+        return Err(DfError::Validation(format!(
+            "only READY plans can be discarded (plan v{} is {})",
+            plan.version,
+            plan.status.as_str()
+        )));
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    tx.execute(
+        "UPDATE plans SET status = 'SUPERSEDED' WHERE id = ?1 AND status = 'READY'",
+        [plan.id.to_string()],
+    )
+    .map_err(db_err)?;
+    let payload = serde_json::json!({
+        "plan_id": plan.id.to_string(),
+        "version": plan.version,
+        "snapshot_id": plan.snapshot_id.to_string(),
+    });
+    append_event(&tx, plan.project_id, EVENT_PLAN_DISCARDED, &payload, actor)?;
     tx.commit().map_err(db_err)?;
     Ok(())
 }

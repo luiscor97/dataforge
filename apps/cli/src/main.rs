@@ -14,8 +14,8 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DevicePreflight, DuplicateReport, ExecuteOutcome, ExtractionLimits, GraftedTreeReport,
-    HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars,
+    DevicePreflight, DiscardOutcome, DuplicateReport, ExecuteOutcome, ExtractionLimits,
+    GraftedTreeReport, HashOutcome, MediaOutcome, MediaProjectOptions, MediaReport, MediaSidecars,
     NameCollisionReport, PlanDestinationTree, PlanOutcome, PlanValidationReport,
     PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus, QueryOptions,
     RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome, SearchBuildOptions,
@@ -450,6 +450,13 @@ enum PlanCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Discard the unapproved plan and go back to ANALYZED, so another
+    /// duplicate policy can be tried. Copies nothing; deletes nothing.
+    Discard {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Approve and freeze the plan (canonical SHA-256).
     Approve {
         /// Project directory.
@@ -710,6 +717,7 @@ enum Output {
     Plan(PlanOutcome),
     PlanTree(PlanDestinationTree),
     PlanValidation(PlanValidationReport),
+    Discard(DiscardOutcome),
     Approve(ApproveOutcome),
     Execute(ExecuteOutcome),
     Verify(VerifyOutcome),
@@ -1074,6 +1082,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             PlanCommand::Validate { path } => {
                 df_facade::validate_plan(path).map(Output::PlanValidation)
+            }
+            PlanCommand::Discard { path } => {
+                df_facade::discard_plan(path, actor).map(Output::Discard)
             }
             PlanCommand::Approve { path } => {
                 df_facade::approve_plan(path, actor).map(Output::Approve)
@@ -1520,6 +1531,13 @@ fn print_plan_validation(report: &PlanValidationReport) {
             println!("  ! {problem}");
         }
     }
+}
+
+fn print_discard(outcome: &DiscardOutcome) {
+    println!("Discarded  : {} (v{})", outcome.plan_id, outcome.version);
+    println!("Operations : {} dropped", outcome.operations_discarded);
+    println!("State      : {}", outcome.state);
+    println!("Next       : `dataforge plan create` with another policy");
 }
 
 fn print_approve(outcome: &ApproveOutcome) {
@@ -2195,6 +2213,7 @@ fn print_human(output: &Output) {
         Output::Plan(outcome) => print_plan(outcome),
         Output::PlanTree(tree) => print_plan_tree(tree),
         Output::PlanValidation(report) => print_plan_validation(report),
+        Output::Discard(outcome) => print_discard(outcome),
         Output::Approve(outcome) => print_approve(outcome),
         Output::Execute(outcome) => print_execute(outcome),
         Output::Verify(outcome) => print_verify(outcome),
@@ -2338,7 +2357,7 @@ fn verdict_exit_code(output: &Output) -> i32 {
                 2
             }
         }
-        Output::Approve(_) => 0,
+        Output::Discard(_) | Output::Approve(_) => 0,
         Output::Execute(outcome) => {
             if outcome.cancelled
                 || outcome.pending > 0

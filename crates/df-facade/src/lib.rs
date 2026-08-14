@@ -50,7 +50,9 @@ pub use df_db::inventory::{NameCollision, NameCollisionReport};
 pub use df_db::liveness::{RunLiveness, RunStage};
 pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
-pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
+pub use df_planner::{
+    AnalyzeOutcome, ApproveOutcome, DiscardOutcome, PlanOutcome, PlanValidationReport,
+};
 pub use df_plugin::{
     Capability as PluginCapability, PluginProjectOptions, PluginsOutcome, RegisteredPluginMetadata,
 };
@@ -2181,6 +2183,21 @@ pub fn create_plan(
     df_planner::create_plan(&mut db, actor, policy)
 }
 
+/// Discard the current unapproved plan and return to `ANALYZED` (§26).
+///
+/// The way back from a plan you do not want. Reversible in the only sense
+/// that matters: nothing was executed, and the superseded plan keeps its row
+/// and its ledger entry, so the record still shows it was built and rejected.
+///
+/// An approved plan cannot be discarded — approval froze a manifest, and that
+/// is evidence of a decision (ADR-0018).
+pub fn discard_plan(project_dir: &Path, actor: Actor) -> DfResult<DiscardOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    df_planner::discard_plan(&mut db, actor)
+}
+
 /// The output tree the current plan would produce, `depth` levels deep.
 ///
 /// Read-only. Answers the question the counts cannot: *where does my data
@@ -4002,6 +4019,67 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
+        // Found on a 444 GB archive: `plan create` produced a tree whose shape
+        // was wrong, and there was no way to build a second one. `create_plan`
+        // accepts only ANALYZED/PLANNING, so PLAN_READY was a dead end whose
+        // only exits were approving a plan nobody wanted or editing SQLite by
+        // hand. Four minutes to reach it; no way back.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("copias")).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("copias/uno.txt"), b"contenido uno").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+
+        let first =
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        assert_eq!(first.state, "PLAN_READY");
+        assert!(
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::PreserveAll).is_err(),
+            "re-planning over a READY plan must stay refused; discarding is the way back"
+        );
+
+        let discarded = discard_plan(&req.project_dir, Actor::Test).expect("discard");
+        assert_eq!(discarded.plan_id, first.plan_id);
+        assert_eq!(discarded.state, "ANALYZED");
+        assert_eq!(discarded.operations_discarded, first.operations);
+
+        let second = create_plan(
+            &req.project_dir,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateWithinContext,
+        )
+        .expect("re-plan");
+        assert_eq!(second.version, first.version + 1);
+        assert_ne!(second.plan_id, first.plan_id);
+        assert_eq!(second.duplicate_policy, "CONSOLIDATE_WITHIN_CONTEXT");
+
+        // The discarded plan is superseded, not erased: the record still shows
+        // it was built and rejected, and the ledger says who did it.
+        let audit = verify_audit(&req.project_dir).expect("audit");
+        assert!(
+            audit.ledger_ok,
+            "discarding must not break the ledger chain"
+        );
+
+        // And once approval has frozen a manifest, there is no way back at
+        // all. That is the line this feature must never cross.
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+        let refused = discard_plan(&req.project_dir, Actor::Test);
+        assert!(
+            refused.is_err(),
+            "an approved plan is evidence of a decision, not a draft"
+        );
+    }
+
+    #[test]
     fn a_delivery_package_covers_every_manifest_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
@@ -4861,11 +4939,14 @@ mod frozen_contracts {
         // to fail when a contract moves. The dependency is a dev-dependency
         // cycle — `df-tools` sits on top of the facade — which Cargo permits
         // precisely for this.
+        // 0.9.0 adds `discard_plan`: the way back from an unapproved plan,
+        // added after a real archive produced one whose shape was wrong and
+        // PLAN_READY turned out to be a dead end.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.8.0"
+            "dataforge.tool-surface/0.9.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 30, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 31, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling

@@ -92,6 +92,19 @@ pub struct ApproveOutcome {
     pub state: String,
 }
 
+/// Report of `plan discard`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscardOutcome {
+    /// The plan that was superseded. It stays in the table; only its status
+    /// and the project's state change.
+    pub plan_id: String,
+    pub version: u32,
+    pub operations_discarded: u64,
+    /// Project state after the discard — always `ANALYZED`, which is where
+    /// another `plan create` can start.
+    pub state: String,
+}
+
 /// Report of `plan validate`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanValidationReport {
@@ -446,6 +459,46 @@ fn occurrence_coverage_problems(
         }
     }
     problems
+}
+
+/// Discard the current unapproved plan; moves the project back to `ANALYZED`.
+///
+/// The gap this closes was found by running the engine on a real archive.
+/// `plan create` under one duplicate policy produced a tree whose shape was
+/// wrong, and the obvious next step — build it again under a different policy
+/// and compare — was impossible: `create_plan` refuses any state but
+/// `ANALYZED`/`PLANNING`, and the only ways out of `PLAN_READY` were to
+/// approve a plan nobody wanted or to edit the database by hand. An operator
+/// could reach a dead end in four minutes and had no way back.
+///
+/// Deliberately a separate verb rather than a `--force` on `create_plan`:
+/// re-running a command should never silently throw away the previous answer.
+/// Discarding is a decision, so it is a thing you say.
+///
+/// Refuses an approved plan. That refusal is the point — see
+/// [`plans::discard_plan`].
+pub fn discard_plan(db: &mut Db, actor: Actor) -> DfResult<DiscardOutcome> {
+    let project = repository::load_project(db)?;
+    if !matches!(
+        project.state,
+        ProjectState::PlanReady | ProjectState::PlanReview
+    ) {
+        return Err(DfError::Validation(format!(
+            "cannot discard a plan in project state {} (expected PLAN_READY or PLAN_REVIEW)",
+            project.state
+        )));
+    }
+    let plan = plans::current_plan(db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let operations = plans::list_operations(db, plan.id)?.len() as u64;
+    plans::discard_plan(db, &plan, actor)?;
+    let project = repository::update_project_state(db, ProjectState::Analyzed, actor)?;
+    Ok(DiscardOutcome {
+        plan_id: plan.id.to_string(),
+        version: plan.version,
+        operations_discarded: operations,
+        state: project.state.to_string(),
+    })
 }
 
 /// Approve the current READY plan (§26.4): validate, canonically serialize,

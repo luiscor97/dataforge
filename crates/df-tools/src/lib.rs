@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.8.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.9.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +289,11 @@ pub const TOOLS: &[Tool] = &[
         name: "validate_plan",
         capability: Capability::Build,
         summary: "Re-check the plan invariants against the stored plan.",
+    },
+    Tool {
+        name: "discard_plan",
+        capability: Capability::Build,
+        summary: "Throw away an unapproved plan and return to ANALYZED. The way back.",
     },
     // ---- commit --------------------------------------------------------
     Tool {
@@ -836,6 +841,10 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::validate_plan(&input.project_dir)?)
         }
+        "discard_plan" => {
+            let input: ProjectInput = parse(name, input)?;
+            encode(name, df_facade::discard_plan(&input.project_dir, actor)?)
+        }
 
         // ---- commit ----------------------------------------------------
         "approve_plan" => {
@@ -990,13 +999,14 @@ mod tests {
                 ("decide_structural_review_batch", Capability::Build),
                 ("create_plan", Capability::Build),
                 ("validate_plan", Capability::Build),
+                ("discard_plan", Capability::Build),
                 ("approve_plan", Capability::Commit),
                 ("execute_plan", Capability::Commit),
                 ("verify_project_output", Capability::Commit),
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.8.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.9.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.
