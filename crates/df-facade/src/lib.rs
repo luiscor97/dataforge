@@ -869,7 +869,17 @@ fn build_project_in(
     let roots: Vec<SourceRoot> = request
         .source_roots
         .iter()
-        .map(|path| SourceRoot::new(project.id, path.clone()))
+        .map(|path| {
+            let mut root = SourceRoot::new(project.id, path.clone());
+            // `SourceRoot::new` cannot classify: `df-domain` sits below
+            // `df-fs-safety`, so the constructor has to default to Unknown and
+            // somebody above has to fill it in. Nobody did, so every project
+            // ever created recorded its origins as UNKNOWN — including origins
+            // on a network share, which then claimed `is_network: false`.
+            root.filesystem = df_fs_safety::classify_filesystem(path);
+            root.is_network = root.filesystem == df_domain::FileSystemKind::Network;
+            root
+        })
         .collect();
     project.source_roots = roots.iter().map(|r| r.id).collect();
 
@@ -3624,6 +3634,33 @@ mod tests {
                 "unknown must not be reported as fine"
             ),
         }
+    }
+
+    #[test]
+    fn a_source_root_records_the_filesystem_it_actually_sits_on() {
+        // Found by running the engine on a real archive: every origin ever
+        // registered reported UNKNOWN, because `SourceRoot::new` has to
+        // default — `df-domain` sits below `df-fs-safety` — and nothing above
+        // ever filled it in. Harmless-looking, except an origin on a network
+        // share also claimed `is_network: false`.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+
+        let status = project_status(&req.project_dir).expect("status");
+        let root = &status.source_roots[0];
+        assert_eq!(
+            root.filesystem,
+            df_fs_safety::classify_filesystem(&origin).as_str(),
+            "the recorded filesystem must be the one the path is on"
+        );
+        // On any machine that can run this test the answer is knowable, so
+        // UNKNOWN here means the classification never happened.
+        assert_ne!(root.filesystem, "UNKNOWN");
     }
 
     #[test]
