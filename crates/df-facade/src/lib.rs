@@ -2671,6 +2671,58 @@ const NAME_COLLISION_SAMPLES: usize = 4;
 /// The evidence behind a rule the engine already follows and could not
 /// previously show: a name is not an identity. Report only — it proposes
 /// nothing (RFC-0001 §15.2).
+/// What a plan could not copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionFailureReport {
+    pub plan_id: String,
+    /// Failures that will not fix themselves.
+    pub failed_final: u64,
+    /// Failures a later run may still resolve.
+    pub failed_retryable: u64,
+    /// `[error_code, count]`, most frequent first — the shape of the damage.
+    pub by_error: Vec<(String, u64)>,
+    pub failures: Vec<df_db::plans::FailedOperationView>,
+}
+
+/// Report everything the current plan could not copy, and why.
+///
+/// A run over failing media finishes: per-file errors never abort it, which is
+/// what makes an old disk workable at all. The cost of that is that the run
+/// ends looking successful, and the operator has to be able to ask what did
+/// not make it. Every attempt and its error code were already recorded; this
+/// is what reads them back.
+pub fn execution_failure_report(project_dir: &Path) -> DfResult<ExecutionFailureReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+
+    let progress = df_db::plans::plan_progress(&db, plan.id)?;
+    // Bounded: a plan over a dying disk can fail as many times as it has
+    // files, and a caller asking what went wrong wants the shape of it.
+    let failures = df_db::plans::failed_operations(&db, plan.id, MAX_REPORTED_FAILURES)?;
+
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for failure in &failures {
+        *counts.entry(failure.error_code.clone()).or_default() += 1;
+    }
+    let mut by_error: Vec<(String, u64)> = counts.into_iter().collect();
+    by_error.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(ExecutionFailureReport {
+        plan_id: plan.id.to_string(),
+        failed_final: progress.failed_final,
+        failed_retryable: progress.failed_retryable,
+        by_error,
+        failures,
+    })
+}
+
+/// Failures listed in one report. The counts above are never truncated.
+const MAX_REPORTED_FAILURES: usize = 1_000;
+
 /// What the profile declined to read, and why.
 #[derive(Debug, Clone, Serialize)]
 pub struct HashExclusionReport {
@@ -3575,6 +3627,49 @@ mod tests {
     }
 
     #[test]
+    fn a_run_over_failing_media_finishes_and_says_what_it_could_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("bueno.txt"), b"se copia").unwrap();
+        std::fs::write(origin.join("roto.txt"), b"desaparece").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        // The disk loses one file between approval and the copy. This is what
+        // failing media looks like from the engine's side.
+        std::fs::remove_file(origin.join("roto.txt")).unwrap();
+
+        let outcome = execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        // The property that makes failing media workable: one unreadable file
+        // costs that file and nothing else. Both halves are asserted together,
+        // because either alone would pass for the wrong reason — a run that
+        // aborted, or one that quietly succeeded at nothing.
+        assert!(
+            outcome.failed_retryable + outcome.failed_final >= 1,
+            "the missing file must be recorded as a failure"
+        );
+        assert!(outcome.completed >= 1, "and the rest of the plan still ran");
+
+        let report = execution_failure_report(&req.project_dir).expect("failures");
+        assert_eq!(report.failures.len(), 1);
+        let failure = &report.failures[0];
+        assert!(failure.source_relative_path.contains("roto.txt"));
+        // Named by its cause, not merely counted: "one file failed" is not
+        // something an operator can act on.
+        assert_eq!(failure.error_code, "SOURCE_MISSING");
+        assert!(failure.attempts >= 1);
+        assert_eq!(report.by_error, vec![("SOURCE_MISSING".to_string(), 1)]);
+    }
+
+    #[test]
     fn a_delivery_package_covers_every_manifest_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
@@ -4432,9 +4527,9 @@ mod frozen_contracts {
         // precisely for this.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.7.0"
+            "dataforge.tool-surface/0.8.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 29, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 30, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling

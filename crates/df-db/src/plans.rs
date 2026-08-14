@@ -1119,6 +1119,79 @@ pub fn pending_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
         .map_err(db_err)
 }
 
+/// One operation that did not complete, and what stopped it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FailedOperationView {
+    /// Source path, as the manifest recorded it.
+    pub source_relative_path: String,
+    /// Where it would have gone.
+    pub destination_relative_path: String,
+    /// Current state: `FAILED_RETRYABLE` or `FAILED_FINAL`.
+    pub execution_state: String,
+    /// `SOURCE_MISSING`, `PERMISSION_DENIED`, `IO_ERROR`, …
+    pub error_code: String,
+    pub detail: String,
+    /// Attempts recorded for this operation.
+    pub attempts: u64,
+}
+
+/// Everything a plan could not copy, worst first.
+///
+/// An old disk is the normal case here, not the exception: a run over failing
+/// media completes — per-file errors never abort it — and then the operator
+/// has to find out what did not make it. The engine recorded every attempt and
+/// its error code from the start and never read them back, so the answer
+/// existed only in the log of the run that happened to be watched.
+///
+/// Final failures before retryable ones, because a caller asking what went
+/// wrong wants what will not fix itself.
+pub fn failed_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: usize,
+) -> DfResult<Vec<FailedOperationView>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(m.source_relative_path_exact, ''),
+                    COALESCE(m.destination_relative_path, ''),
+                    p.execution_state,
+                    COALESCE(r.error_code, 'UNKNOWN'),
+                    COALESCE(r.detail, ''),
+                    (SELECT COUNT(*) FROM operation_results a
+                      WHERE a.operation_id = p.id)
+             FROM plan_operations p
+             JOIN execution_manifest m ON m.operation_id = p.id
+             LEFT JOIN operation_results r ON r.id = (
+                 SELECT r2.id FROM operation_results r2
+                  WHERE r2.operation_id = p.id
+                  ORDER BY r2.finished_at DESC, r2.created_at DESC
+                  LIMIT 1
+             )
+             WHERE p.plan_id = ?1
+               AND p.execution_state IN ('FAILED_FINAL', 'FAILED_RETRYABLE')
+             ORDER BY CASE p.execution_state WHEN 'FAILED_FINAL' THEN 0 ELSE 1 END,
+                      m.source_relative_path_exact
+             LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![plan_id.to_string(), limit as i64], |row| {
+            Ok(FailedOperationView {
+                source_relative_path: row.get(0)?,
+                destination_relative_path: row.get(1)?,
+                execution_state: row.get(2)?,
+                error_code: row.get(3)?,
+                detail: row.get(4)?,
+                attempts: row.get::<_, i64>(5)? as u64,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
 /// One completed verification run, as recorded.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct VerificationRunView {

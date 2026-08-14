@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.7.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.8.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +223,11 @@ pub const TOOLS: &[Tool] = &[
         name: "destination_guarantees",
         capability: Capability::Observe,
         summary: "What the destination root guarantees about identity and safety.",
+    },
+    Tool {
+        name: "execution_failure_report",
+        capability: Capability::Observe,
+        summary: "What the plan could not copy, and why.",
     },
     Tool {
         name: "verify_audit",
@@ -553,6 +558,7 @@ pub fn report_collections(name: &str) -> Option<&'static [&'static str]> {
         "tree_relation_report" => &["relations"],
         "context_report" => &["generic_folders", "protected_folders"],
         "structural_anomaly_report" => &["anomalies"],
+        "execution_failure_report" => &["failures"],
         "structural_review_queue" => &["items"],
         _ => return None,
     })
@@ -706,6 +712,14 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
         "destination_guarantees" => {
             let input: ProjectInput = parse(name, input)?;
             encode(name, df_facade::destination_guarantees(&input.project_dir)?)
+        }
+        "execution_failure_report" => {
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::execution_failure_report(&input.project_dir)?,
+                input.window(),
+            )
         }
         "verify_audit" => {
             let input: ProjectInput = parse(name, input)?;
@@ -963,6 +977,7 @@ mod tests {
                 ("plan_destination_tree", Capability::Observe),
                 ("plan_space_preflight", Capability::Observe),
                 ("destination_guarantees", Capability::Observe),
+                ("execution_failure_report", Capability::Observe),
                 ("verify_audit", Capability::Observe),
                 ("content_search", Capability::Observe),
                 ("content_query", Capability::Observe),
@@ -981,7 +996,7 @@ mod tests {
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.7.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.8.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.
