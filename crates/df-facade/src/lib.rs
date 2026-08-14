@@ -989,8 +989,9 @@ pub fn open_project(project_dir: &Path) -> DfResult<ProjectStatus> {
 /// Cheap on purpose, and it did not use to be. This ran `PRAGMA
 /// integrity_check` on every call — a full pass over every page — so the one
 /// command an operator uses to watch a long stage was the one doing the most
-/// work, and it got slower exactly as the archive got bigger. On a 293 MB
-/// database mid-hash it did not return within five minutes.
+/// work, and it got slower exactly as the archive got bigger. Measured on a
+/// 293 MB database while a hash was running: **75 minutes 17 seconds** for one
+/// call that answers "how is it going?".
 ///
 /// Integrity is a question you ask deliberately: [`project_integrity`]. The
 /// `integrity` field is `Option` precisely because it was always meant to be
@@ -3697,8 +3698,8 @@ mod tests {
         // Found watching a real hash: `project_status` ran PRAGMA
         // integrity_check on every call — a pass over every page — so the
         // command an operator uses to see how a long stage is going was the
-        // one doing the most work, and got slower as the archive grew. On a
-        // 293 MB database mid-hash it did not return within five minutes.
+        // one doing the most work, and got slower as the archive grew.
+        // Measured on a 293 MB database mid-hash: 75 minutes 17 seconds.
         let tmp = tempfile::tempdir().unwrap();
         let req = request(tmp.path());
         create_project(&req, Actor::Test).unwrap();
