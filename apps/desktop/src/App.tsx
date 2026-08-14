@@ -2,17 +2,43 @@ import { useCallback, useEffect, useState } from "react";
 
 import {
   analyzeMedia,
+  analyzeProject,
   analyzeSimilarity,
+  approvePlan,
+  createPlan,
   createProject,
   engineVersion,
+  executePlan,
+  hashProject,
   openProject,
+  planDestinationTree,
   projectStatus,
+  scanProject,
+  verifyProject,
 } from "./api";
 import { ErrorAlert } from "./components/ErrorAlert";
+import { GuidedFlow } from "./screens/GuidedFlow";
 import { StatusView } from "./screens/StatusView";
+import type { Stage } from "./screens/resume";
 import { type ErrorDto, type ProjectStatus, isErrorDto } from "./types";
 
-type Screen = "home" | "create" | "open" | "status";
+/**
+ * The advanced screen runs the pipeline one stage at a time. Each entry is the
+ * facade command for that stage; the screen decides *which* stage the project
+ * can run next, and never invents one the engine would refuse.
+ */
+const STAGE_COMMANDS: Record<Stage, (projectDir: string) => Promise<unknown>> =
+  {
+    scan: scanProject,
+    hash: hashProject,
+    analyze: analyzeProject,
+    plan: createPlan,
+    approve: approvePlan,
+    execute: executePlan,
+    verify: verifyProject,
+  };
+
+type Screen = "home" | "guided" | "create" | "open" | "status";
 type BuiltInProfile = "generic" | "legal";
 
 interface CreateFormState {
@@ -91,6 +117,14 @@ export default function App(): React.JSX.Element {
     }
   }, [openPath, handleFailure]);
 
+  // Memoised on the directory alone: the preview component reloads whenever
+  // this identity changes, so a fresh closure per render would loop.
+  const projectDir = status?.project_dir ?? "";
+  const loadPlanTree = useCallback(
+    () => planDestinationTree(projectDir, 1),
+    [projectDir],
+  );
+
   const refreshStatus = useCallback(async () => {
     if (status === null) {
       return;
@@ -122,6 +156,31 @@ export default function App(): React.JSX.Element {
       setBusy(false);
     }
   }, [status, handleFailure]);
+
+  const runStage = useCallback(
+    async (stage: Stage) => {
+      if (status === null) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      try {
+        await STAGE_COMMANDS[stage](status.project_dir);
+      } catch (failure) {
+        handleFailure(failure);
+      } finally {
+        // The state moved even when the stage failed part way — a paused scan,
+        // a partial execution — so the screen must show where it actually is.
+        try {
+          setStatus(await projectStatus(status.project_dir));
+        } catch (failure) {
+          handleFailure(failure);
+        }
+        setBusy(false);
+      }
+    },
+    [status, handleFailure],
+  );
 
   const runMedia = useCallback(async () => {
     if (status === null) {
@@ -182,20 +241,20 @@ export default function App(): React.JSX.Element {
               <span className="step-number" aria-hidden="true">
                 2
               </span>
-              <h4>Deja que analice</h4>
+              <h4>Deja que los examine</h4>
               <p>
-                DataForge examina los archivos en modo solo lectura y guarda
-                cada evidencia en el proyecto.
+                Los lee sin modificarlos, identifica cada uno y encuentra las
+                copias repetidas.
               </p>
             </li>
             <li>
               <span className="step-number" aria-hidden="true">
                 3
               </span>
-              <h4>Revisa la evidencia</h4>
+              <h4>Recibe una copia ordenada</h4>
               <p>
-                Consulta duplicados, versiones y anomalías, y busca dentro del
-                contenido de tus archivos.
+                Se copia a la carpeta que elijas y se comprueba archivo por
+                archivo. Tus originales quedan intactos.
               </p>
             </li>
           </ol>
@@ -203,15 +262,41 @@ export default function App(): React.JSX.Element {
             <button
               type="button"
               className="primary"
-              onClick={() => setScreen("create")}
+              onClick={() => setScreen("guided")}
             >
-              Crear proyecto
+              Empezar
             </button>
             <button type="button" onClick={() => setScreen("open")}>
-              Abrir proyecto existente
+              Abrir un proyecto que ya tenía
             </button>
           </div>
+          <p className="hint">
+            <button
+              type="button"
+              className="linklike"
+              onClick={() => setScreen("create")}
+            >
+              Prefiero configurarlo yo (modo avanzado)
+            </button>
+          </p>
         </section>
+      )}
+
+      {screen === "guided" && (
+        <GuidedFlow
+          onOpenAdvanced={(dir) => {
+            setError(null);
+            setBusy(true);
+            projectStatus(dir)
+              .then((opened) => {
+                setStatus(opened);
+                setScreen("status");
+              })
+              .catch(handleFailure)
+              .finally(() => setBusy(false));
+          }}
+          onExit={goHome}
+        />
       )}
 
       {screen === "create" && (
@@ -295,9 +380,8 @@ export default function App(): React.JSX.Element {
                   aria-describedby="output-root-help"
                 />
                 <span id="output-root-help" className="field-help">
-                  Aquí escribirá DataForge los resultados en fases futuras;
-                  nunca toca tus originales. No puede estar dentro de las otras
-                  carpetas.
+                  Aquí escribirá DataForge la copia reconstruida; nunca toca tus
+                  originales. No puede estar dentro de las otras carpetas.
                 </span>
               </label>
               <label>
@@ -374,6 +458,8 @@ export default function App(): React.JSX.Element {
           onRefresh={() => void refreshStatus()}
           onAnalyzeSimilarity={() => void runSimilarity()}
           onAnalyzeMedia={() => void runMedia()}
+          onRunStage={(stage) => void runStage(stage)}
+          onLoadPlanTree={loadPlanTree}
           onBack={goHome}
         />
       )}

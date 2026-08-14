@@ -97,6 +97,19 @@ pub enum DuplicateKind {
     GenericToCanonical,
     /// Copies that exist only as replicas inside a backup container.
     BackupReplica,
+    /// A copy that lives inside a folder the engine has **proved** holds
+    /// nothing of its own — the contained side of a `TREE_EMBEDDED` relation,
+    /// whose `CHECK` enforces `unique_files = 0` — while the set's
+    /// representative lives outside it (ADR-0045).
+    ///
+    /// This is not an inference about context, it is a recorded proof: every
+    /// content of that subtree also exists in the outer one. Distinct from
+    /// [`DuplicateKind::UnknownContext`] precisely because §15.2 forbids
+    /// *inferring* redundancy, and here nothing is inferred.
+    ///
+    /// Never produced from a `PARTIAL_TREE_CLONE`: that relation has unique
+    /// content on both sides, which is the case §19.4 warns about.
+    ContainedTreeReplica,
     /// The relation between the copies' contexts could not be established.
     /// Conservative: treated as "do not touch".
     UnknownContext,
@@ -113,6 +126,7 @@ impl DuplicateKind {
             Self::AcrossProtectedContexts => "ACROSS_PROTECTED_CONTEXTS",
             Self::GenericToCanonical => "GENERIC_TO_CANONICAL",
             Self::BackupReplica => "BACKUP_REPLICA",
+            Self::ContainedTreeReplica => "CONTAINED_TREE_REPLICA",
             Self::UnknownContext => "UNKNOWN_CONTEXT",
             Self::ActiveToExcluded => "ACTIVE_TO_EXCLUDED",
         }
@@ -124,6 +138,7 @@ impl DuplicateKind {
             "ACROSS_PROTECTED_CONTEXTS" => Ok(Self::AcrossProtectedContexts),
             "GENERIC_TO_CANONICAL" => Ok(Self::GenericToCanonical),
             "BACKUP_REPLICA" => Ok(Self::BackupReplica),
+            "CONTAINED_TREE_REPLICA" => Ok(Self::ContainedTreeReplica),
             "UNKNOWN_CONTEXT" => Ok(Self::UnknownContext),
             "ACTIVE_TO_EXCLUDED" => Ok(Self::ActiveToExcluded),
             other => Err(df_error::DfError::Validation(format!(
@@ -190,6 +205,18 @@ pub fn decide(
     }
 
     // 4. Uncertainty preserves.
+    //
+    // `ContainedTreeReplica` is deliberately absent from this list, and that
+    // absence is the whole of ADR-0045. Everything here is a kind we could not
+    // establish; a contained tree replica is one the engine *proved*, through
+    // a `TREE_EMBEDDED` relation whose CHECK enforces `unique_files = 0`.
+    // §15.2 forbids inferring redundancy, not using a recorded proof of it.
+    //
+    // It therefore falls through to the policy match below, where only
+    // `CONSOLIDATE_ALL` acts on it: `CONSOLIDATE_WITHIN_CONTEXT` means one
+    // folder and this is by definition another, and
+    // `CONSOLIDATE_GENERIC_COPIES` only touches generic containers.
+    // Consolidation stays opt-in (ADR-0045 §4).
     if matches!(
         kind,
         DuplicateKind::UnknownContext | DuplicateKind::ActiveToExcluded

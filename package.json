@@ -1,7 +1,7 @@
 {
   "name": "dataforge-monorepo",
   "private": true,
-  "version": "0.2.0",
+  "version": "1.0.0",
   "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=20"

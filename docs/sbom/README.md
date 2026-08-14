@@ -28,6 +28,9 @@ fechadas en `deny.toml`.
 
 ## Firma
 
-La firma del SBOM y de los artefactos de release es un acto de publicación
-que requiere infraestructura de claves y autorización explícita; queda como
-paso del proceso de release, no del build local.
+El SBOM y los checksums de los binarios se firman en el job de release
+(ADR-0039): **Sigstore keyless**, sin claves privadas que custodiar — un
+certificado efímero liga la firma al repositorio, al workflow y al tag. El
+acto humano que la autoriza es empujar el tag; no es un paso del build local.
+Las instrucciones de verificación (`cosign verify-blob`) acompañan a cada
+release.

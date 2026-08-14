@@ -363,6 +363,22 @@ impl SafeOutputRoot {
     /// Fails on platforms without a safe implementation, so a caller can never
     /// execute believing it is protected when it is not.
     pub fn validate(path: &Path) -> FsResult<Self> {
+        Self::validate_inner(path, true)
+    }
+
+    /// Validate a root that must already exist, **creating nothing**.
+    ///
+    /// [`validate`] materialises the directory, which is right for an output
+    /// root the run is about to write into — and wrong for a source root,
+    /// where it would leave an empty tree behind and quietly mask that the
+    /// origin moved or its drive went away. Callers that only read must use
+    /// this: "the origin is only ever read" has to hold for the root itself,
+    /// not just for the file handles under it.
+    pub fn validate_existing(path: &Path) -> FsResult<Self> {
+        Self::validate_inner(path, false)
+    }
+
+    fn validate_inner(path: &Path, create_missing: bool) -> FsResult<Self> {
         if !cfg!(windows) {
             return Err(FsSafetyError::UnsupportedPlatform {
                 platform: std::env::consts::OS,
@@ -371,10 +387,20 @@ impl SafeOutputRoot {
         if !path.is_absolute() {
             return Err(FsSafetyError::InvalidRelativePath {
                 path: path.to_path_buf(),
-                reason: "the output root must be absolute".to_string(),
+                reason: "the root must be absolute".to_string(),
             });
         }
-        std::fs::create_dir_all(path).map_err(|e| FsSafetyError::io(path, e))?;
+        if create_missing {
+            std::fs::create_dir_all(path).map_err(|e| FsSafetyError::io(path, e))?;
+        } else if !path.is_dir() {
+            return Err(FsSafetyError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the root does not exist or is not a directory",
+                ),
+            ));
+        }
         if is_reparse_point(path)? {
             return Err(FsSafetyError::ReparsePoint {
                 path: path.to_path_buf(),
@@ -718,6 +744,57 @@ pub fn classify_filesystem(path: &Path) -> df_domain::FileSystemKind {
     {
         df_domain::FileSystemKind::Unknown
     }
+}
+
+/// Bytes still writable at `path`, or `None` where this build cannot ask.
+///
+/// `None` means **unknown**, never "none left" and never "plenty". A caller
+/// that cannot measure must not refuse work on that basis: refusing a run
+/// because the platform has no answer would turn a missing feature into a
+/// broken product, and the engine already stops cleanly on a real ENOSPC.
+///
+/// Measured for the calling process, so a volume with a per-user quota
+/// reports what this user may write rather than what the disk holds — which
+/// is the number that decides whether a copy finishes.
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        windows_available_bytes(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_available_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // The path need not exist for the API, but its directory must resolve, so
+    // walk up to the first ancestor that is actually there. A destination root
+    // about to be created is the normal case here.
+    let existing = path.ancestors().find(|candidate| candidate.exists())?;
+    let mut wide: Vec<u16> = existing.as_os_str().encode_wide().collect();
+    if wide.last() != Some(&(b'\\' as u16)) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
+
+    let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer that outlives the
+    // call, and the out parameter is a stack u64 the API writes at most once.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
 }
 
 #[cfg(windows)]
@@ -1430,6 +1507,27 @@ mod platform {
 mod tests {
     use super::*;
 
+    /// A source root is only ever read, and that has to include the root
+    /// itself: validating a vanished origin must report it, not recreate an
+    /// empty tree that hides the drive going away.
+    #[cfg(windows)]
+    #[test]
+    fn validating_an_absent_root_read_only_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("origen-que-ya-no-esta");
+
+        let refused = SafeOutputRoot::validate_existing(&missing);
+
+        assert!(refused.is_err(), "an absent root must be reported");
+        assert!(
+            !missing.exists(),
+            "read-only validation must not materialise the origin"
+        );
+        // The writable variant is what an output root wants, and it does create.
+        SafeOutputRoot::validate(&missing).unwrap();
+        assert!(missing.is_dir());
+    }
+
     #[test]
     fn relative_paths_reject_traversal_and_absolutes() {
         assert!(SafeRelativePath::parse(Path::new("a/b.txt")).is_ok());
@@ -1730,7 +1828,7 @@ mod tests {
             let link = tmp.path().join("link");
             std::fs::create_dir(&real).unwrap();
             if !make_junction(&link, &real) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
 
@@ -1883,7 +1981,7 @@ mod tests {
             let root = SafeOutputRoot::validate(&output).unwrap();
             let planted = output.join("claimed.tmp");
             if !make_junction(&planted, &outside) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
             let partial = SafeRelativePath::parse(Path::new("claimed.tmp")).unwrap();
@@ -1985,7 +2083,7 @@ mod tests {
             let root = SafeOutputRoot::validate(&output).unwrap();
             let planted = output.join("leased.tmp");
             if !make_junction(&planted, &outside) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
 
@@ -2008,7 +2106,7 @@ mod tests {
             let link = tmp.path().join("link");
             std::fs::create_dir(&real).unwrap();
             if !make_junction(&link, &real) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
             let err = SafeOutputRoot::validate(&link).unwrap_err();
@@ -2027,7 +2125,7 @@ mod tests {
             // out/clientes -> outside   (the attack from the threat model)
             let planted = out_dir.join("clientes");
             if !make_junction(&planted, &outside) {
-                eprintln!("SKIP: could not create a junction on this system");
+                skip_hardening("could not create a junction on this system");
                 return;
             }
 
@@ -2057,6 +2155,21 @@ mod tests {
             assert!(info[0].exists && info[0].is_dir && !info[0].is_reparse_point);
             assert!(!info[1].exists);
             assert!(!info[2].exists);
+        }
+
+        /// Skip a hardening test this environment genuinely cannot run — loudly.
+        ///
+        /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+        /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+        /// reports green having proved none of what these tests exist to prove,
+        /// which is worse than red: it looks like evidence.
+        #[cfg(windows)]
+        fn skip_hardening(reason: &str) {
+            assert!(
+                std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+                "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+            );
+            eprintln!("SKIP: {reason}");
         }
 
         /// Create a directory junction with the `mklink /J` shell builtin.

@@ -21,13 +21,21 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::glob_matches;
+
 use crate::{context::ContextKind, RuleDefinition};
 
 /// The declarative-profile schema identifier and version. Frozen for 1.0
 /// (M0.9): changing either requires a new version and an ADR, never an
 /// in-place edit.
+///
+/// `2.0.0` (M2.2, ADR-0040 §6) adds `destination_roots`. A **major** bump and
+/// not a minor one, even though `generic`'s output is unchanged: a 2.0 profile
+/// may declare roots a 1.x engine knows nothing about, and a 1.x engine would
+/// ignore the field and quietly produce different destination paths. Refusing
+/// to load is the only safe reading of a profile you cannot fully interpret.
 pub const PROFILE_SCHEMA: &str = "dataforge.profile";
-pub const PROFILE_SCHEMA_VERSION: &str = "1.1.0";
+pub const PROFILE_SCHEMA_VERSION: &str = "2.0.0";
 const SCHEMA: &str = PROFILE_SCHEMA;
 const SCHEMA_VERSION: &str = PROFILE_SCHEMA_VERSION;
 
@@ -99,6 +107,36 @@ pub struct ProtectedMarker {
     pub match_mode: MatchMode,
 }
 
+/// One destination root a profile declares (ADR-0040 §1).
+///
+/// Declared rather than hardcoded so that enriching the output does not mean
+/// growing a `match` in the planner — and so that the set is enumerable before
+/// a plan runs, which is what lets the reserved-name check see every root
+/// instead of the three that happened to be constants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationRootDef {
+    /// Stable identifier, independent of the folder name. This is what gets
+    /// persisted as routing provenance, so renaming `folder` never rewrites
+    /// the history of plans made before the rename.
+    pub id: String,
+    /// Literal directory name created under the output root. `null` routes to
+    /// the output root itself — the working archive.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Whether what lands here belongs to the working archive or is set aside
+    /// from it. Reports and presentation read this; routing does not.
+    #[serde(default)]
+    pub set_aside: bool,
+}
+
+/// The root ids the engine can route into, and therefore the ones every
+/// profile has to declare.
+///
+/// Checked at load time and fail-closed: a profile that omits one would send
+/// an operation to a root that does not exist, and the failure would surface
+/// as a broken plan over a real archive rather than as a rejected profile.
+pub const REQUIRED_DESTINATION_ROOTS: &[&str] = &["active", "review", "separated", "temporary"];
+
 /// A parsed, resolved profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -118,9 +156,146 @@ pub struct Profile {
     /// every match remains evidence even when human review overrides it.
     #[serde(default)]
     pub rules: Vec<RuleDefinition>,
+    /// The destination roots this profile routes into, in presentation order.
+    ///
+    /// Not `#[serde(default)]`: a profile that forgot to declare them would
+    /// silently inherit whatever the engine assumed, which is the coupling
+    /// ADR-0040 exists to remove. `generic` declares exactly the four the 1.x
+    /// engine hardcoded, so its output is unchanged byte for byte.
+    pub destination_roots: Vec<DestinationRootDef>,
+    /// Occurrences this profile declines to hash.
+    ///
+    /// Reading 443 GB of video to prove it is video costs hours and answers
+    /// nothing, so a profile may name material the identity pipeline should
+    /// skip. The file is still **inventoried**, and its exclusion is recorded
+    /// with the rule that caused it: RFC-0001's coverage criterion asks that
+    /// nothing be left without representation *or reason*, and this gives it a
+    /// reason. Excluded is not discarded, and the origin is untouched either
+    /// way.
+    #[serde(default)]
+    pub hash_exclusions: Vec<HashExclusion>,
+}
+
+/// One declared reason not to hash something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HashExclusion {
+    pub id: String,
+    /// Why, in the operator's words. Stored with every exclusion it causes,
+    /// because "this was not read" is only acceptable if it comes with why.
+    pub reason: String,
+    pub r#match: ExclusionMatch,
+}
+
+/// What an exclusion matches. Every field that is present must match.
+///
+/// At least one must be present. An exclusion with no criteria matches the
+/// entire archive, and a profile that silently declined to read anything is
+/// the worst failure this engine could have — so it is rejected at load
+/// rather than trusted to be intentional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusionMatch {
+    /// Glob over the path relative to its source root, compared case
+    /// insensitively. This is what names a folder — the case `file_name_glob`
+    /// cannot express.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    #[serde(default)]
+    pub file_name_glob: Option<String>,
+    /// Size at or above which this matches. What makes "heavy media"
+    /// expressible without guessing from the extension.
+    #[serde(default)]
+    pub min_size_bytes: Option<u64>,
+}
+
+impl ExclusionMatch {
+    /// Whether this matcher names anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.path_glob.is_none() && self.file_name_glob.is_none() && self.min_size_bytes.is_none()
+    }
+
+    /// Whether an occurrence matches. Conjunctive: every declared criterion
+    /// has to hold, so adding one always narrows and never widens.
+    pub fn matches(&self, relative_path: &str, file_name: &str, size_bytes: u64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        if let Some(glob) = &self.path_glob {
+            if !glob_matches(&glob.to_lowercase(), &relative_path.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(glob) = &self.file_name_glob {
+            if !glob_matches(&glob.to_lowercase(), &file_name.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(minimum) = self.min_size_bytes {
+            if size_bytes < minimum {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Profile {
+    /// Reject a declared root set the planner could not route with.
+    ///
+    /// Fail-closed on every count. A missing root would send an operation to a
+    /// place that does not exist; a duplicate id would make provenance
+    /// ambiguous; a duplicate folder would put two meanings in one directory;
+    /// and a folder name with a separator in it would escape the output root,
+    /// which is the one thing the filesystem boundary must never allow.
+    fn validate_destination_roots(&self) -> df_error::DfResult<()> {
+        let id = &self.id;
+        let mut ids = std::collections::HashSet::new();
+        let mut folders = std::collections::HashSet::new();
+        for root in &self.destination_roots {
+            if root.id.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares a destination root with an empty id"
+                )));
+            }
+            if !ids.insert(root.id.as_str()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares destination root `{}` more than once",
+                    root.id
+                )));
+            }
+            let Some(folder) = &root.folder else {
+                continue;
+            };
+            if folder.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` gives destination root `{}` an empty folder; use null for \
+                     the working archive",
+                    root.id
+                )));
+            }
+            if folder.contains(['/', '\\']) || folder.contains("..") {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares destination root folder `{folder}`, which is not a \
+                     single directory name"
+                )));
+            }
+            if !folders.insert(folder.to_lowercase()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` maps two destination roots onto folder `{folder}`"
+                )));
+            }
+        }
+        for required in REQUIRED_DESTINATION_ROOTS {
+            if !ids.contains(required) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` does not declare the required destination root `{required}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Load a built-in profile by id, resolving inheritance.
     ///
     /// Unknown ids are rejected. Falling back to [`DEFAULT_PROFILE_ID`] would
@@ -211,7 +386,50 @@ impl Profile {
                 )));
             }
         }
+        profile.validate_destination_roots()?;
+        profile.validate_hash_exclusions()?;
         Ok(profile)
+    }
+
+    /// Reject an exclusion that would decline to read the archive.
+    ///
+    /// Fail-closed, and this one is not a formality. A matcher with no
+    /// criteria matches everything, so a profile carrying one would inventory
+    /// a 443 GB archive, hash none of it, and produce a plan that looks
+    /// finished. That failure is silent by construction — there is no error to
+    /// notice — which is exactly why it has to be impossible to load rather
+    /// than merely unlikely to be written.
+    fn validate_hash_exclusions(&self) -> df_error::DfResult<()> {
+        let id = &self.id;
+        let mut ids = std::collections::HashSet::new();
+        for exclusion in &self.hash_exclusions {
+            if exclusion.id.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` has a hash exclusion with no id"
+                )));
+            }
+            if !ids.insert(exclusion.id.as_str()) {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` declares hash exclusion `{}` twice",
+                    exclusion.id
+                )));
+            }
+            if exclusion.reason.trim().is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` hash exclusion `{}` has no reason; material that \
+                     was never read must say why",
+                    exclusion.id
+                )));
+            }
+            if exclusion.r#match.is_empty() {
+                return Err(df_error::DfError::Validation(format!(
+                    "profile `{id}` hash exclusion `{}` matches on nothing, which would \
+                     exclude the entire archive",
+                    exclusion.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Ids of every profile shipped with this build.
@@ -466,5 +684,191 @@ mod tests {
             .rules
             .iter()
             .all(|rule| rule.action.operation_type().is_executable()));
+    }
+
+    /// A profile with a valid root set, to mutate in the rejection tests.
+    fn profile_with_roots(roots: Vec<DestinationRootDef>) -> Profile {
+        let mut profile = Profile::load(DEFAULT_PROFILE_ID).expect("generic loads");
+        profile.destination_roots = roots;
+        profile
+    }
+
+    fn root(id: &str, folder: Option<&str>) -> DestinationRootDef {
+        DestinationRootDef {
+            id: id.to_string(),
+            folder: folder.map(str::to_string),
+            set_aside: false,
+        }
+    }
+
+    fn full_set() -> Vec<DestinationRootDef> {
+        vec![
+            root("active", None),
+            root("review", Some("90_DataForge_Review")),
+            root("separated", Some("95_DataForge_Separated")),
+            root("temporary", Some("98_DataForge_Temporary")),
+        ]
+    }
+
+    #[test]
+    fn every_built_in_profile_declares_every_routable_root() {
+        // The planner routes by id. A profile missing one would send an
+        // operation to a root that does not exist, and over a real archive
+        // that surfaces as a broken plan rather than as a rejected profile.
+        for id in Profile::built_in_ids() {
+            let profile = Profile::load(id).unwrap_or_else(|e| panic!("profile `{id}`: {e}"));
+            for required in REQUIRED_DESTINATION_ROOTS {
+                assert!(
+                    profile
+                        .destination_roots
+                        .iter()
+                        .any(|root| root.id == *required),
+                    "profile `{id}` does not declare root `{required}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_required_root_is_rejected() {
+        let mut roots = full_set();
+        roots.retain(|root| root.id != "review");
+        let error = profile_with_roots(roots)
+            .validate_destination_roots()
+            .expect_err("a set without `review` cannot route a review copy");
+        assert!(error.to_string().contains("review"), "{error}");
+    }
+
+    #[test]
+    fn a_duplicate_root_id_is_rejected() {
+        // Two roots with one id make the recorded provenance ambiguous: the
+        // column would no longer identify where something landed.
+        let mut roots = full_set();
+        roots.push(root("review", Some("otra_carpeta")));
+        let error = profile_with_roots(roots)
+            .validate_destination_roots()
+            .expect_err("an id declared twice is ambiguous");
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn two_roots_cannot_share_one_folder() {
+        // Two meanings in one directory: nothing downstream could tell which
+        // root a file in it came from.
+        let mut roots = full_set();
+        roots.push(root("extra", Some("90_dataforge_review")));
+        let error = profile_with_roots(roots)
+            .validate_destination_roots()
+            .expect_err("two roots mapping onto one folder is ambiguous");
+        assert!(
+            error.to_string().contains("two destination roots"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_root_folder_must_be_a_single_directory_name() {
+        // The one that matters for safety: a folder carrying a separator or a
+        // parent reference would place a root outside the output root, which
+        // is the boundary the whole engine rests on.
+        for escaping in ["a/b", "a\\b", "..", "../fuera"] {
+            let mut roots = full_set();
+            roots.push(root("escapa", Some(escaping)));
+            let error = profile_with_roots(roots)
+                .validate_destination_roots()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("single directory name"),
+                "`{escaping}` was accepted as a root folder: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_folder_name_is_rejected_but_null_is_the_archive() {
+        let mut roots = full_set();
+        roots.push(root("vacia", Some("   ")));
+        assert!(profile_with_roots(roots)
+            .validate_destination_roots()
+            .is_err());
+
+        // `null` is how a root says "the output root itself", and `active`
+        // uses it, so it has to stay valid.
+        assert!(profile_with_roots(full_set())
+            .validate_destination_roots()
+            .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod exclusion_tests {
+    use super::*;
+
+    fn profile_with(exclusions: Vec<HashExclusion>) -> Profile {
+        let mut profile = Profile::load("generic").expect("generic loads");
+        profile.hash_exclusions = exclusions;
+        profile
+    }
+
+    #[test]
+    fn an_exclusion_that_matches_nothing_in_particular_is_refused() {
+        // It would match every file, so a profile carrying one would inventory
+        // an archive, read none of it, and look finished. There is no error to
+        // notice at run time, which is why it must not be loadable.
+        let error = profile_with(vec![HashExclusion {
+            id: "everything".to_string(),
+            reason: "oops".to_string(),
+            r#match: ExclusionMatch::default(),
+        }])
+        .validate_hash_exclusions()
+        .expect_err("a matcher with no criteria is not a matcher");
+        assert!(error.to_string().contains("entire archive"));
+    }
+
+    #[test]
+    fn an_exclusion_without_a_reason_is_refused() {
+        let error = profile_with(vec![HashExclusion {
+            id: "silent".to_string(),
+            reason: "  ".to_string(),
+            r#match: ExclusionMatch {
+                file_name_glob: Some("*.mp4".to_string()),
+                ..ExclusionMatch::default()
+            },
+        }])
+        .validate_hash_exclusions()
+        .expect_err("material never read must say why");
+        assert!(error.to_string().contains("no reason"));
+    }
+
+    #[test]
+    fn every_declared_criterion_has_to_hold() {
+        // Conjunctive, so adding a criterion always narrows. If it widened,
+        // a rule meant for large videos would start taking small ones.
+        let matcher = ExclusionMatch {
+            file_name_glob: Some("*.mp4".to_string()),
+            min_size_bytes: Some(1000),
+            ..ExclusionMatch::default()
+        };
+        assert!(matcher.matches("a/b/vista.mp4", "vista.mp4", 2000));
+        assert!(
+            !matcher.matches("a/b/vista.mp4", "vista.mp4", 999),
+            "too small"
+        );
+        assert!(
+            !matcher.matches("a/b/nota.txt", "nota.txt", 2000),
+            "wrong name"
+        );
+        // Case-insensitive, because Windows paths are.
+        assert!(matcher.matches("A/B/VISTA.MP4", "VISTA.MP4", 2000));
+    }
+
+    #[test]
+    fn a_path_glob_names_a_folder_that_a_file_name_glob_cannot() {
+        let matcher = ExclusionMatch {
+            path_glob: Some("TomTom*".to_string()),
+            ..ExclusionMatch::default()
+        };
+        assert!(matcher.matches("TomTom/HOME/mapa.dat", "mapa.dat", 10));
+        assert!(!matcher.matches("asunto/escrito.pdf", "escrito.pdf", 10));
     }
 }

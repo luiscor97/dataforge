@@ -133,7 +133,10 @@ impl RuleDefinition {
     }
 }
 
-fn glob_matches(pattern: &str, value: &str) -> bool {
+/// Shared with `profile`, so an exclusion glob and a rule glob mean exactly
+/// the same thing. Two implementations would eventually disagree on a corner
+/// and nobody would notice until a file was silently skipped.
+pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let value: Vec<char> = value.chars().collect();
     let mut previous = vec![false; value.len() + 1];

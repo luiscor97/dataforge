@@ -111,6 +111,13 @@ pub struct ExecuteOutcome {
     pub pending: u64,
     pub bytes_copied: u64,
     pub cancelled: bool,
+    /// The run stopped because the destination volume filled up.
+    ///
+    /// Distinguishable from an ordinary pause so a caller can say what
+    /// happened instead of reporting an unexplained pile of retryable
+    /// failures. The operations left untouched stay `PENDING`, and the one
+    /// that hit the wall stays `FAILED_RETRYABLE`: free space and re-run.
+    pub out_of_space: bool,
     /// Project state after the run: `EXECUTED` when every operation reached
     /// a terminal state, `EXECUTION_PAUSED` when work remains.
     pub state: String,
@@ -226,20 +233,28 @@ pub fn execute_plan(
     if !recovering_executing {
         repository::update_project_state(db, ProjectState::Executing, actor)?;
     }
+    // EXECUTING is a durable state that outlives the process holding it, which
+    // is why recovering from it is a decision the caller has to make. Recording
+    // who is copying makes that decision an informed one instead of a bet.
+    df_db::liveness::claim(db, project.id, df_db::liveness::RunStage::Execute, actor)?;
 
     // Sequential by default; the strict-parallel path (design §2/§10) runs
     // only when more than one worker is requested and is proven byte-identical
     // to the sequential path by the determinism tests. Both share the exact
     // per-file protocol (prepare/claim/finish) and per-operation recovery.
     let workers = resolve_workers(options.workers);
+    let target = RunTarget {
+        project_id: project.id,
+        plan_id: plan.id,
+    };
     let mut stages = StageNanos::default();
-    let (bytes_copied, cancelled, any_attempted) = if workers <= 1 {
-        run_sequential(db, &safe_root, plan.id, options, cancel, &mut stages)?
+    let (bytes_copied, cancelled, any_attempted, out_of_space) = if workers <= 1 {
+        run_sequential(db, &safe_root, target, options, cancel, &mut stages)?
     } else {
         run_parallel(
             db,
             &safe_root,
-            plan.id,
+            target,
             workers,
             options,
             cancel,
@@ -247,6 +262,7 @@ pub fn execute_plan(
         )?
     };
 
+    df_db::liveness::release(db, project.id)?;
     let progress = plans::plan_progress(db, plan.id)?;
     let all_terminal =
         progress.pending == 0 && progress.running == 0 && progress.failed_retryable == 0;
@@ -263,6 +279,7 @@ pub fn execute_plan(
         "pending": progress.pending,
         "bytes_copied": bytes_copied,
         "cancelled": cancelled,
+        "out_of_space": out_of_space,
     });
     // Only the zero-work recovery path can represent the legacy crash window
     // between a terminal milestone and the old separate state transition.
@@ -288,6 +305,7 @@ pub fn execute_plan(
         pending: progress.pending + progress.running,
         bytes_copied,
         cancelled,
+        out_of_space,
         state: project.state.as_str().to_string(),
         stage_nanos: stages,
     })
@@ -296,17 +314,31 @@ pub fn execute_plan(
 /// The original single-writer execution loop: reclaim, lease, run, record, one
 /// operation at a time. `workers <= 1` uses this untouched path. Returns
 /// (bytes copied, cancelled, whether any operation was attempted).
+/// What a run is working on: the project that owns it and the plan it
+/// executes. Passed together because neither is meaningful here without the
+/// other — the plan says what to do, the project says whose heartbeat it is.
+#[derive(Clone, Copy)]
+struct RunTarget {
+    project_id: df_domain::ProjectId,
+    plan_id: df_domain::PlanId,
+}
+
 fn run_sequential(
     db: &mut Db,
     safe_root: &SafeOutputRoot,
-    plan_id: df_domain::PlanId,
+    target: RunTarget,
     options: &ExecuteOptions,
     cancel: Option<&AtomicBool>,
     stages: &mut StageNanos,
-) -> DfResult<(u64, bool, bool)> {
+) -> DfResult<(u64, bool, bool, bool)> {
+    let RunTarget {
+        project_id,
+        plan_id,
+    } = target;
     let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut bytes_copied: u64 = 0;
     let mut cancelled = false;
+    let mut out_of_space = false;
     let mut buffer = vec![0u8; options.copy_buffer_bytes];
     'run: loop {
         let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
@@ -354,9 +386,23 @@ fn run_sequential(
             plans::record_operation_outcome(db, operation.operation_id, &outcome)?;
             stages.persist_result += nanos_since(persist_started);
             stages.operations += 1;
+            // A full destination is the run's problem, not this operation's.
+            // Carrying on would attempt every remaining copy — at millions of
+            // files, hours of guaranteed failure that bury the one fact the
+            // user needs. Stopping leaves the rest PENDING, which is exactly
+            // what resuming after freeing space picks up.
+            if outcome.error_code == Some(OperationErrorCode::NoSpace) {
+                out_of_space = true;
+                break 'run;
+            }
         }
+        // One beat per batch, not per operation: at 197k operations a
+        // per-file heartbeat costs more writes than the work it reports on.
+        // The claim and release live in `execute_plan`; only the sign of life
+        // belongs in the loop that actually makes progress.
+        df_db::liveness::beat(db, project_id)?;
     }
-    Ok((bytes_copied, cancelled, !attempted.is_empty()))
+    Ok((bytes_copied, cancelled, !attempted.is_empty(), out_of_space))
 }
 
 /// Strict-parallel execution (design §2/§10). A single coordinator owns the
@@ -372,12 +418,16 @@ fn run_sequential(
 fn run_parallel(
     db: &mut Db,
     safe_root: &SafeOutputRoot,
-    plan_id: df_domain::PlanId,
+    target: RunTarget,
     workers: usize,
     options: &ExecuteOptions,
     cancel: Option<&AtomicBool>,
     stages: &mut StageNanos,
-) -> DfResult<(u64, bool, bool)> {
+) -> DfResult<(u64, bool, bool, bool)> {
+    let RunTarget {
+        project_id,
+        plan_id,
+    } = target;
     use dest_exclusion::DestinationGuard;
     use std::sync::mpsc;
 
@@ -394,7 +444,7 @@ fn run_parallel(
         stages,
         &mut attempted,
     )? {
-        return Ok((bytes_copied, true, !attempted.is_empty()));
+        return Ok((bytes_copied, true, !attempted.is_empty(), false));
     }
 
     // Worker → coordinator messages, and coordinator → worker work items.
@@ -675,6 +725,11 @@ fn run_parallel(
                         stages.persist_result += nanos_since(persist_started);
                         stages.operations += pending_results.len() as u64;
                         pending_results.clear();
+                        // The coordinator is the only thread touching the
+                        // database, so this is where a sign of life belongs —
+                        // and it beats for committed work, never for work in
+                        // flight.
+                        df_db::liveness::beat(db, project_id)?;
                     }
                     // No destination is held now, so any deferred op can be
                     // re-offered. Otherwise we are done.
@@ -763,7 +818,13 @@ fn run_parallel(
         Ok(bytes_copied)
     })?;
 
-    Ok((bytes, cancelled, !attempted.is_empty()))
+    // The parallel coordinator does not yet stop the whole run on ENOSPC the
+    // way the sequential path does: its workers are already in flight when the
+    // first NO_SPACE lands. Reporting `false` is the honest reading — the run
+    // did not stop *for* a full disk — and the operations still fail
+    // retryably, so nothing is lost and resuming after freeing space works.
+    // Making it stop early is a follow-up, tracked in the PR.
+    Ok((bytes, cancelled, !attempted.is_empty(), false))
 }
 
 fn execution_source_roots(
@@ -1708,6 +1769,48 @@ struct StreamedCopy {
     sync_nanos: u64,
 }
 
+/// Test-only fault injection for a full destination volume.
+///
+/// ENOSPC is the likeliest failure in production and the executor now stops
+/// the whole run on it, so that rule needs a test that drives the real loop —
+/// not one that only checks the error mapping. Filling a real volume is not
+/// something a unit test can do portably, so the write is made to fail here
+/// instead. Thread-local, so tests running in parallel cannot see each other's
+/// injection.
+///
+/// Gated on `windows` to match the test module below: off Windows the executor
+/// refuses to run at all (ADR-0017), so nothing would call this and it would
+/// be dead code under `-D warnings`.
+#[cfg(all(test, windows))]
+mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COPIES_UNTIL_DISK_FULL: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let `copies` copies through, then fail every later write with ENOSPC.
+    pub(super) fn fill_disk_after(copies: usize) {
+        COPIES_UNTIL_DISK_FULL.with(|cell| cell.set(Some(copies)));
+    }
+
+    pub(super) fn clear() {
+        COPIES_UNTIL_DISK_FULL.with(|cell| cell.set(None));
+    }
+
+    /// True once the injected budget is spent. Consumes one copy otherwise.
+    pub(super) fn disk_is_full() -> bool {
+        COPIES_UNTIL_DISK_FULL.with(|cell| match cell.get() {
+            None => false,
+            Some(0) => true,
+            Some(remaining) => {
+                cell.set(Some(remaining - 1));
+                false
+            }
+        })
+    }
+}
+
 /// Stream the source into an already-opened partial, hashing as we go.
 ///
 /// The writer arrives from `df-fs-safety::create_partial_secure`, so this
@@ -1718,6 +1821,13 @@ fn stream_copy(
     mut writer: std::fs::File,
     buffer: &mut [u8],
 ) -> std::io::Result<StreamedCopy> {
+    #[cfg(all(test, windows))]
+    if fault::disk_is_full() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "injected: no space left on device",
+        ));
+    }
     let mut reader = std::fs::File::open(source)?;
     let mut sha = sha2::Sha256::new();
     let mut blake = blake3::Hasher::new();
@@ -2272,6 +2382,21 @@ mod tests {
         (partial, identity)
     }
 
+    /// Skip a hardening test this environment genuinely cannot run — loudly.
+    ///
+    /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+    /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+    /// reports green having proved none of what these tests exist to prove,
+    /// which is worse than red: it looks like evidence.
+    #[cfg(windows)]
+    fn skip_hardening(reason: &str) {
+        assert!(
+            std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+            "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+        );
+        eprintln!("SKIP: {reason}");
+    }
+
     /// Create a directory junction with `mklink /J`. Returns false when the
     /// environment forbids it, so a test can skip *loudly* (the encargo
     /// forbids silent passes).
@@ -2302,7 +2427,7 @@ mod tests {
         std::fs::create_dir_all(&fx.output).unwrap();
         let planted = fx.output.join("origen");
         if !make_junction(&planted, &outside) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -2346,7 +2471,7 @@ mod tests {
         std::fs::rename(&fx.origin, &saved_origin).unwrap();
         std::fs::create_dir_all(&fx.output).unwrap();
         if !make_junction(&fx.origin, &fx.output) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -3078,7 +3203,7 @@ mod tests {
         let outside = tmp.path().join("outside-partial-target");
         std::fs::create_dir(&outside).unwrap();
         if !make_junction(&planted, &outside) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -3176,5 +3301,89 @@ mod tests {
         assert!(types.contains(&"PLAN_APPROVED"));
         assert!(types.contains(&"EXECUTION_COMPLETED"));
         df_ledger::verify_chain(&events).expect("ledger stays valid");
+    }
+
+    // --- A full destination volume (ENOSPC) --------------------------------
+    //
+    // The likeliest failure when copying a real archive, and until now the
+    // least covered: the mapping existed but nothing exercised it, and the run
+    // loop treated a full disk as one operation's bad luck.
+
+    #[test]
+    fn a_full_destination_maps_to_a_retryable_no_space_failure() {
+        let failure = OperationFailure::from_io(
+            &std::io::Error::new(std::io::ErrorKind::StorageFull, "disk full"),
+            "copying",
+        );
+        assert_eq!(failure.code, OperationErrorCode::NoSpace);
+        // Retryable, not final: freeing space and re-running is the fix, and a
+        // FAILED_FINAL operation would never be attempted again.
+        assert_eq!(failure.state, ExecutionState::FailedRetryable);
+        assert!(!failure.retain_partial_lease);
+    }
+
+    #[test]
+    fn a_full_destination_stops_the_run_instead_of_grinding_through_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        fault::fill_disk_after(1);
+        let outcome = execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None);
+        fault::clear();
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.out_of_space, "the run must report why it stopped");
+        assert_eq!(outcome.state, "EXECUTION_PAUSED");
+        // Exactly one copy hit the wall. The remaining copies were never
+        // attempted, which is the whole point: at a million files, attempting
+        // them costs hours and teaches nobody anything.
+        assert_eq!(outcome.failed_retryable, 1);
+        assert!(
+            outcome.pending > 0,
+            "later operations must be left PENDING, not failed"
+        );
+        // Exactly the one copy that ran before the wall is on disk. The
+        // fixture has three; the other two were never attempted.
+        let copied = ["a.txt", "sub/b.txt", "c.txt"]
+            .into_iter()
+            .filter(|relative| fx.output.join("origen").join(relative).exists())
+            .count();
+        assert_eq!(copied, 1, "only the copy before the wall may exist");
+        // Space is not made worse: the doomed partial is cleaned up.
+        assert!(no_partials_left(&fx.output));
+    }
+
+    #[test]
+    fn freeing_space_and_running_again_finishes_the_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        fault::fill_disk_after(1);
+        let stopped = execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None);
+        fault::clear();
+        assert!(stopped.unwrap().out_of_space);
+
+        // "Free space and try again" has to actually work, including for the
+        // operation that failed: it is FAILED_RETRYABLE, so it comes back.
+        let resumed =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert!(!resumed.out_of_space);
+        assert_eq!(resumed.state, "EXECUTED");
+        assert_eq!(resumed.failed_retryable, 0);
+        assert_eq!(
+            std::fs::read(fx.output.join("origen").join("a.txt")).unwrap(),
+            b"same bytes"
+        );
+        assert!(no_partials_left(&fx.output));
+    }
+
+    #[test]
+    fn a_run_that_never_fills_the_disk_does_not_claim_it_did() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+        let outcome =
+            execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None).unwrap();
+        assert!(!outcome.out_of_space);
+        assert_eq!(outcome.state, "EXECUTED");
     }
 }

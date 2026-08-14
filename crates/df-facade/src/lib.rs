@@ -18,19 +18,26 @@ use df_db::extraction::{
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
 use df_domain::{
-    Actor, ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus,
-    FileFingerprint, MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId,
-    SnapshotId, SourceRoot, TreeCloneSet,
+    ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus, FileFingerprint,
+    MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId, SnapshotId,
+    SourceRoot, TreeCloneSet,
 };
 use sha2::{Digest, Sha256};
 
+/// Re-exported for the same reason as [`DuplicatePolicy`]: every facade call
+/// that changes state takes an [`Actor`], so a client that cannot name one
+/// cannot use the facade without reaching past it to `df-domain`.
+pub use df_domain::Actor;
 /// Re-exported so clients can name a policy without depending on `df-domain`
 /// (RFC-0001 rules 16/17: clients only ever talk to the facade).
 pub use df_domain::DuplicatePolicy;
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
-pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
+pub use df_db::analysis::{
+    AnomalyReport, ReviewClass, ReviewClassSummary, ReviewDecisionInput, ReviewItemView,
+    ReviewQueue, StructuralDiagnostics,
+};
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOptions;
 pub use df_executor::ExecuteOutcome;
@@ -39,6 +46,9 @@ mod ai_transport;
 mod secrets;
 
 pub use df_db::assistance::AssistanceAuditView;
+pub use df_db::inventory::{NameCollision, NameCollisionReport};
+pub use df_db::liveness::{RunLiveness, RunStage};
+pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
 pub use df_plugin::{
@@ -135,6 +145,10 @@ pub struct ProjectStatus {
     pub media: Option<MediaStatusReport>,
     /// Present when an integrity pass was executed (project_status).
     pub integrity: Option<IntegrityReport>,
+    /// The run holding this project, if one claimed it. Evidence only — who,
+    /// from where, and how long since it last said anything. It carries no
+    /// alive/dead verdict, because that is not a fact this database can hold.
+    pub active_run: Option<df_db::liveness::RunLiveness>,
 }
 
 /// Compact, human-readable relation. It is evidence only: `automatic_action`
@@ -609,6 +623,7 @@ fn status_from_db(
         similarity,
         media,
         integrity,
+        active_run: df_db::liveness::liveness(db, project.id)?,
     })
 }
 
@@ -1617,7 +1632,10 @@ fn read_verified_source(
 ) -> DfResult<VerifiedSource> {
     let relative = raw_source_relative(source)?;
     let safe_relative = df_fs_safety::SafeRelativePath::parse(&relative)?;
-    let safe_root = df_fs_safety::SafeOutputRoot::validate(&source.root_path)?;
+    // Read-only validation: this is a *source* root. `validate` would create
+    // the directory, leaving an empty tree where the origin used to be and
+    // hiding the fact that it moved or its drive is gone.
+    let safe_root = df_fs_safety::SafeOutputRoot::validate_existing(&source.root_path)?;
     let lease = safe_root.lease_existing_file(&safe_relative)?;
     let path = lease.path().to_path_buf();
     let stored = FileFingerprint::parse(&source.fingerprint)?;
@@ -2100,6 +2118,43 @@ pub fn create_plan(
     df_planner::create_plan(&mut db, actor, policy)
 }
 
+/// The output tree the current plan would produce, `depth` levels deep.
+///
+/// Read-only. Answers the question the counts cannot: *where does my data
+/// end up*. Available from `PLAN_READY` onwards, so the tree can be judged
+/// before approving a manifest that freezes it.
+pub fn plan_destination_tree(project_dir: &Path, depth: u32) -> DfResult<PlanDestinationTree> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let tree = df_db::plans::destination_tree(&db, plan.id, depth)?;
+    Ok(PlanDestinationTree {
+        plan_id: plan.id.to_string(),
+        version: plan.version,
+        output_root: project.output_root.display().to_string(),
+        files: tree.files,
+        directories: tree.directories,
+        bytes: tree.bytes,
+        without_destination: tree.without_destination,
+        nodes: tree
+            .nodes
+            .into_iter()
+            .map(|n| PlanDestinationNode {
+                prefix: n.prefix,
+                depth: n.depth,
+                files: n.files,
+                directories: n.directories,
+                bytes: n.bytes,
+                by_operation: n.by_operation,
+                sample: n.sample,
+            })
+            .collect(),
+    })
+}
+
 /// Re-run the §26.5 invariants against the stored current plan.
 pub fn validate_plan(project_dir: &Path) -> DfResult<PlanValidationReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2115,6 +2170,34 @@ pub fn approve_plan(project_dir: &Path, actor: Actor) -> DfResult<ApproveOutcome
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
     df_planner::approve_plan(&mut db, actor)
+}
+
+/// What the project's destination filesystem can and cannot guarantee.
+///
+/// A caller that offers to execute needs this *before* asking the user to
+/// commit: on a network share or a FAT variant the executor refuses without
+/// an explicit acknowledgement (ADR-0036), and discovering that only after
+/// the copy has run for an hour is a worse way to learn it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DestinationGuarantees {
+    /// `NTFS`, `REFS`, `FAT32`, `EXFAT`, `NETWORK` or `UNKNOWN`.
+    pub filesystem: String,
+    /// False when the volume offers no physical identity, so substitution
+    /// detection and the strong-identity leases are degraded (ADR-0036).
+    pub has_physical_identity: bool,
+}
+
+/// Classify the project's output root (read-only; touches no state).
+pub fn destination_guarantees(project_dir: &Path) -> DfResult<DestinationGuarantees> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let kind = df_fs_safety::classify_filesystem(&project.output_root);
+    Ok(DestinationGuarantees {
+        filesystem: kind.as_str().to_string(),
+        has_physical_identity: kind.has_physical_identity(),
+    })
 }
 
 /// Execute the approved plan (§27). Resumable; ends in `EXECUTED` or
@@ -2153,6 +2236,43 @@ pub fn verify_project_output_with_options(
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
     df_verifier::verify_project(&mut db, actor, options)
+}
+
+/// One prefix of the projected output tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationNode {
+    /// Path relative to the output root.
+    pub prefix: String,
+    /// Path components in `prefix` (1 for a top-level root).
+    pub depth: u32,
+    /// Copies landing anywhere under this prefix.
+    pub files: u64,
+    /// Directories created under this prefix.
+    pub directories: u64,
+    /// Bytes the copies would write.
+    pub bytes: u64,
+    /// Copies by operation type, most frequent first.
+    pub by_operation: Vec<(String, u64)>,
+    /// A real destination path from this subtree.
+    pub sample: Option<String>,
+}
+
+/// What the current plan would produce on disk.
+///
+/// The plan already holds a destination for every occurrence; this only
+/// aggregates it. Reporting the shape of the output before it is frozen is
+/// what lets an approval be informed rather than blind.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationTree {
+    pub plan_id: String,
+    pub version: u32,
+    pub output_root: String,
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    /// Copies with no recorded destination. Surfaced, never hidden.
+    pub without_destination: u64,
+    pub nodes: Vec<PlanDestinationNode>,
 }
 
 /// Exact duplicate report of the latest snapshot (RFC-0001 §15).
@@ -2232,6 +2352,406 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
         redundant_bytes,
         sets,
     })
+}
+
+/// Whether the destination has room for what is left to copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpacePreflight {
+    pub plan_id: String,
+    pub output_root: String,
+    /// Bytes the operations still to be attempted would write.
+    pub required_bytes: u64,
+    /// Bytes writable at the destination, or `None` where this build cannot
+    /// ask. `None` is **unknown**, never zero and never plenty.
+    pub available_bytes: Option<u64>,
+    /// True when there is measurably room; false when there measurably is not.
+    /// `None` when nothing could be measured, so a caller cannot mistake
+    /// "could not check" for "checked and fine".
+    pub sufficient: Option<bool>,
+}
+
+/// Check the destination has room before a long copy starts.
+///
+/// On a real archive a copy runs for hours, and finding out at hour six that
+/// the volume was always too small costs the whole run. The engine already
+/// stops cleanly on a real ENOSPC — this is about not starting.
+///
+/// It reports and refuses nothing by itself. Where free space cannot be
+/// measured the answer is `None`, and a caller must not read that as
+/// permission or as denial: turning "this platform has no answer" into a
+/// refusal would make a missing feature look like a full disk.
+pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+
+    let required_bytes = df_db::plans::pending_bytes(&db, plan.id)?;
+    let available_bytes = df_fs_safety::available_bytes(&project.output_root);
+    Ok(SpacePreflight {
+        plan_id: plan.id.to_string(),
+        output_root: project.output_root.display().to_string(),
+        required_bytes,
+        available_bytes,
+        sufficient: available_bytes.map(|available| available >= required_bytes),
+    })
+}
+
+/// What an exported delivery package contains.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryPackage {
+    pub plan_id: String,
+    /// Directory the files were written to, under the audit root.
+    pub directory: String,
+    /// Rows in the traceability map: one per manifest entry, always.
+    pub entries: u64,
+    /// Entries carrying an expected SHA-256, and therefore checkable.
+    pub checksummed: u64,
+    /// Entries with no destination recorded. Reported, never dropped.
+    pub without_destination: u64,
+    pub bytes: u64,
+}
+
+/// Export the evidence that nothing was lost.
+///
+/// The original this engine was built against was not accepted on a metric.
+/// It was accepted, in the client's words, when the adviser had no doubt that
+/// material could have gone missing — and what removed the doubt was a
+/// traceability map, a checksum manifest and a plain statement of guarantees
+/// they could check themselves. The engine already held every one of those
+/// facts and had no way to hand them over.
+///
+/// Three files, all derived from the **frozen manifest** rather than from a
+/// walk of the output, so the package describes what was approved and not
+/// merely what happens to be on disk:
+///
+/// - `traceability.csv` — origin → destination, one row per manifest entry.
+/// - `SHA256SUMS` — in `sha256sum -c` format, so it is checkable with a tool
+///   the recipient already trusts rather than only with this one.
+/// - `delivery.md` — the guarantees, in prose, with the counts behind them.
+///
+/// # Why it lands in the audit root and not in the output
+///
+/// The delivered folder is described by a manifest that was frozen before
+/// anything was copied, and the verifier re-reads the output against exactly
+/// that. Writing three files into it would add files the manifest never
+/// described and the verifier never expected. So the package is produced
+/// beside the output, and copying it in afterwards is the operator's call,
+/// taken knowingly.
+pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let entries = df_db::plans::manifest(&db, plan.id)?;
+    if entries.is_empty() {
+        return Err(DfError::Validation(
+            "the plan has no frozen manifest; approve it before exporting a delivery package"
+                .to_string(),
+        ));
+    }
+
+    let directory = project.audit_root.join("delivery");
+    std::fs::create_dir_all(&directory).map_err(|error| DfError::io(&directory, error))?;
+
+    let mut csv = String::from(
+        "source_root,source_relative_path,destination_relative_path,operation,sha256,bytes\n",
+    );
+    let mut sums = String::new();
+    let mut checksummed = 0u64;
+    let mut without_destination = 0u64;
+    let mut bytes = 0u64;
+
+    for entry in &entries {
+        let destination = entry.destination_relative_path.clone().unwrap_or_default();
+        if entry.destination_relative_path.is_none() {
+            without_destination += 1;
+        }
+        bytes += entry.expected_size_bytes.unwrap_or(0);
+        let sha = entry.expected_sha256.clone().unwrap_or_default();
+        if let (Some(sha), Some(destination)) = (
+            entry.expected_sha256.as_deref(),
+            entry.destination_relative_path.as_deref(),
+        ) {
+            checksummed += 1;
+            // The two-space form `sha256sum -c` expects for a binary file.
+            sums.push_str(&format!("{sha}  {destination}\n"));
+        }
+        csv.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            csv_field(entry.source_root_path_snapshot.as_deref().unwrap_or("")),
+            csv_field(entry.source_relative_path_exact.as_deref().unwrap_or("")),
+            csv_field(&destination),
+            entry.operation_type.as_str(),
+            sha,
+            entry.expected_size_bytes.unwrap_or(0),
+        ));
+    }
+
+    // The verdict is read back from the run that produced it, never asserted.
+    // "Not verified" is said in those words rather than left blank: a delivery
+    // that was never checked and one that passed must not look alike.
+    let verification = df_db::plans::latest_verification(&db, plan.id)?;
+    let verdict = match &verification {
+        Some(run) => format!(
+            "**{}** — {} checked, {} problems, {} warnings, finished {}",
+            run.verdict, run.checked, run.problems, run.warnings, run.finished_at
+        ),
+        None => {
+            "**not verified** — no verification run has been recorded for this plan".to_string()
+        }
+    };
+
+    // What the profile declined to read belongs in a document that claims
+    // nothing was lost. An exclusion is a legitimate decision; leaving it out
+    // of the delivery would make the claim broader than the evidence, which is
+    // the one thing this package must not do.
+    let skipped = match df_db::inventory::latest_complete_snapshot(&db, project.id)? {
+        Some(snapshot) => df_db::inventory::hash_exclusions(&db, snapshot.id)?,
+        None => Vec::new(),
+    };
+    let not_read = if skipped.is_empty() {
+        "Everything in the origin was read and identified by hash.".to_string()
+    } else {
+        let mut counts: std::collections::BTreeMap<&str, (u64, &str)> =
+            std::collections::BTreeMap::new();
+        for exclusion in &skipped {
+            let entry = counts
+                .entry(exclusion.rule_id.as_str())
+                .or_insert((0, exclusion.reason.as_str()));
+            entry.0 += 1;
+        }
+        let mut lines = format!(
+            "**{} files were deliberately not read** and carry no hash here. They \
+             remain in the origin, untouched, and stay listed in the project's \
+             inventory:\n",
+            skipped.len()
+        );
+        for (rule, (count, reason)) in counts {
+            lines.push_str(&format!("\n- `{rule}` — {count} files: {reason}"));
+        }
+        lines
+    };
+
+    let summary = format!(
+        "# Delivery package\n\n\
+         Plan `{}`, version {}.\n\n\
+         ## What this says\n\n\
+         - Entries in the frozen manifest: **{}**\n\
+         - Of those, carrying a SHA-256 anyone can check: **{}**\n\
+         - Without a recorded destination: **{}**\n\
+         - Bytes described: **{}**\n\
+         - Independent verification: {}\n\n\
+         ## What was not read\n\n\
+         {}\n\n\
+         ## Guarantees\n\n\
+         The origin was never written to: no code in this engine renames, \
+         deletes or modifies anything inside a source root. Nothing was \
+         overwritten in the destination. Every row of `traceability.csv` names \
+         where a file came from and where it went, and `SHA256SUMS` can be \
+         checked with `sha256sum -c` against the delivered folder — with a \
+         tool of your choosing, not only with this one.\n\n\
+         This package is derived from the manifest frozen at approval, not \
+         from a walk of the delivered folder, so it describes what was agreed \
+         rather than what happens to be present.\n",
+        plan.id,
+        plan.version,
+        entries.len(),
+        checksummed,
+        without_destination,
+        bytes,
+        verdict,
+        not_read,
+    );
+
+    write_delivery_file(&directory, "traceability.csv", &csv)?;
+    write_delivery_file(&directory, "SHA256SUMS", &sums)?;
+    write_delivery_file(&directory, "delivery.md", &summary)?;
+
+    Ok(DeliveryPackage {
+        plan_id: plan.id.to_string(),
+        directory: directory.display().to_string(),
+        entries: entries.len() as u64,
+        checksummed,
+        without_destination,
+        bytes,
+    })
+}
+
+fn write_delivery_file(directory: &Path, name: &str, contents: &str) -> DfResult<()> {
+    let path = directory.join(name);
+    std::fs::write(&path, contents).map_err(|error| DfError::io(&path, error))
+}
+
+/// Quote a CSV field so a path containing a comma or a quote cannot shift the
+/// columns. A traceability map whose rows can be misread is worse than none.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Store a rule set version in the project (ADR-0041).
+///
+/// Storing is not gating: nothing consults these at decision time yet. What it
+/// establishes is that a set has an identity — an id, a version and a digest
+/// over its exact bytes — before anything is allowed to cite one.
+///
+/// The digest is computed by `df-rules`, never here. Persistence keeps bytes;
+/// deciding what they mean belongs to the crate that owns the format, and a
+/// second implementation of the digest is a second thing that can disagree.
+pub fn save_rule_set(project_dir: &Path, set: &df_rules::RuleSet) -> DfResult<()> {
+    // Refuse a set whose digest no longer matches its params before it is
+    // written, so a set that drifted between being built and being stored
+    // never becomes the record other decisions cite.
+    set.verify()?;
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let params = df_ledger::canonical_json(
+        &serde_json::to_value(&set.params)
+            .map_err(|error| DfError::Serialization(format!("rule params: {error}")))?,
+    );
+    df_db::rules::save(
+        &db,
+        &df_db::rules::RuleSetRecord {
+            id: set.id.clone(),
+            version: set.version,
+            schema: df_rules::RULE_SET_SCHEMA_VERSION.to_string(),
+            params,
+            digest: set.digest.clone(),
+            created_at: String::new(),
+        },
+    )
+}
+
+/// Read a stored rule set back, refusing one whose bytes no longer match its
+/// digest.
+///
+/// Verified on read and not once at startup: a set that drifted between being
+/// loaded and being used is exactly the case a check at load time cannot see
+/// (ADR-0041, threat A4).
+pub fn rule_set(project_dir: &Path, id: &str, version: Option<u32>) -> DfResult<df_rules::RuleSet> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let record = match version {
+        Some(version) => df_db::rules::load(&db, id, version)?,
+        None => df_db::rules::latest(&db, id)?,
+    }
+    .ok_or_else(|| DfError::Validation(format!("no rule set `{id}` stored in this project")))?;
+
+    if record.schema != df_rules::RULE_SET_SCHEMA_VERSION {
+        return Err(DfError::Validation(format!(
+            "rule set `{}` version {} was written for schema {}, and this build speaks {}",
+            record.id,
+            record.version,
+            record.schema,
+            df_rules::RULE_SET_SCHEMA_VERSION
+        )));
+    }
+
+    let params: df_rules::RuleParams = serde_json::from_str(&record.params)
+        .map_err(|error| DfError::Serialization(format!("stored rule params: {error}")))?;
+    let set = df_rules::RuleSet {
+        id: record.id,
+        version: record.version,
+        params,
+        digest: record.digest,
+    };
+    set.verify()?;
+    Ok(set)
+}
+
+/// Absolute paths sampled per colliding name, one per distinct content.
+///
+/// Enough to make a collision concrete in a report without turning the
+/// response into a file listing: the finding is that the name disagrees, and
+/// four disagreeing paths show that as well as four hundred.
+const NAME_COLLISION_SAMPLES: usize = 4;
+
+/// File names that stand for different content in different places.
+///
+/// The evidence behind a rule the engine already follows and could not
+/// previously show: a name is not an identity. Report only — it proposes
+/// nothing (RFC-0001 §15.2).
+/// What the profile declined to read, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct HashExclusionReport {
+    pub snapshot_id: String,
+    pub excluded: u64,
+    /// `[rule_id, count]`, most excluded first.
+    pub by_rule: Vec<(String, u64)>,
+    pub exclusions: Vec<df_db::inventory::HashExclusionView>,
+}
+
+/// Report the occurrences this project's profile declined to hash.
+///
+/// The answer to "was anything skipped?", which an operator is entitled to ask
+/// before trusting a delivery and which the inventory alone cannot give. An
+/// exclusion is a legitimate decision; an *undisclosed* one is not.
+pub fn hash_exclusion_report(project_dir: &Path) -> DfResult<HashExclusionReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let exclusions = df_db::inventory::hash_exclusions(&db, snapshot.id)?;
+
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for exclusion in &exclusions {
+        *counts.entry(exclusion.rule_id.clone()).or_default() += 1;
+    }
+    let mut by_rule: Vec<(String, u64)> = counts.into_iter().collect();
+    by_rule.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(HashExclusionReport {
+        snapshot_id: snapshot.id.to_string(),
+        excluded: exclusions.len() as u64,
+        by_rule,
+        exclusions,
+    })
+}
+
+pub fn name_collision_report(
+    project_dir: &Path,
+) -> DfResult<df_db::inventory::NameCollisionReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Deliberately not gated on complete analysis, unlike the structural
+    // reports: this one reads hashes and names, which the hash stage already
+    // sealed. Requiring analysis would withhold an answer the database can
+    // give — and the collision matters most *before* anyone plans a merge.
+    df_db::inventory::name_collisions(&db, snapshot.id, NAME_COLLISION_SAMPLES)
+}
+
+/// Grafted subtrees and how much of each places itself.
+///
+/// A graft is a folder that acquired a leading prefix when a whole tree was
+/// copied under it; stripping the prefix recovers the canonical path. Evidence
+/// only — it proposes no move (RFC-0001 §15.2).
+pub fn grafted_tree_report(project_dir: &Path) -> DfResult<GraftedTreeReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Gated on complete analysis, unlike the name report: this one reads
+    // `tree_relations`, which only a finished analysis has written.
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::structure::grafted_trees(&db, snapshot.id)
 }
 
 /// Exact tree-clone report of the latest snapshot (RFC-0001 §19).
@@ -2326,6 +2846,66 @@ fn non_overlapping_redundant_bytes(sets: &[TreeCloneSet]) -> u64 {
     redundant_bytes
 }
 
+/// Bytes held by subtrees a `TREE_EMBEDDED` relation proves carry nothing of
+/// their own, counting no nested subtree twice.
+///
+/// An embedded relation requires the contained side to have zero unique files
+/// — the schema enforces it — so every content under it also exists outside,
+/// and `shared_bytes` is that subtree's content weight. This is the strongest
+/// redundancy claim the engine can make short of a duplicate set, and until
+/// now nothing surfaced its size: answering "how much is provably collapsible"
+/// meant querying SQLite by hand.
+///
+/// Deliberately conservative, exactly like the clone-set estimate: nested
+/// contained subtrees collapse to their shallowest ancestor, so the figure may
+/// undercount and never overcounts. Evidence only — it proposes no action, and
+/// no policy consolidates on it today (ADR-0045 is where that is decided).
+fn non_overlapping_embedded_bytes(
+    relations: &[df_db::structure::TreeRelationView],
+) -> (u64, u64, u64) {
+    let mut candidates: Vec<(Vec<String>, u64, u64)> = Vec::new();
+    for relation in relations {
+        if relation.relationship != "TREE_EMBEDDED" {
+            continue;
+        }
+        // `contained` names which side is inside the other; it is not implied
+        // by the ordering of the pair.
+        let (path, files) = match relation.contained.as_deref() {
+            Some("A") => (&relation.path_a, relation.shared_files),
+            Some("B") => (&relation.path_b, relation.shared_files),
+            // A relation without a contained side is not an embedding we can
+            // read, so it contributes nothing rather than a guess.
+            _ => continue,
+        };
+        candidates.push((clone_path_components(path), relation.shared_bytes, files));
+    }
+
+    // One folder can be the contained side of several relations; keep it once.
+    candidates.sort_by(|left, right| {
+        left.0
+            .len()
+            .cmp(&right.0.len())
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.dedup_by(|left, right| left.0 == right.0);
+
+    let mut selected = Vec::<Vec<String>>::new();
+    let (mut bytes, mut files) = (0_u64, 0_u64);
+    for (components, subtree_bytes, subtree_files) in candidates {
+        if selected
+            .iter()
+            .any(|path| clone_paths_overlap(path, &components))
+        {
+            continue;
+        }
+        bytes = bytes.saturating_add(subtree_bytes);
+        files = files.saturating_add(subtree_files);
+        selected.push(components);
+    }
+    (selected.len() as u64, files, bytes)
+}
+
 /// Compute the exact tree-clone report of the latest complete snapshot.
 pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2360,6 +2940,25 @@ pub struct TreeRelationReport {
     pub embedded: u64,
     /// Pairs whose only meaningful overlap is a repeated component.
     pub repeated_components: u64,
+    /// Contained subtrees counted once, ancestors absorbing descendants.
+    pub embedded_contained_folders: u64,
+    /// Distinct contents shared by those subtrees with their outer tree.
+    /// Not a file count of the subtree: a subtree that holds the same content
+    /// twice contributes it once.
+    pub embedded_contained_files: u64,
+    /// Bytes of those distinct shared contents — the strongest redundancy
+    /// claim short of a duplicate set, since every one of them also exists
+    /// outside the contained subtree.
+    ///
+    /// A **lower bound** on what collapsing would avoid writing, twice over:
+    /// nested subtrees collapse into their ancestor, and internal duplication
+    /// inside a subtree is counted once here while a plan would copy it once
+    /// per occurrence. Erring low is deliberate — the same discipline as the
+    /// clone-set estimate — because overstating a saving is how a user ends
+    /// up surprised by a destination that does not fit.
+    ///
+    /// Still evidence: no policy consolidates on it today (ADR-0045).
+    pub embedded_redundant_bytes: u64,
     pub relations: Vec<df_db::structure::TreeRelationView>,
 }
 
@@ -2385,11 +2984,16 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
         .iter()
         .filter(|r| r.relationship == "REPEATED_COMPONENT_ONLY")
         .count() as u64;
+    let (embedded_contained_folders, embedded_contained_files, embedded_redundant_bytes) =
+        non_overlapping_embedded_bytes(&relations);
     Ok(TreeRelationReport {
         snapshot_id: snapshot.id.to_string(),
         partial_clones,
         embedded,
         repeated_components,
+        embedded_contained_folders,
+        embedded_contained_files,
+        embedded_redundant_bytes,
         relations,
     })
 }
@@ -2447,6 +3051,23 @@ pub fn structural_review_queue(project_dir: &Path) -> DfResult<ReviewQueue> {
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
+/// The review queue grouped by question rather than listed by item.
+///
+/// The flat queue is the wrong first call over a real archive: it returns
+/// thousands of rows that are mostly the same question repeated. This returns
+/// one row per class, ordered by how many decisions each would settle, so the
+/// shortest path to an empty review bucket is the first line of output.
+pub fn structural_review_classes(project_dir: &Path) -> DfResult<ReviewClassSummary> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::review_class_summary(&db, snapshot.id)
+}
+
 /// Append a review decision before planning. Decisions after a plan exists
 /// would not change that immutable plan, so they are rejected explicitly.
 pub fn decide_structural_review(
@@ -2470,6 +3091,34 @@ pub fn decide_structural_review(
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
     ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     df_db::analysis::decide_review_item(&mut db, project.id, item_id, decision, rationale, actor)?;
+    df_db::analysis::review_queue(&db, snapshot.id)
+}
+
+/// Append many review decisions atomically.
+///
+/// The queue over a real archive runs to thousands of items, most of them
+/// repetitions of a few questions, which is exactly the shape an agent can
+/// answer in one pass. Each decision keeps its own rationale and its own
+/// ledger event; the batch only removes the need for one process per item.
+pub fn decide_structural_review_batch(
+    project_dir: &Path,
+    decisions: &[ReviewDecisionInput],
+    actor: Actor,
+) -> DfResult<ReviewQueue> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    if project.state != ProjectState::Analyzed {
+        return Err(DfError::Validation(format!(
+            "review decisions require ANALYZED state before planning (current {})",
+            project.state
+        )));
+    }
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::decide_review_items(&mut db, project.id, decisions, actor)?;
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
@@ -2504,6 +3153,82 @@ pub fn verify_audit(project_dir: &Path) -> DfResult<AuditReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embedded(
+        contained_path: &str,
+        outer_path: &str,
+        files: u64,
+        bytes: u64,
+    ) -> df_db::structure::TreeRelationView {
+        df_db::structure::TreeRelationView {
+            path_a: contained_path.to_owned(),
+            path_b: outer_path.to_owned(),
+            relationship: "TREE_EMBEDDED".to_string(),
+            contained: Some("A".to_string()),
+            shared_files: files,
+            // The schema forbids unique content on the contained side; that
+            // is precisely what makes the claim provable.
+            unique_a_files: 0,
+            unique_b_files: 3,
+            shared_bytes: bytes,
+            similarity: 1.0,
+        }
+    }
+
+    /// The size of a provable redundancy, counted once. Two nested contained
+    /// subtrees are one opportunity, not two, and reporting the sum would
+    /// overstate what collapsing them recovers.
+    #[test]
+    fn nested_contained_subtrees_are_counted_once() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz", 10, 1_000),
+            embedded(r"raiz\copia\dentro", r"raiz", 4, 400),
+        ];
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1, "the descendant is absorbed by its ancestor");
+        assert_eq!(files, 10);
+        assert_eq!(bytes, 1_000, "never the 1.400 of the naive sum");
+    }
+
+    /// One folder can be the contained side of several relations — embedded
+    /// in two different outer trees — and it is still one folder.
+    #[test]
+    fn a_folder_contained_twice_is_still_one_opportunity() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz\a", 10, 1_000),
+            embedded(r"raiz\copia", r"raiz\b", 10, 1_000),
+        ];
+        let (folders, _, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1);
+        assert_eq!(bytes, 1_000);
+    }
+
+    /// Only embeddings count. A partial clone has unique content on both
+    /// sides — dropping either loses data (§19.4) — so it must never appear
+    /// in a figure that describes what is safe to collapse.
+    #[test]
+    fn partial_clones_contribute_nothing_to_the_provable_figure() {
+        let mut partial = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        partial.relationship = "PARTIAL_TREE_CLONE".to_string();
+        partial.contained = None;
+        partial.unique_a_files = 2;
+
+        let mut repeated = embedded(r"raiz\c", r"raiz\d", 5, 500);
+        repeated.relationship = "REPEATED_COMPONENT_ONLY".to_string();
+        repeated.contained = None;
+
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&[partial, repeated]);
+        assert_eq!((folders, files, bytes), (0, 0, 0));
+    }
+
+    /// An embedding whose contained side is not recorded is not readable as
+    /// an embedding, so it contributes nothing rather than a guess.
+    #[test]
+    fn an_embedding_without_a_contained_side_is_skipped() {
+        let mut orphan = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        orphan.contained = None;
+        assert_eq!(non_overlapping_embedded_bytes(&[orphan]), (0, 0, 0));
+    }
 
     fn clone_set(tag: char, folders: &[&str], subtree_bytes: u64) -> TreeCloneSet {
         TreeCloneSet {
@@ -2593,6 +3318,21 @@ mod tests {
             .collect()
     }
 
+    /// Skip a hardening test this environment genuinely cannot run — loudly.
+    ///
+    /// With `DF_REQUIRE_HARDENING=1` (which CI sets) the skip becomes a
+    /// failure. Without it, a machine where `mklink` or `icacls` is forbidden
+    /// reports green having proved none of what these tests exist to prove,
+    /// which is worse than red: it looks like evidence.
+    #[cfg(windows)]
+    fn skip_hardening(reason: &str) {
+        assert!(
+            std::env::var_os("DF_REQUIRE_HARDENING").is_none(),
+            "hardening test skipped while DF_REQUIRE_HARDENING is set: {reason}"
+        );
+        eprintln!("SKIP: {reason}");
+    }
+
     #[cfg(windows)]
     fn make_junction(link: &Path, target: &Path) -> bool {
         let status = std::process::Command::new("cmd")
@@ -2672,7 +3412,7 @@ mod tests {
         std::fs::create_dir(&output).unwrap();
         std::fs::write(output.join("origen.txt"), b"source bytes").unwrap();
         if !make_junction(&source_alias, &output) {
-            eprintln!("SKIP: this environment cannot create junctions (mklink /J failed)");
+            skip_hardening("this environment cannot create junctions (mklink /J failed)");
             return;
         }
 
@@ -2801,6 +3541,223 @@ mod tests {
             matches!(&error, DfError::Validation(message) if message.contains("legla")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn the_preflight_counts_what_is_left_and_never_guesses_what_it_cannot_measure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"doce bytes!!").unwrap();
+        std::fs::write(origin.join("dos.txt"), b"otros doce!!").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let before = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert!(before.required_bytes >= 24, "both files are still to copy");
+
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+
+        // The property that keeps a resume usable: what is already on disk is
+        // not demanded again. Without this, resuming a half-done 443 GB run
+        // would be refused for wanting room it no longer needs.
+        let after = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(
+            after.required_bytes, 0,
+            "nothing is left to copy, so nothing is required"
+        );
+
+        // `sufficient` is only ever an answer when something was measured.
+        match after.available_bytes {
+            Some(_) => assert_eq!(after.sufficient, Some(true)),
+            None => assert_eq!(
+                after.sufficient, None,
+                "unknown must not be reported as fine"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_delivery_package_covers_every_manifest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("dos, con coma.txt"), b"contenido dos").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+
+        let directory = std::path::Path::new(&package.directory);
+        let csv = std::fs::read_to_string(directory.join("traceability.csv")).expect("csv");
+        // Header plus one row per entry, always. A package that quietly
+        // omitted rows would defeat the only thing it exists to show.
+        assert_eq!(
+            csv.lines().count() as u64,
+            package.entries + 1,
+            "every manifest entry has a row"
+        );
+        // A path with a comma must not shift the columns; every row has the
+        // same field count as the header.
+        let columns = csv.lines().next().expect("header").split(',').count();
+        for line in csv.lines().skip(1) {
+            assert_eq!(
+                csv_columns(line),
+                columns,
+                "a quoted path changed the column count: {line}"
+            );
+        }
+
+        let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).expect("sums");
+        assert_eq!(sums.lines().count() as u64, package.checksummed);
+        // `sha256sum -c` format: 64 hex chars, two spaces, then the path.
+        for line in sums.lines() {
+            assert!(line.len() > 66 && &line[64..66] == "  ", "bad line: {line}");
+        }
+
+        let summary = std::fs::read_to_string(directory.join("delivery.md")).expect("summary");
+        assert!(summary.contains("The origin was never written to"));
+        // Never verified and verified-and-passed must not read alike, so the
+        // unchecked case says so in words rather than leaving a blank.
+        assert!(
+            summary.contains("not verified"),
+            "an unverified delivery must say so: {summary}"
+        );
+        // Nothing was excluded here, and the package says so rather than
+        // leaving the reader to assume it.
+        assert!(summary.contains("Everything in the origin was read"));
+
+        // After a real verification the package reports what that run found,
+        // read back from the run itself rather than re-derived.
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        let verify = verify_project_output(&req.project_dir, Actor::Test).expect("verify");
+        let after = export_delivery_package(&req.project_dir).expect("exported again");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&after.directory).join("delivery.md"))
+                .expect("summary");
+        assert!(
+            summary.contains(&verify.verdict),
+            "the package must carry the verdict the run produced: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_delivery_discloses_what_was_never_read() {
+        // The property that keeps "nothing was lost" honest. Excluding is a
+        // legitimate decision; an undisclosed exclusion makes the claim
+        // broader than the evidence, which is the one thing this document
+        // must never do.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom")).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"material").unwrap();
+        std::fs::write(origin.join("TomTom").join("mapa.dat"), b"gps").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+
+        // Exclude by path, then hash: the GPS folder is never read.
+        {
+            let marker = read_marker(&req.project_dir).unwrap();
+            let mut db = open_db(&req.project_dir, &marker).unwrap();
+            let project = repository::load_project(&db).unwrap();
+            let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+                .unwrap()
+                .unwrap();
+            df_db::inventory::enqueue_hash_jobs_with(
+                &mut db,
+                snapshot.id,
+                Actor::Test,
+                &[df_domain::HashExclusion {
+                    id: "gps.tomtom".to_string(),
+                    reason: "navigation data, not case material".to_string(),
+                    r#match: df_domain::ExclusionMatch {
+                        path_glob: Some("TomTom*".to_string()),
+                        ..df_domain::ExclusionMatch::default()
+                    },
+                }],
+            )
+            .unwrap();
+        }
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let report = hash_exclusion_report(&req.project_dir).expect("exclusions");
+        assert_eq!(report.excluded, 1);
+        assert_eq!(report.by_rule, vec![("gps.tomtom".to_string(), 1)]);
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&package.directory).join("delivery.md"))
+                .expect("summary");
+        assert!(
+            summary.contains("deliberately not read"),
+            "the delivery must disclose the skip: {summary}"
+        );
+        // With the rule's own words, so the reader can judge the decision
+        // rather than only learn that one was taken.
+        assert!(summary.contains("navigation data, not case material"));
+    }
+
+    /// Count CSV fields honouring quoting.
+    fn csv_columns(line: &str) -> usize {
+        let mut fields = 1;
+        let mut quoted = false;
+        for character in line.chars() {
+            match character {
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields += 1,
+                _ => {}
+            }
+        }
+        fields
+    }
+
+    #[test]
+    fn a_rule_set_survives_a_round_trip_and_a_tampered_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let set = df_rules::RuleSet::new("legal", 1, df_rules::RuleParams::default())
+            .expect("a valid set");
+        save_rule_set(&req.project_dir, &set).expect("stored");
+
+        let read = rule_set(&req.project_dir, "legal", None).expect("read back");
+        assert_eq!(read.version, 1);
+        assert_eq!(read.digest, set.digest);
+        assert_eq!(read.params, set.params);
+
+        // A set whose digest no longer covers its params is refused on the way
+        // in. Storing it would make it the record other decisions cite, and a
+        // decision citing parameters nobody can reproduce is not auditable.
+        let mut tampered = set.clone();
+        tampered.params.auto_approve_confidence = 0.01;
+        save_rule_set(&req.project_dir, &tampered)
+            .expect_err("a digest that no longer matches is not storable");
+
+        // Version 1 still says what it said.
+        let again = rule_set(&req.project_dir, "legal", Some(1)).expect("still there");
+        assert_eq!(again.params, set.params);
     }
 
     #[test]
@@ -3411,15 +4368,19 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 19, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 24, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[18].name, "incremental_reuse");
+        assert_eq!(df_db::migrations::MIGRATIONS[23].name, "hash_exclusions");
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");
         }
         assert_eq!(df_domain::PROFILE_SCHEMA, "dataforge.profile");
-        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "1.1.0");
+        // 2.0.0 (M2.2, ADR-0040 §6) adds `destination_roots`. Major, not
+        // minor: a 2.0 profile may declare roots a 1.x engine knows nothing
+        // about, and a 1.x engine would ignore the field and quietly produce
+        // different destination paths.
+        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "2.0.0");
         assert_eq!(super::MARKER_SCHEMA_VERSION, "1.0.0");
 
         // Similarity (M0.3).
@@ -3471,6 +4432,88 @@ mod frozen_contracts {
         assert_eq!(
             df_ai::PROMPT_VERSION,
             "dataforge.assisted-intelligence-prompt/0.7.0"
+        );
+
+        // Agent tool surface (M2.1, ADR-0043 §4). Recorded here, next to every
+        // other frozen contract, rather than only in `df-tools`: external
+        // agents pin these names, so they belong in the one test whose job is
+        // to fail when a contract moves. The dependency is a dev-dependency
+        // cycle — `df-tools` sits on top of the facade — which Cargo permits
+        // precisely for this.
+        assert_eq!(
+            df_tools::TOOL_SURFACE_VERSION,
+            "dataforge.tool-surface/0.7.0"
+        );
+        assert_eq!(df_tools::TOOLS.len(), 29, "tool count");
+
+        // Reports bound what they list. These two are contract, not tuning: an
+        // agent sizes its own reading against them, and raising the ceiling
+        // later would hand a pinned caller a response it budgeted against.
+        assert_eq!(df_tools::DEFAULT_REPORT_ITEMS, 50);
+        assert_eq!(df_tools::MAX_REPORT_ITEMS, 1_000);
+
+        // Deterministic gate (M2.4, ADR-0041). The hard-boundary count is
+        // frozen alongside the schema: turning an invariant into a tunable
+        // parameter is exactly the change this test exists to catch.
+        assert_eq!(
+            df_rules::RULE_SET_SCHEMA_VERSION,
+            "dataforge.rule-set/0.1.0"
+        );
+        assert_eq!(df_rules::HARD_BOUNDARY_COUNT, 4);
+
+        // Consent by policy (M2.5, ADR-0042). A caller that pins this version
+        // is pinning what a single human approval is allowed to authorise.
+        assert_eq!(
+            df_ai::DISCLOSURE_POLICY_SCHEMA_VERSION,
+            "dataforge.ai-disclosure-policy/0.1.0"
+        );
+
+        // Agent run loop (M2.6, ADR-0044).
+        assert_eq!(
+            df_agent::AGENT_RUN_SCHEMA_VERSION,
+            "dataforge.agent-run/0.1.0"
+        );
+        assert_eq!(df_agent::Stage::ORDER.len(), 10, "run stages");
+        assert_eq!(
+            df_tools::tools_with(df_tools::Capability::Commit).count(),
+            3,
+            "the gated class is approve, execute and verify — nothing else"
+        );
+    }
+
+    /// Every ADR is listed in the index.
+    ///
+    /// Reads the directory rather than a list, because a list is one more
+    /// thing to forget. The index is how anyone arriving at the repo finds
+    /// the decisions, so an ADR missing from it is a decision nobody will
+    /// read — which is the same as not having written it.
+    #[test]
+    fn every_adr_is_in_the_index() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("adr");
+        let index = std::fs::read_to_string(root.join("README.md")).expect("the ADR index");
+
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&root).expect("docs/adr") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if !name.starts_with("ADR-") || !name.ends_with(".md") {
+                continue;
+            }
+            if !index.contains(&name) {
+                missing.push(name);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "ADRs missing from docs/adr/README.md: {missing:?}"
         );
     }
 

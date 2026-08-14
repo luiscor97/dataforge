@@ -456,6 +456,78 @@ summary:focus-visible {
   max-width: 62ch;
 }
 
+/* Projected output tree ---------------------------------------------------- */
+
+.plan-tree {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.plan-tree h4 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.plan-tree p {
+  margin: 0;
+  max-width: 62ch;
+}
+
+.plan-tree code {
+  font-size: 0.85em;
+  word-break: break-all;
+}
+
+.plan-tree-warning {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.plan-tree-roots {
+  list-style: none;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.plan-tree-roots li {
+  border-left: 3px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  padding-left: 0.7rem;
+}
+
+.plan-tree-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.plan-tree-label {
+  font-size: 0.82rem;
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.plan-tree-figures {
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-tree-sample,
+.plan-tree-loading {
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+.plan-tree-error {
+  color: var(--danger);
+}
+
 /* Diagnostic sections ------------------------------------------------------ */
 
 .diagnostics {
@@ -926,4 +998,158 @@ summary:focus-visible {
   * {
     transition: none !important;
   }
+}
+
+/* ---------------------------------------------------------------------------
+ * Guided flow — the non-technical path.
+ * One decision per screen, generous targets, and no invented progress.
+ * ------------------------------------------------------------------------- */
+
+.guided h2 {
+  margin-top: 0;
+}
+
+/* Drop targets. The border thickens on hover so it reads as "put it here"
+ * before anything is dragged, and turns accent-coloured while a drag is
+ * actually over the window. */
+.dropfield input {
+  border: 2px dashed var(--border-strong);
+  padding: 0.9rem 0.7rem;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.dropfield input:hover {
+  border-color: var(--accent);
+}
+
+.dropfield-active input {
+  border-color: var(--accent);
+  border-style: solid;
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+/* Working state. The bar is a looping indeterminate sweep on purpose: the
+ * engine reports no percentage, and a bar that filled on a timer would be
+ * fiction at the moment the user most needs the truth. */
+.working {
+  padding: 2rem 0;
+  text-align: center;
+}
+
+.working-bar {
+  height: 6px;
+  margin: 1.25rem auto;
+  max-width: 26rem;
+  background: var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.working-bar span {
+  display: block;
+  height: 100%;
+  width: 35%;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .working-bar span {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
+  }
+}
+
+/* Headline numbers. Few, large, and labelled in plain words. */
+.tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1.25rem 0;
+}
+
+.tile {
+  flex: 1 1 8rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.tile-label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 0.3rem;
+}
+
+.tile strong {
+  font-size: 1.5rem;
+  line-height: 1.1;
+}
+
+/* Notices carry the outcome, so severity is colour *and* wording, never
+ * colour alone. */
+.notice {
+  margin: 1rem 0;
+  padding: 0.85rem 1rem;
+  border-radius: 10px;
+  border-left: 4px solid var(--border-strong);
+  background: color-mix(in srgb, var(--text) 4%, var(--surface));
+}
+
+.notice-ok {
+  border-left-color: var(--ok);
+}
+
+.notice-warning {
+  border-left-color: var(--warning);
+}
+
+.notice-danger {
+  border-left-color: var(--danger);
+}
+
+/* Neutral information — "we picked up where you left off" — which is neither
+ * good news nor a warning and must not be dressed as either. */
+.notice-info {
+  border-left-color: var(--accent);
+}
+
+.guided code {
+  padding: 0.1rem 0.35rem;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 7%, var(--surface));
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+/* A secondary route rendered as a link: present for people who want it,
+ * visually quiet so it never competes with the main path. */
+.linklike {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-ink);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.linklike:hover {
+  color: var(--accent-hover);
 }

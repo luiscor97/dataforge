@@ -268,3 +268,60 @@ test("keeps the media diagnosis pending until structural analysis completes", ()
     /Pendiente: primero debe terminar el análisis estructural/,
   );
 });
+
+// The advanced screen could create a project and then do nothing with it: the
+// reconstruction pipeline had no button anywhere, so anyone who chose "prefiero
+// configurarlo yo" reached a dead end. The next runnable stage is now offered
+// here, and only ever the one the engine would accept.
+test("offers the one pipeline stage the project can actually run", () => {
+  const cases = [
+    ["READY", "Recorrer las carpetas"],
+    ["SCANNED", "Calcular las huellas"],
+    ["HASHED", "Analizar la estructura"],
+    ["ANALYZED", "Preparar la propuesta"],
+    ["PLAN_READY", "Aprobar la propuesta"],
+    ["PLAN_APPROVED", "Ejecutar la copia"],
+    ["EXECUTION_PAUSED", "Ejecutar la copia"],
+    ["EXECUTED", "Comprobar la copia"],
+  ];
+  const everyLabel = [...new Set(cases.map(([, label]) => label))];
+  for (const [state, label] of cases) {
+    const markup = renderStatus({ ...baseStatus, state });
+    assert.match(markup, new RegExp(label), `state ${state}`);
+    // Exactly one stage button: offering several would invite the user to pick
+    // one the engine refuses.
+    const offered = everyLabel.filter((other) => markup.includes(other));
+    assert.deepEqual(offered, [label], `state ${state}`);
+  }
+});
+
+test("offers no pipeline stage once the project is finished", () => {
+  const markup = renderStatus({ ...baseStatus, state: "COMPLETED" });
+  assert.doesNotMatch(markup, /Recorrer las carpetas|Ejecutar la copia/);
+});
+
+// A stage button that cannot be wired to anything must not look clickable.
+test("disables the stage button when the shell offers no handler", () => {
+  const markup = renderStatus({ ...baseStatus, state: "READY" });
+  assert.match(markup, /Recorrer las carpetas<\/button>/);
+  assert.match(markup, /<button type="button" class="primary" disabled=""/);
+});
+
+// Integrity problems come first: continuing on a project whose ledger or
+// database is questionable is exactly what must not be one click away.
+test("integrity problems suppress the stage button", () => {
+  const markup = renderStatus({
+    ...baseStatus,
+    state: "READY",
+    integrity: {
+      database_ok: false,
+      foreign_keys_ok: true,
+      migrations_ok: true,
+      ledger_ok: true,
+      problems: ["integrity_check devolvió un error"],
+    },
+  });
+
+  assert.match(markup, /Problemas de integridad detectados/);
+  assert.doesNotMatch(markup, /Recorrer las carpetas/);
+});

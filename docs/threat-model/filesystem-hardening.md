@@ -304,6 +304,8 @@ y el test que lo demuestra.
 - **Mitigación**: solo ruta absoluta explícita o hermano de `current_exe`; no
   `PATH`/env; archivo regular sin reparse, padre validado y lease vivo durante
   la ejecución; protocolo/version handshake; entorno del hijo vacío.
-- **Riesgo residual**: la firma del paquete/binario se cierra en M0.9; quien
-  sustituye el ejecutable antes de que el proceso padre lo arriende queda
-  dentro del riesgo de cadena de suministro, no del parser.
+- **Riesgo residual**: la firma de los artefactos de release se cierra con la
+  firma keyless de Sigstore (ADR-0039), que cubre checksums y SBOM; no hay
+  firma Authenticode, así que quien sustituye el ejecutable antes de que el
+  proceso padre lo arriende queda dentro del riesgo de cadena de suministro,
+  no del parser.

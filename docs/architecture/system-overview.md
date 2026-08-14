@@ -1,6 +1,7 @@
 # DataForge — visión general del sistema
 
-Estado del documento: refleja M0.2–M0.8 implementados y M0.9 en curso. La
+Estado del documento: refleja M0.2–M0.9 implementados y publicados en la
+1.0.0. La
 arquitectura objetivo completa está en
 [RFC-0001 §7](../rfcs/RFC-0001-dataforge-foundation-and-roadmap.md).
 

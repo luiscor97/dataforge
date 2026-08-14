@@ -1,16 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import {
+  type AnalyzeOutcome,
+  type ApproveOutcome,
   type ContentArtifactBuildOutcome,
   type ContentExtractionOutcome,
   type ContentQueryOutcome,
   type ContentSearchOutcome,
   type ContentSearchRequest,
   type CreateProjectRequest,
+  type DestinationGuarantees,
   type ErrorDto,
+  type ExecuteOutcome,
+  type HashOutcome,
   type MediaOutcome,
+  type PlanDestinationTree,
+  type PlanOutcome,
+  type PlanValidationReport,
   type ProjectStatus,
+  type ScanOutcome,
   type SimilarityOutcome,
+  type VerifyOutcome,
   isErrorDto,
 } from "./types";
 
@@ -37,6 +47,75 @@ export function createProject(
   request: CreateProjectRequest,
 ): Promise<ProjectStatus> {
   return call<ProjectStatus>("create_project", { request });
+}
+
+// --- The reconstruction pipeline -----------------------------------------
+// Each call is one stage of RFC-0001's flow. The guided experience chains
+// them so the user never has to know they exist.
+
+export function scanProject(projectDir: string): Promise<ScanOutcome> {
+  return call<ScanOutcome>("scan_project", { projectDir });
+}
+
+export function hashProject(projectDir: string): Promise<HashOutcome> {
+  return call<HashOutcome>("hash_project", { projectDir });
+}
+
+export function analyzeProject(projectDir: string): Promise<AnalyzeOutcome> {
+  return call<AnalyzeOutcome>("analyze_project", { projectDir });
+}
+
+export function createPlan(projectDir: string): Promise<PlanOutcome> {
+  return call<PlanOutcome>("create_plan", { projectDir });
+}
+
+export function validatePlan(
+  projectDir: string,
+): Promise<PlanValidationReport> {
+  return call<PlanValidationReport>("validate_plan", { projectDir });
+}
+
+/** Where the plan would put everything, `depth` levels under the output root. */
+export function planDestinationTree(
+  projectDir: string,
+  depth = 1,
+): Promise<PlanDestinationTree> {
+  return call<PlanDestinationTree>("plan_destination_tree", {
+    projectDir,
+    depth,
+  });
+}
+
+export function approvePlan(projectDir: string): Promise<ApproveOutcome> {
+  return call<ApproveOutcome>("approve_plan", { projectDir });
+}
+
+export function destinationGuarantees(
+  projectDir: string,
+): Promise<DestinationGuarantees> {
+  return call<DestinationGuarantees>("destination_guarantees", { projectDir });
+}
+
+export function executePlan(projectDir: string): Promise<ExecuteOutcome> {
+  return call<ExecuteOutcome>("execute_plan", { projectDir });
+}
+
+/**
+ * Copy towards a volume without physical identity guarantees (ADR-0036).
+ *
+ * A separate function rather than a flag: the acknowledgement is a decision
+ * the user has to have made, so it must be visible at every call site.
+ */
+export function executePlanOnDegradedDestination(
+  projectDir: string,
+): Promise<ExecuteOutcome> {
+  return call<ExecuteOutcome>("execute_plan_on_degraded_destination", {
+    projectDir,
+  });
+}
+
+export function verifyProject(projectDir: string): Promise<VerifyOutcome> {
+  return call<VerifyOutcome>("verify_project", { projectDir });
 }
 
 export function openProject(projectDir: string): Promise<ProjectStatus> {

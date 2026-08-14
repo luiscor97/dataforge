@@ -40,8 +40,151 @@ Versionado: [SemVer](https://semver.org/lang/es/).
   coordinador SQLite único, exclusión por destino, protocolo §27.1 intacto y
   las seis ventanas de caída con su recuperación. A revisar antes de
   refactorizar el executor; el modo estricto actual no cambia.
+_Nada pendiente; el trabajo post-1.0.1 se anotará aquí._
 
-## [1.0.0] — 2026-07-21 — Milestone 1.0 "Stable Reconstruction Platform"
+## [1.0.1] — 2026-08-09
+
+Primera versión publicable. La 1.0.0 llegó a estar taggeada y con release en
+borrador, pero **nunca se publicó**, y en los quince días siguientes entraron
+en `main` un aviso de seguridad, un fallo real del motor y toda la interfaz
+que hace la herramienta usable sin conocer el pipeline. Publicar aquel
+borrador habría entregado software peor que el que ya existía, así que la
+1.0.0 queda como un tag histórico sin release y **la 1.0.1 es la primera
+versión que se publica**.
+
+Ninguna garantía de reconstrucción cambia respecto a la 1.0.0.
+
+#### Seguridad
+
+- **wasmtime 36.0.12 → 36.0.13**, que cierra
+  [RUSTSEC-2026-0222](https://rustsec.org/advisories/RUSTSEC-2026-0222)
+  (CVSS 3.8, bajo): stores que podían confundir índices de tipo entre
+  engines. Alcanzable solo por `df-plugin`. Se mantiene la línea LTS 36, que
+  es la restricción que el pin ya llevaba; el lock mueve 62 líneas, todas
+  versiones de las familias `wasmtime` y `wasmparser`, sin añadir ni quitar
+  paquetes.
+
+#### Corregido
+
+- **Validar una raíz de origen ya no la crea.** La ruta de extracción
+  llamaba a `validate`, que hace `create_dir_all`, sobre una raíz de
+  *origen*: apuntar a una carpeta que no existía la creaba, escribiendo
+  dentro del territorio que la regla 1 declara intocable. `validate_existing`
+  no crea nada.
+- **Un destino lleno detiene la ejecución** en vez de intentar todas las
+  operaciones restantes. Lo pendiente queda `PENDING`, la que topó queda
+  `FAILED_RETRYABLE`, y el proyecto pausa: el estado del que parte reanudar
+  tras liberar espacio.
+- **Soltar una carpeta cae donde apuntas**, no en el campo que tuviera el
+  foco.
+- El asistente ya no continúa un proyecto que describe otras carpetas.
+
+#### Añadido
+
+- **Asistente guiado**: tres decisiones en lugar de siete comandos. Elegir
+  las dos carpetas, mirar lo encontrado y decir que sí, recoger el resultado
+  verificado. Reanuda un trabajo interrumpido en lugar de negarse, pregunta
+  por un destino sin identidad física *antes* de copiar (ADR-0036), y no
+  enseña ningún número que no haya obtenido del motor en esa ejecución.
+- **La pantalla avanzada ejecuta el pipeline**: ofrece el único stage que el
+  motor aceptaría, derivado de la misma tabla con la que el asistente
+  reanuda.
+- `ExecuteOutcome.out_of_space`; comandos de escritorio `validate_plan` y
+  `destination_guarantees`.
+- Manual de usuario con sección de escritorio y
+  `docs/release/field-test-readiness.md`: qué está probado, qué no, y qué
+  recoger si algo falla.
+
+#### Calidad
+
+- `DF_REQUIRE_HARDENING=1` convierte en fallo cualquier test de
+  endurecimiento que no pueda ejecutarse. Trece imprimían `SKIP` y pasaban,
+  así que el job de CI de Windows podía dar verde sin haber probado nada de
+  lo que promete. CI lo fija.
+
+#### Añadido
+
+- **El ledger distingue una decisión humana de una de un agente.** El actor
+  `agent` es el LLM que conduce el motor por cuenta de una persona, y se
+  registra aparte de `cli`. El conjunto de acciones seguras es idéntico para
+  ambos: la atribución dice *quién*, nunca concede *más*. Sin esto, un modelo
+  respondiendo la cola de revisión quedaba anotado como si fuera el usuario, y
+  un archivo probatorio cuyo rastro no separa ambas cosas no tiene rastro.
+  La CLI expone `--actor`, que solo admite `cli` o `agent`: `system` es del
+  motor y `test` del código de test, y dejar que un llamante los reclamase
+  sería dejarle disfrazar sus propias decisiones. No hubo migración; la
+  columna `actor` nunca tuvo restricción de valores.
+- **Decisiones de revisión por lotes** (`review decide-batch`), leídas como
+  JSON desde stdin o fichero. Una cola sobre un archivo real ronda los miles
+  de elementos, la mayoría repeticiones de un puñado de preguntas, y los
+  identificadores por sí solos desbordan una línea de órdenes; resolverlos a
+  un proceso por elemento no es un flujo de trabajo. Cada decisión conserva su
+  propia justificación y su propio evento encadenado —el lote es transporte,
+  nunca un registro más débil— y todas entran o no entra ninguna: media cola
+  decidida no es un estado sobre el que nadie pueda razonar.
+- **`dataforge plan tree`**: el árbol de salida que produciría el plan, antes
+  de aprobarlo. El plan ya guardaba la ruta de destino de cada aparición, pero
+  no había forma de verla, y aprobar congela un manifiesto inmutable: era
+  pedir una firma a ciegas. La profundidad es una vista y nunca un filtro, así
+  que los totales no cambian al ampliarla. Una copia sin destino registrado se
+  reporta con código de salida propio en vez de descontarse en silencio, que
+  es justamente el defecto que esta vista existe para destapar. La app de
+  escritorio la muestra encima del botón de aprobar, no en otra pantalla.
+- **Un hashing interrumpido se puede continuar** (`--resume-interrupted`).
+  `HASH_PAUSED` solo lo escribía la ruta cooperativa de cancelación, así que
+  una muerte abrupta —un cierre de ventana, un corte de luz— dejaba el
+  proyecto en `HASHING` con la cola intacta pero inalcanzable, un estado que
+  ninguna etapa acepta. El executor ya trataba su caso equivalente; el hash
+  era el olvidado. Nunca se infiere: el motor no puede distinguir un run
+  muerto de uno vivo sobre la misma base, así que el opt-in es el operador
+  afirmando que no hay otro activo. El run interrumpido se cierra con su
+  propio evento `HASH_PAUSED` antes de arrancar el nuevo, de modo que el
+  ledger explique por qué se permitió reiniciar. La app de escritorio lo
+  reanuda sola, simétrica ya con la ejecución (ADR-0029).
+
+- **El asistente guiado retoma un trabajo interrumpido** en lugar de
+  negarse. Una pasada sobre un archivo real dura de minutos a horas, así
+  que la interrupción es lo normal: hasta ahora una segunda ejecución
+  moría con «el directorio del proyecto ya existe» y tiraba todo el
+  hashing hecho. La decisión vive en una tabla pura (`resume.ts`), una
+  entrada por estado, cada una calcada de una guarda que existe de verdad
+  en el motor. Los estados que ningún stage acepta (`SCANNING`, `HASHING`,
+  `ANALYSIS_PAUSED`, `VERIFYING`, `ARCHIVED`) y cualquier estado
+  desconocido degradan a «abre el detalle», nunca a una suposición.
+- **La pantalla avanzada ejecuta el pipeline.** «Prefiero configurarlo yo»
+  creaba un proyecto y ahí se acababa: no había botón para scan, hash,
+  analyze, plan, approve, execute ni verify en ninguna parte, de modo que
+  las dos razones para usar el modo avanzado — varias raíces de origen y
+  el perfil jurídico — no llevaban a ningún sitio. Ofrece un solo botón,
+  el del único stage que el motor aceptaría, derivado de la misma tabla.
+- `ExecuteOutcome.out_of_space` y el comando de escritorio `validate_plan`
+  (lectura; re-ejecuta los invariantes §26.5 sobre el plan almacenado).
+
+#### Corregido
+
+- **Un destino lleno detiene la ejecución** en vez de intentar todas las
+  operaciones restantes. Cada una repetía el mismo trabajo condenado —
+  lease, parcial, bytes hasta ENOSPC, limpieza, dos commits SQLite —: en
+  un plan de un millón de archivos, horas de fallo garantizado que
+  entierran el único dato útil bajo un millón de filas `NO_SPACE`
+  idénticas. Lo pendiente queda `PENDING`, la operación que topó queda
+  `FAILED_RETRYABLE`, y el proyecto pausa: justo el estado del que parte
+  reanudar tras liberar espacio. ENOSPC no tenía cobertura en ningún
+  punto del repositorio pese a ser el fallo más probable en producción.
+- **Soltar una carpeta cae donde apuntas.** El manejador de arrastre
+  llenaba el campo que tuviera el foco e ignoraba la posición del puntero
+  que Tauri le pasa; soltar sobre la segunda caja y verlo aparecer en la
+  primera se lee, para un usuario, como que la aplicación está rota.
+- Los tests de endurecimiento que no podían ejecutarse imprimían `SKIP` y
+  pasaban, así que el job de CI de endurecimiento en Windows podía dar
+  verde sin haber probado nada de lo que promete. `DF_REQUIRE_HARDENING=1`
+  (que ese job ahora fija) convierte cualquier skip en fallo.
+- El asistente ya no continúa un proyecto que describe otras carpetas: el
+  directorio del proyecto se deriva del destino, así que reutilizar un
+  destino con otro origen habría seguido silenciosamente el trabajo ajeno
+  contra la fuente equivocada.
+
+## [1.0.0] — 2026-07-24 — Milestone 1.0 "Stable Reconstruction Platform"
 
 Primera versión estable. El pipeline completo — inventario inmutable,
 análisis estructural y de contenido, plan aprobado, copia verificada y

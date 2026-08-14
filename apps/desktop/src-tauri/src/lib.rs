@@ -3,12 +3,14 @@
 //! The UI holds no critical logic (RFC-0001 rule 16): every command below
 //! delegates to `df-facade`, exactly like the CLI does.
 
-use df_domain::Actor;
+use df_domain::{Actor, DuplicatePolicy};
 use df_error::DfError;
 use df_facade::{
-    ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
-    ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest, MediaOutcome, ProjectStatus,
-    QueryOptions, SearchRequest, SimilarityOutcome, SnapshotBuildOptions,
+    AnalyzeOutcome, ApproveOutcome, ContentArtifactBuildOutcome, ContentExtractionOptions,
+    ContentExtractionOutcome, ContentQueryOutcome, ContentSearchOutcome, CreateProjectRequest,
+    DestinationGuarantees, ExecuteOptions, ExecuteOutcome, HashOutcome, MediaOutcome,
+    PlanDestinationTree, PlanOutcome, PlanValidationReport, ProjectStatus, QueryOptions,
+    ScanOutcome, SearchRequest, SimilarityOutcome, SnapshotBuildOptions, VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -65,6 +67,150 @@ fn open_project(project_dir: String) -> Result<ProjectStatus, ErrorDto> {
 #[tauri::command]
 fn project_status(project_dir: String) -> Result<ProjectStatus, ErrorDto> {
     df_facade::project_status(std::path::Path::new(&project_dir)).map_err(ErrorDto::from)
+}
+
+// --- The reconstruction pipeline -----------------------------------------
+//
+// Until now the shell could create a project and run the optional analyses,
+// but not the work the product exists for: a non-technical user had to drop
+// to the CLI to actually reconstruct anything. Each command below is the same
+// facade call the CLI makes, run off the UI thread because these are long.
+
+/// Inventory the sources into an immutable snapshot. Reads only.
+#[tauri::command]
+async fn scan_project(project_dir: String) -> Result<ScanOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::scan_project(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Give every scanned file its content identity (BLAKE3 + SHA-256).
+///
+/// Resumes a project stranded in `HASHING` by a killed run, mirroring how the
+/// executor treats a stranded `EXECUTING`. The desktop shell owns the project
+/// it opened and ADR-0029 excludes concurrent writers, so here the state means
+/// "an earlier run died", not "a run is live" — the ambiguity that makes the
+/// CLI demand `--resume-interrupted` does not arise.
+#[tauri::command]
+async fn hash_project(project_dir: String) -> Result<HashOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::hash_project_with_options(
+            std::path::Path::new(&project_dir),
+            Actor::Desktop,
+            &df_facade::HashOptions {
+                resume_interrupted: true,
+                ..df_facade::HashOptions::default()
+            },
+        )
+    })
+    .await
+}
+
+/// The output tree the current plan would produce (read-only).
+///
+/// Approving freezes a manifest, so the shape of the result has to be
+/// visible *before* that, not inferred from operation counts.
+#[tauri::command]
+async fn plan_destination_tree(
+    project_dir: String,
+    depth: u32,
+) -> Result<PlanDestinationTree, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::plan_destination_tree(std::path::Path::new(&project_dir), depth)
+    })
+    .await
+}
+
+/// Materialise the exact-duplicate evidence of the hashed snapshot.
+#[tauri::command]
+async fn analyze_project(project_dir: String) -> Result<AnalyzeOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::analyze_project(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Propose the reconstruction. `REPORT_ONLY` is the only policy the guided
+/// flow offers: duplicates are reported, never consolidated, so nothing the
+/// user owns can be dropped by a decision they did not make.
+#[tauri::command]
+async fn create_plan(project_dir: String) -> Result<PlanOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::create_plan(
+            std::path::Path::new(&project_dir),
+            Actor::Desktop,
+            DuplicatePolicy::ReportOnly,
+        )
+    })
+    .await
+}
+
+/// Re-run the §26.5 invariants against the stored plan.
+///
+/// The guided flow uses this when it resumes a project that was planned in an
+/// earlier session: the operation count it shows must come from the plan on
+/// disk, and a plan the user is about to approve is worth re-validating rather
+/// than trusting because it was valid once.
+#[tauri::command]
+async fn validate_plan(project_dir: String) -> Result<PlanValidationReport, ErrorDto> {
+    run_blocking_command(move || df_facade::validate_plan(std::path::Path::new(&project_dir))).await
+}
+
+/// Freeze the plan into the immutable execution manifest.
+#[tauri::command]
+async fn approve_plan(project_dir: String) -> Result<ApproveOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::approve_plan(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// What the destination volume can guarantee, so the UI can ask before the
+/// copy rather than fail after it (ADR-0036).
+#[tauri::command]
+fn destination_guarantees(project_dir: String) -> Result<DestinationGuarantees, ErrorDto> {
+    df_facade::destination_guarantees(std::path::Path::new(&project_dir)).map_err(ErrorDto::from)
+}
+
+/// Execute the approved manifest: verified copy, resumable, never replacing.
+#[tauri::command]
+async fn execute_plan(project_dir: String) -> Result<ExecuteOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::execute_plan(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
+}
+
+/// Execute towards a destination without physical identity guarantees.
+///
+/// Separate command rather than a flag, so the acknowledgement ADR-0036
+/// requires is visible at the call site and cannot be passed by accident: a
+/// UI that wants this has to have asked for it.
+#[tauri::command]
+async fn execute_plan_on_degraded_destination(
+    project_dir: String,
+) -> Result<ExecuteOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::execute_plan_with_options(
+            std::path::Path::new(&project_dir),
+            Actor::Desktop,
+            &ExecuteOptions {
+                allow_degraded_destination: true,
+                ..Default::default()
+            },
+        )
+    })
+    .await
+}
+
+/// Re-check the output from primary evidence, independently of the executor.
+#[tauri::command]
+async fn verify_project(project_dir: String) -> Result<VerifyOutcome, ErrorDto> {
+    run_blocking_command(move || {
+        df_facade::verify_project_output(std::path::Path::new(&project_dir), Actor::Desktop)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -172,6 +318,17 @@ pub fn run() {
             create_project,
             open_project,
             project_status,
+            scan_project,
+            hash_project,
+            analyze_project,
+            create_plan,
+            plan_destination_tree,
+            validate_plan,
+            approve_plan,
+            destination_guarantees,
+            execute_plan,
+            execute_plan_on_degraded_destination,
+            verify_project,
             analyze_similarity,
             analyze_media,
             extract_content,
