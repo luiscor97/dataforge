@@ -4057,6 +4057,59 @@ mod tests {
     }
 
     #[test]
+    fn every_long_stage_says_it_is_running() {
+        // `RunStage` declared five stages and only three ever claimed one.
+        // Scan was fixed when a real scan reported `active_run: null`; Analyze
+        // and Verify kept the same defect for months, because a variant
+        // existing in the enum makes the stage look covered. Caught by running
+        // `verify` on a 438 GB archive and finding the table empty while a
+        // process held the project.
+        //
+        // The match below is exhaustive on purpose: adding a sixth stage will
+        // not compile until someone names what claims it. That is the part
+        // that stops this recurring — the previous fix left no such question
+        // behind, so nobody was ever asked it again.
+        fn claimant(stage: df_db::liveness::RunStage) -> &'static str {
+            use df_db::liveness::RunStage::*;
+            match stage {
+                Scan => "df-scan",
+                Hash => "df-hash",
+                Analyze => "df-planner",
+                Execute => "df-executor",
+                Verify => "df-verifier",
+            }
+        }
+
+        use df_db::liveness::RunStage;
+        for stage in [
+            RunStage::Scan,
+            RunStage::Hash,
+            RunStage::Analyze,
+            RunStage::Execute,
+            RunStage::Verify,
+        ] {
+            let crate_name = claimant(stage);
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(crate_name)
+                .join("src/lib.rs");
+            let text = std::fs::read_to_string(&source)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source.display()));
+            let claim = format!("RunStage::{}", stage.as_str_pascal());
+            assert!(
+                text.contains(&claim) && text.contains("liveness::claim"),
+                "{crate_name} runs the {} stage without claiming the project; \
+                 `project_status` would report nobody is working while it does",
+                stage.as_str()
+            );
+            assert!(
+                text.contains("liveness::release"),
+                "{crate_name} claims the project and never releases it"
+            );
+        }
+    }
+
+    #[test]
     fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
         // Found on a 444 GB archive: `plan create` produced a tree whose shape
         // was wrong, and there was no way to build a second one. `create_plan`

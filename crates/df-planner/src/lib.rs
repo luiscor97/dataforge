@@ -232,6 +232,11 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
     if project.state == ProjectState::Hashed {
         repository::update_project_state(db, ProjectState::Analyzing, actor)?;
     }
+    // `RunStage::Analyze` has existed since the liveness table was added and
+    // nothing ever claimed it, so an analysis that takes minutes on a real
+    // archive reported `active_run: null` throughout. Same defect as the one
+    // fixed in scan, in a stage the enum made look already covered.
+    df_db::liveness::claim(db, project.id, df_db::liveness::RunStage::Analyze, actor)?;
     let summary = materialize_analysis_evidence(
         db,
         project.id,
@@ -249,6 +254,7 @@ pub fn analyze_project(db: &mut Db, actor: Actor) -> DfResult<AnalyzeOutcome> {
         &summary,
         actor,
     )?;
+    df_db::liveness::release(db, project.id)?;
     let project = if legacy_upgrade {
         // Databases produced by an earlier M0.2 increment may already be in
         // ANALYZED without the 0010 completion marker. Recompute the new
