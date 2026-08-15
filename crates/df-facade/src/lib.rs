@@ -4417,6 +4417,11 @@ mod tests {
     }
 
     /// Count CSV fields honouring quoting.
+    ///
+    /// Gated with its only caller: a helper left behind when the test that
+    /// used it is compiled out is dead code, and this workspace denies
+    /// warnings. Gating a test is never just gating the test.
+    #[cfg(windows)]
     fn csv_columns(line: &str) -> usize {
         let mut fields = 1;
         let mut quoted = false;
