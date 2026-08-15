@@ -2535,8 +2535,16 @@ pub fn device_preflight(project_dir: &Path) -> DfResult<DevicePreflight> {
     if shared == Some(true) {
         rationale.push_str(
             " An origin and the destination are on the same physical device, so \
-             the copy stage will read and write through one queue; expect it to \
-             run slower than either would alone.",
+             the copy stage reads and writes through one queue. Measured on a \
+             444 GB run over an external platter, that cost about 6%: hashing \
+             read at 20.9 MB/s and copying managed 19.7 MB/s doing both, \
+             because the write cache absorbs the writes and flushes them in \
+             batches instead of making the head travel per file. Worth knowing \
+             and not worth moving the destination for. What did cost 2.5x on \
+             that disk was the *origin's* layout: re-reading the freshly \
+             written output ran at 53.4 MB/s against 20.9 for a decade-old \
+             archive, so fragmentation, not the shared queue, is what sets the \
+             pace here.",
         );
     }
 

@@ -493,6 +493,17 @@ fn run_parallel(
     let in_flight_cap = resolve_in_flight(options.max_in_flight, workers);
     let buffer_bytes = options.copy_buffer_bytes;
     let mut cancelled = false;
+    // A full destination stops this path too, the same way it stops the
+    // sequential one and for the same reason: carrying on attempts every
+    // remaining copy, which at millions of files is hours of guaranteed
+    // failure burying the one fact the operator needs.
+    //
+    // It behaves exactly like `cancelled` — stop refilling, stop dispatching,
+    // let what is in flight land — rather than aborting. Workers already
+    // writing are not interrupted, so no partial is orphaned, and everything
+    // untouched stays PENDING, which is what resuming after freeing space
+    // picks up.
+    let mut out_of_space = false;
 
     let bytes = std::thread::scope(|scope| -> DfResult<u64> {
         // The message channel is created *inside* the scope on purpose. A
@@ -681,7 +692,7 @@ fn run_parallel(
                 cancelled |= cancel_now;
                 // Refill the ready queue from the database when it runs low.
                 // Copy-only paging so directories never mask pending copies.
-                if ready.is_empty() && !exhausted && !cancelled {
+                if ready.is_empty() && !exhausted && !cancelled && !out_of_space {
                     let batch =
                         plans::executable_copy_operations(db, plan_id, options.operation_batch)?;
                     let batch_empty = batch.is_empty();
@@ -705,8 +716,9 @@ fn run_parallel(
                         exhausted = true;
                     }
                 }
-                // Dispatch while capacity and work remain and not cancelled.
-                while outstanding < in_flight_cap && !cancelled {
+                // Dispatch while capacity and work remain, and neither a
+                // cancellation nor a full destination has stopped the run.
+                while outstanding < in_flight_cap && !cancelled && !out_of_space {
                     let Some(operation) = ready.pop_front() else {
                         break;
                     };
@@ -758,7 +770,7 @@ fn run_parallel(
                         ready.extend(deferred.drain(..));
                         continue;
                     }
-                    if cancelled || (exhausted && ready.is_empty()) {
+                    if cancelled || out_of_space || (exhausted && ready.is_empty()) {
                         break;
                     }
                     if ready.is_empty() {
@@ -793,6 +805,9 @@ fn run_parallel(
                         outcome,
                     }) => {
                         bytes_copied += outcome.bytes_copied;
+                        // Same predicate the sequential path uses, so the two
+                        // report the same event by the same test.
+                        out_of_space |= outcome.error_code == Some(OperationErrorCode::NoSpace);
                         // Micro-batch the result commits: every operation here has
                         // already finalised on disk, so a lost batch leaves each one
                         // in the finalised-but-unrecorded window, which the next run
@@ -839,13 +854,7 @@ fn run_parallel(
         Ok(bytes_copied)
     })?;
 
-    // The parallel coordinator does not yet stop the whole run on ENOSPC the
-    // way the sequential path does: its workers are already in flight when the
-    // first NO_SPACE lands. Reporting `false` is the honest reading — the run
-    // did not stop *for* a full disk — and the operations still fail
-    // retryably, so nothing is lost and resuming after freeing space works.
-    // Making it stop early is a follow-up, tracked in the PR.
-    Ok((bytes, cancelled, !attempted.is_empty(), false))
+    Ok((bytes, cancelled, !attempted.is_empty(), out_of_space))
 }
 
 fn execution_source_roots(
@@ -1796,39 +1805,68 @@ struct StreamedCopy {
 /// the whole run on it, so that rule needs a test that drives the real loop —
 /// not one that only checks the error mapping. Filling a real volume is not
 /// something a unit test can do portably, so the write is made to fail here
-/// instead. Thread-local, so tests running in parallel cannot see each other's
-/// injection.
+/// instead.
+///
+/// **Shared across threads and scoped to one test's tree.** It used to be a
+/// `thread_local!`, which bought isolation for free and quietly made the
+/// parallel executor untestable: its copies happen on worker threads, which
+/// never saw the injection. The result was a coordinator reporting
+/// `out_of_space: false` on a full disk, with no test able to catch it. A
+/// fault the harness cannot reach is a fault the suite will keep missing.
+///
+/// Making it global restores the reach and costs the isolation — every other
+/// test in the process shares it, and a first attempt at serialising only the
+/// injecting tests failed exactly there: the lock kept them apart from each
+/// other and not from everyone else. So the injection carries the directory it
+/// applies to, and a copy fails only when its **source** sits inside that
+/// tree. Tests use their own temp directories, so concurrent ones cannot see
+/// each other's full disk, and worker threads can.
 ///
 /// Gated on `windows` to match the test module below: off Windows the executor
 /// refuses to run at all (ADR-0017), so nothing would call this and it would
 /// be dead code under `-D warnings`.
 #[cfg(all(test, windows))]
 mod fault {
-    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
 
-    thread_local! {
-        static COPIES_UNTIL_DISK_FULL: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The tree the injection applies to, and the copies still allowed in it.
+    static INJECTION: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+
+    fn held() -> MutexGuard<'static, Option<(PathBuf, usize)>> {
+        // A poisoned lock only means an earlier disk-full test panicked.
+        // Propagating it would fail every later test and bury the one that
+        // actually broke.
+        INJECTION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Let `copies` copies through, then fail every later write with ENOSPC.
-    pub(super) fn fill_disk_after(copies: usize) {
-        COPIES_UNTIL_DISK_FULL.with(|cell| cell.set(Some(copies)));
+    /// Within `scope`, let `copies` copies through and fail every later write
+    /// with ENOSPC.
+    pub(super) fn fill_disk_after(scope: &Path, copies: usize) {
+        *held() = Some((scope.to_path_buf(), copies));
     }
 
     pub(super) fn clear() {
-        COPIES_UNTIL_DISK_FULL.with(|cell| cell.set(None));
+        *held() = None;
     }
 
-    /// True once the injected budget is spent. Consumes one copy otherwise.
-    pub(super) fn disk_is_full() -> bool {
-        COPIES_UNTIL_DISK_FULL.with(|cell| match cell.get() {
-            None => false,
-            Some(0) => true,
-            Some(remaining) => {
-                cell.set(Some(remaining - 1));
-                false
+    /// True once this tree's budget is spent. Consumes one copy otherwise.
+    pub(super) fn disk_is_full(source: &Path) -> bool {
+        match &mut *held() {
+            // Decided under the lock, so two workers cannot both spend the
+            // last copy and slip past a wall that should have stopped them.
+            Some((scope, remaining)) if source.starts_with(&*scope) => {
+                if *remaining == 0 {
+                    true
+                } else {
+                    *remaining -= 1;
+                    false
+                }
             }
-        })
+            _ => false,
+        }
     }
 }
 
@@ -1843,7 +1881,7 @@ fn stream_copy(
     buffer: &mut [u8],
 ) -> std::io::Result<StreamedCopy> {
     #[cfg(all(test, windows))]
-    if fault::disk_is_full() {
+    if fault::disk_is_full(source) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::StorageFull,
             "injected: no space left on device",
@@ -3348,7 +3386,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut fx = approved_project(tmp.path());
 
-        fault::fill_disk_after(1);
+        fault::fill_disk_after(tmp.path(), 1);
         let outcome = execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None);
         fault::clear();
         let outcome = outcome.unwrap();
@@ -3375,11 +3413,55 @@ mod tests {
     }
 
     #[test]
+    fn the_parallel_path_stops_for_a_full_disk_too() {
+        // It used to report `out_of_space: false` unconditionally, which was
+        // literally true — the run did not stop — and defeated the field's
+        // whole purpose, which is to let a caller say what happened instead of
+        // handing them an unexplained pile of retryable failures. A guarantee
+        // that holds only at one worker is not a guarantee.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fx = approved_project(tmp.path());
+
+        fault::fill_disk_after(tmp.path(), 1);
+        let outcome = execute_plan(
+            &mut fx.db,
+            Actor::Test,
+            &ExecuteOptions {
+                workers: 4,
+                ..ExecuteOptions::default()
+            },
+            None,
+        );
+        fault::clear();
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.out_of_space, "the run must report why it stopped");
+        assert_eq!(outcome.state, "EXECUTION_PAUSED");
+        // What is deliberately *not* asserted: that work was left PENDING.
+        // The coordinator does stop dispatching on the first NO_SPACE, but
+        // whether anything is left to stop depends on the in-flight window —
+        // and `resolve_in_flight` never lets it fall below the worker count,
+        // so on a three-file fixture every copy can already be in flight
+        // before the wall lands. Asserting it here would be asserting the
+        // scheduler, and a test that passes on timing is worse than none.
+        //
+        // The deterministic property is the one the field cares about: the
+        // run says a full disk is why it stopped, at any worker count.
+        assert!(
+            outcome.failed_retryable >= 1,
+            "the copy that hit the wall is retryable, so freeing space fixes it"
+        );
+        // And a stopped run leaves the destination no worse: every doomed
+        // partial is cleaned up, including the ones workers abandoned.
+        assert!(no_partials_left(&fx.output));
+    }
+
+    #[test]
     fn freeing_space_and_running_again_finishes_the_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let mut fx = approved_project(tmp.path());
 
-        fault::fill_disk_after(1);
+        fault::fill_disk_after(tmp.path(), 1);
         let stopped = execute_plan(&mut fx.db, Actor::Test, &ExecuteOptions::default(), None);
         fault::clear();
         assert!(stopped.unwrap().out_of_space);
