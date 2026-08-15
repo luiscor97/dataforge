@@ -122,6 +122,14 @@ enum Command {
         /// mode remains the default and the evidential recommendation.
         #[arg(long)]
         incremental: bool,
+        /// Parallel hashing workers. 0 = auto (a conservative cap on the
+        /// machine's parallelism). The result is identical for any value;
+        /// use 1 to reproduce sequential behaviour.
+        ///
+        /// On a spinning disk more workers make the head travel instead of
+        /// read: `report devices` says which kind this volume is.
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
         /// Continue a project stranded in `HASHING` by a run that died
         /// without pausing (a kill, a power cut, a closed window). Only
         /// pass this when no other hash run is active: DataForge still
@@ -207,12 +215,22 @@ enum Command {
         /// guarantees (network shares, FAT variants) â€” ADR-0036.
         #[arg(long)]
         allow_degraded_destination: bool,
+        /// Parallel copy workers under a single database coordinator
+        /// (strict-parallel). Default 1 = sequential; `0` = auto. Any value
+        /// produces byte-identical output and the same recovery. Opt-in until
+        /// the full crash-injection acceptance lands.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
     },
     /// Verify the executed plan from primary evidence.
     Verify {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Parallel re-hash workers. 0 = auto. The verdict and findings are
+        /// identical for any value; use 1 to reproduce sequential behaviour.
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
     },
     /// Export the delivery package: traceability map, checksum manifest and
     /// the statement of guarantees, all derived from the frozen manifest.
@@ -809,6 +827,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Hash {
             path,
             incremental,
+            workers,
             resume_interrupted,
             max_files,
         } => df_facade::hash_project_with_options(
@@ -816,6 +835,7 @@ fn run(cli: &Cli) -> DfResult<Output> {
             actor,
             &df_facade::HashOptions {
                 incremental: *incremental,
+                workers: *workers,
                 resume_interrupted: *resume_interrupted,
                 max_files: *max_files,
                 ..df_facade::HashOptions::default()
@@ -1101,18 +1121,26 @@ fn run(cli: &Cli) -> DfResult<Output> {
         Command::Execute {
             path,
             allow_degraded_destination,
+            workers,
         } => df_facade::execute_plan_with_options(
             path,
             actor,
             &df_facade::ExecuteOptions {
                 allow_degraded_destination: *allow_degraded_destination,
+                workers: *workers,
                 ..df_facade::ExecuteOptions::default()
             },
         )
         .map(Output::Execute),
-        Command::Verify { path } => {
-            df_facade::verify_project_output(path, actor).map(Output::Verify)
-        }
+        Command::Verify { path, workers } => df_facade::verify_project_output_with_options(
+            path,
+            actor,
+            &df_facade::VerifyOptions {
+                workers: *workers,
+                ..df_facade::VerifyOptions::default()
+            },
+        )
+        .map(Output::Verify),
         Command::Deliver { path } => df_facade::export_delivery_package(path).map(Output::Deliver),
         Command::Report { command } => match command {
             ReportCommand::Duplicates { path } => {

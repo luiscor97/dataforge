@@ -853,33 +853,74 @@ pub struct ExecutableOperation {
 /// hash (threat T5). `plan_operations` is still joined, but only for the
 /// mutable *progress* columns (approval, execution_state) — never for what to
 /// read or expect.
+/// Copy-family operation types (everything that opens a partial and finalises).
+const COPY_OPERATION_TYPES: &str =
+    "'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY', \
+     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT'";
+
+/// Every executable operation type (copies plus directories).
+const ALL_EXECUTABLE_TYPES: &str =
+    "'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY', \
+     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY'";
+
+/// Executable operations of any type (copies and directories interleaved by
+/// sequence). Used by the sequential executor, which completes each operation
+/// before the next fetch so a filtered window never masks pending work.
 pub fn executable_operations(
     db: &Db,
     plan_id: PlanId,
     limit: u32,
 ) -> DfResult<Vec<ExecutableOperation>> {
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT m.operation_id, m.sequence, m.operation_type,
-                    m.destination_relative_path, m.source_root_path_snapshot,
-                    m.source_relative_path_exact, m.source_fingerprint,
-                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
-                    m.source_raw_relative_path, m.source_root_identity,
-                    p.execution_state, p.partial_lease_token,
-                    p.partial_lease_identity
-             FROM execution_manifest m
-             JOIN plan_operations p ON p.id = m.operation_id
-             WHERE m.plan_id = ?1
-               AND p.approval = 'APPROVED'
-               AND m.operation_type IN
-                   ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                    'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')
-               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
-             ORDER BY m.sequence
-             LIMIT ?2",
-        )
-        .map_err(db_err)?;
+    query_executable_operations(db, plan_id, limit, ALL_EXECUTABLE_TYPES)
+}
+
+/// Executable **copy** operations only. The parallel executor pages copies
+/// separately from directories: `ORDER BY sequence LIMIT n` over a mixed set
+/// can return a window full of the other type, which the caller would misread
+/// as "no work left" while operations remain past the window.
+pub fn executable_copy_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+) -> DfResult<Vec<ExecutableOperation>> {
+    query_executable_operations(db, plan_id, limit, COPY_OPERATION_TYPES)
+}
+
+/// Executable **directory** operations only (the parallel executor's
+/// sequential pre-stage), paged the same way for the same reason.
+pub fn executable_directory_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+) -> DfResult<Vec<ExecutableOperation>> {
+    query_executable_operations(db, plan_id, limit, "'CREATE_DIRECTORY'")
+}
+
+fn query_executable_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+    operation_types: &str,
+) -> DfResult<Vec<ExecutableOperation>> {
+    // `operation_types` is a hardcoded constant list, never caller input.
+    let sql = format!(
+        "SELECT m.operation_id, m.sequence, m.operation_type,
+                m.destination_relative_path, m.source_root_path_snapshot,
+                m.source_relative_path_exact, m.source_fingerprint,
+                m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
+                m.source_raw_relative_path, m.source_root_identity,
+                p.execution_state, p.partial_lease_token,
+                p.partial_lease_identity
+         FROM execution_manifest m
+         JOIN plan_operations p ON p.id = m.operation_id
+         WHERE m.plan_id = ?1
+           AND p.approval = 'APPROVED'
+           AND m.operation_type IN ({operation_types})
+           AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
+         ORDER BY m.sequence
+         LIMIT ?2"
+    );
+    let mut stmt = db.conn().prepare(&sql).map_err(db_err)?;
     let rows: Vec<DfResult<ExecutableOperation>> = stmt
         .query_map(params![plan_id.to_string(), limit], |row| {
             Ok((
@@ -1065,12 +1106,50 @@ pub fn record_operation_outcome(
     operation_id: OperationId,
     outcome: &OperationOutcome,
 ) -> DfResult<()> {
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    record_outcome_in(&tx, operation_id, outcome)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Record several finished operations in **one** transaction (M1.0.1).
+///
+/// Safe to batch because every operation in the batch has already finalised on
+/// disk: if the commit never lands, each one sits in the "finalised but not
+/// recorded" window, where the next run finds the destination holding the
+/// expected content and resolves it idempotently as `SKIP_REPRESENTED` while
+/// clearing the lease (the window is pinned by
+/// `crash_after_finalize_before_outcome_resumes_and_clears_lease`). What must
+/// **not** be batched is the ownership claim: it is the durable barrier that
+/// has to commit before a worker writes a byte, so it stays one commit per
+/// operation.
+pub fn record_operation_outcomes(
+    db: &mut Db,
+    outcomes: &[(OperationId, OperationOutcome)],
+) -> DfResult<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for (operation_id, outcome) in outcomes {
+        record_outcome_in(&tx, *operation_id, outcome)?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// The per-operation body shared by the single and batched paths, so both
+/// write exactly the same rows and enforce the same invariants.
+fn record_outcome_in(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outcome: &OperationOutcome,
+) -> DfResult<()> {
     if outcome.retain_partial_lease && outcome.execution_state != ExecutionState::Running {
         return Err(DfError::Validation(
             "a retained partial lease requires RUNNING execution state".to_string(),
         ));
     }
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO operation_results
             (id, operation_id, outcome, error_code, detail, final_relative_path,
@@ -1123,7 +1202,6 @@ pub fn record_operation_outcome(
             "operation {operation_id} cannot record its outcome/lease state"
         )));
     }
-    tx.commit().map_err(db_err)?;
     Ok(())
 }
 

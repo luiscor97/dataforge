@@ -31,6 +31,12 @@ pub struct HashOptions {
     pub read_buffer_bytes: usize,
     /// Pending jobs fetched from the queue per round trip.
     pub job_batch: u32,
+    /// Filesystem/CPU workers hashing a batch in parallel. `0` = auto
+    /// (a conservative cap on the machine's parallelism). The database
+    /// coordinator stays single-threaded: workers only run the pure
+    /// `hash_one`, never touch SQLite, and the persisted result is identical
+    /// for any worker count (M1.0.1).
+    pub workers: usize,
     /// Carry content bindings forward from the previous complete snapshot
     /// when the v2 fingerprint is byte-identical with every field present
     /// (RFC-0001 §14.4 fast path; ADR-0035). Off by default: full mode is
@@ -71,11 +77,27 @@ impl Default for HashOptions {
         Self {
             read_buffer_bytes: 1024 * 1024,
             job_batch: 256,
+            workers: 0,
             incremental: false,
             resume_interrupted: false,
             max_files: None,
         }
     }
+}
+
+/// Resolve the effective worker count. `auto` (0) caps at the machine's
+/// parallelism but no higher than [`AUTO_WORKER_CAP`], because using every
+/// logical thread is rarely the fastest on mixed I/O and must be measured,
+/// not assumed (M1.0.1). An explicit request is honoured (still ≥ 1).
+fn resolve_workers(requested: usize) -> usize {
+    const AUTO_WORKER_CAP: usize = 8;
+    if requested > 0 {
+        return requested;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, AUTO_WORKER_CAP)
 }
 
 /// Result of a finished (or paused) hash run.
@@ -164,11 +186,14 @@ pub fn hash_project(
         0
     };
 
-    // One read buffer for the whole run, and one transaction per batch:
-    // per-file commits are what made large runs crawl, and the persistent
-    // queue keeps a crash safe — uncommitted results stay PENDING and are
-    // recomputed on resume.
-    let mut buffer = vec![0u8; options.read_buffer_bytes];
+    // The coordinator owns SQLite: it fetches a batch, hands the immutable
+    // jobs to a bounded worker pool, and persists the batch in one
+    // transaction. Workers never touch the database, so per-file commits (the
+    // thing that made large runs crawl) stay gone and the persistent queue
+    // keeps a crash safe — uncommitted results stay PENDING and are recomputed
+    // on resume. Results are keyed by job, so the persisted state is identical
+    // for any worker count.
+    let workers = resolve_workers(options.workers);
     let mut cancelled = false;
     let mut budget_spent: u64 = 0;
     let mut budget_exhausted = false;
@@ -177,24 +202,32 @@ pub fn hash_project(
         if jobs.is_empty() {
             break;
         }
-        let mut results = Vec::with_capacity(jobs.len());
-        for job in &jobs {
-            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                cancelled = true;
-                break;
-            }
-            // Checked before the work, so the budget is a ceiling on files
-            // hashed rather than on files hashed minus one.
-            if options.max_files.is_some_and(|max| budget_spent >= max) {
+        // The budget trims the batch *before* it is dispatched. With a worker
+        // pool the ceiling can only be on work handed out: a worker already
+        // reading a file cannot be told to un-hash it, and stopping mid-file
+        // would leave the job PENDING after paying for it.
+        let mut jobs = jobs;
+        if let Some(max) = options.max_files {
+            let remaining = max.saturating_sub(budget_spent) as usize;
+            if jobs.len() > remaining {
+                jobs.truncate(remaining);
                 budget_exhausted = true;
-                break;
             }
-            results.push(inventory::HashJobResult {
-                job,
-                outcome: hash_one(job, &mut buffer),
-            });
-            budget_spent += 1;
         }
+
+        let (outcomes, batch_cancelled) =
+            hash_batch(&jobs, workers, options.read_buffer_bytes, cancel);
+        cancelled |= batch_cancelled;
+        // Only jobs that actually produced an outcome are recorded; a job
+        // skipped because cancellation fired stays PENDING for the next run.
+        let results: Vec<inventory::HashJobResult> = jobs
+            .iter()
+            .zip(outcomes)
+            .filter_map(|(job, outcome)| {
+                outcome.map(|outcome| inventory::HashJobResult { job, outcome })
+            })
+            .collect();
+        budget_spent += results.len() as u64;
         inventory::record_hash_results(db, &results)?;
         // One beat per committed batch: the heartbeat tracks progress that
         // actually reached the database, never merely that the loop spun.
@@ -235,6 +268,63 @@ pub fn hash_project(
         cancelled,
         state: project.state.as_str().to_string(),
     })
+}
+
+/// Hash one batch across up to `workers` scoped threads, each with its own
+/// reusable buffer, pulling jobs by an atomic index (self-balancing across
+/// uneven file sizes). Returns one slot per input job — `None` when
+/// cancellation stopped it before it started — plus whether cancellation
+/// fired. No database access happens here.
+fn hash_batch(
+    jobs: &[PendingHashJob],
+    workers: usize,
+    read_buffer_bytes: usize,
+    cancel: Option<&AtomicBool>,
+) -> (Vec<Option<inventory::HashJobOutcome>>, bool) {
+    let effective = workers.clamp(1, jobs.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+
+    // Each worker returns (index, outcome) pairs; the coordinator merges them
+    // back into job order. Positions never collide (each index is claimed by
+    // exactly one worker via fetch_add), so the merge is unambiguous.
+    let collected: Vec<Vec<(usize, inventory::HashJobOutcome)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..effective)
+            .map(|_| {
+                let next = &next;
+                let cancelled = &cancelled;
+                scope.spawn(move || {
+                    let mut buffer = vec![0u8; read_buffer_bytes];
+                    let mut local = Vec::new();
+                    loop {
+                        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                            cancelled.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= jobs.len() {
+                            break;
+                        }
+                        local.push((idx, hash_one(&jobs[idx], &mut buffer)));
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("hash worker panicked"))
+            .collect()
+    });
+
+    let mut outcomes: Vec<Option<inventory::HashJobOutcome>> =
+        (0..jobs.len()).map(|_| None).collect();
+    for worker in collected {
+        for (idx, outcome) in worker {
+            outcomes[idx] = Some(outcome);
+        }
+    }
+    (outcomes, cancelled.load(Ordering::Relaxed))
 }
 
 /// Hash one file without touching the database; every per-file problem
@@ -566,6 +656,62 @@ mod tests {
             && e.reason.contains("navigation")
             && e.relative_path.contains("mapa.dat")));
         assert!(recorded.iter().any(|e| e.rule_id == "media.heavy"));
+    }
+
+    #[test]
+    fn parallel_hashing_is_deterministic_regardless_of_worker_count() {
+        // Build 40 duplicate pairs of varied sizes: every file lands in a
+        // duplicate set, so exact_duplicates covers every content identity.
+        fn build(root: &Path) {
+            std::fs::create_dir_all(root).unwrap();
+            for i in 0..40u32 {
+                let len = 1 + (i as usize * 997) % 5000;
+                let content: Vec<u8> = (0..len).map(|b| ((b as u32) ^ i) as u8).collect();
+                std::fs::write(root.join(format!("a-{i:03}.bin")), &content).unwrap();
+                std::fs::write(root.join(format!("b-{i:03}.bin")), &content).unwrap();
+            }
+        }
+        // Small buffer + small batch force multiple reads per file and several
+        // batches, exercising the parallel path across batch boundaries.
+        fn run(dir: &Path, workers: usize) -> (u64, u64, Vec<(String, u64, usize)>) {
+            let origin = dir.join("origen");
+            build(&origin);
+            let mut db = Db::open(&dir.join("state.sqlite")).unwrap();
+            let project = Project::new(
+                "det",
+                ProfileRef::default(),
+                dir.join("out"),
+                dir.join("audit"),
+                "test",
+            );
+            let roots = vec![SourceRoot::new(project.id, origin)];
+            repository::create_project(&mut db, &project, &roots, Actor::Test).unwrap();
+            scan_project(&mut db, Actor::Test, &ScanOptions::default(), None).unwrap();
+            let options = HashOptions {
+                read_buffer_bytes: 512,
+                job_batch: 7,
+                workers,
+                ..HashOptions::default()
+            };
+            let outcome = hash_project(&mut db, Actor::Test, &options, None).unwrap();
+            let snapshot = outcome.snapshot_id.parse().unwrap();
+            let mut sets: Vec<(String, u64, usize)> = exact_duplicates(&db, snapshot)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.sha256, s.size_bytes, s.occurrences.len()))
+                .collect();
+            sets.sort();
+            (outcome.hashed, outcome.failed, sets)
+        }
+
+        let sequential = run(&tempfile::tempdir().unwrap().path().join("seq"), 1);
+        let parallel = run(&tempfile::tempdir().unwrap().path().join("par"), 8);
+        assert_eq!(sequential.0, 80, "all 80 files hashed");
+        assert_eq!(sequential.1, 0, "no failures");
+        assert_eq!(
+            sequential, parallel,
+            "worker count must not change hashing results"
+        );
     }
 
     #[test]
