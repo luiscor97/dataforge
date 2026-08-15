@@ -559,6 +559,15 @@ copiar; reanudación exacta desde el manifiesto; fallo de verificación a
 
 ### M2.7 — Colocación por correspondencia
 
+> **Va después de M2.3, y no por planificación.** Medido sobre el corpus real:
+> hay 88 pares de carpetas con hijas homónimas y menos del 5% de contenido
+> común —invisibles para `tree_relations`, que compara contenido— y el mayor
+> tiene 333 hijas con nombres idénticos y 0% compartido. Pero la mitad de los
+> mayores son directorios de recursos de aplicaciones instaladas. **La
+> correspondencia por nombre no distingue por sí sola un inventario de clientes
+> de una carpeta de programa**, así que sin clasificación de contexto un
+> detector propondría fusionar las dos con la misma confianza.
+
 El verbo que faltaba. Añadido el 2026-08-15 a partir de
 [las-correcciones-del-trabajo-real.md](las-correcciones-del-trabajo-real.md):
 de las nueve correcciones que un operador tuvo que hacer a mano en el trabajo
