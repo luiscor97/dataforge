@@ -56,6 +56,25 @@ pub struct ExecuteOptions {
     /// unclassifiable volumes (ADR-0036). Without it, execution towards
     /// such a destination refuses fail-closed.
     pub allow_degraded_destination: bool,
+    /// Stop after this many copies and pause, leaving the rest of the plan
+    /// approved and pending.
+    ///
+    /// The same budget `HashOptions::max_files` gives hashing, for the stage
+    /// that needs it more: on the field corpus, hashing took six hours and
+    /// **executing took six and a half**, as one blocking call. A caller
+    /// driving the engine over stdio has one session, and a call that does not
+    /// return for most of a day is a call that never comes back.
+    ///
+    /// Nothing new had to be made resumable for this. The plan is already a
+    /// durable queue of operations and the executor already pauses
+    /// cooperatively, so a budget is only a decision about how much to hand
+    /// out before stopping.
+    ///
+    /// Exhausting it is neither a failure nor a cancellation: it takes the
+    /// same cooperative pause path, so the project lands in `EXECUTION_PAUSED`
+    /// with the rest still `PENDING`, and `pending` says how much is left.
+    /// `None` runs to completion, which is what a person at a terminal wants.
+    pub max_operations: Option<u64>,
 }
 
 impl Default for ExecuteOptions {
@@ -71,6 +90,7 @@ impl Default for ExecuteOptions {
             // opts in; `0` then means auto.
             workers: 1,
             max_in_flight: 0,
+            max_operations: None,
         }
     }
 }
@@ -360,6 +380,17 @@ fn run_sequential(
     let mut bytes_copied: u64 = 0;
     let mut cancelled = false;
     let mut out_of_space = false;
+    // Copies only. Directories are a `mkdir` and cost nothing worth bounding,
+    // and a caller asking for a thousand operations would otherwise spend the
+    // whole budget on the 47.592 directories the field plan begins with and
+    // copy nothing — a call that returns fast and did none of the work it was
+    // asked for.
+    //
+    // Nothing else is needed to report a spent budget: it leaves operations
+    // PENDING, and the caller already turns that into `EXECUTION_PAUSED`. Like
+    // hash, it does not set `cancelled` — the caller does not need to know why
+    // it stopped, only what is left, and `pending` says that either way.
+    let mut copies_done: u64 = 0;
     let mut buffer = vec![0u8; options.copy_buffer_bytes];
     'run: loop {
         let batch = plans::executable_operations(db, plan_id, options.operation_batch)?;
@@ -415,6 +446,12 @@ fn run_sequential(
             if outcome.error_code == Some(OperationErrorCode::NoSpace) {
                 out_of_space = true;
                 break 'run;
+            }
+            if operation.operation_type != OperationType::CreateDirectory {
+                copies_done += 1;
+                if options.max_operations.is_some_and(|max| copies_done >= max) {
+                    break 'run;
+                }
             }
         }
         // One beat per batch, not per operation: at 197k operations a
@@ -504,6 +541,12 @@ fn run_parallel(
     // untouched stays PENDING, which is what resuming after freeing space
     // picks up.
     let mut out_of_space = false;
+    // The budget caps work *handed out*, not work finished: a worker already
+    // streaming a file cannot be told to un-copy it, and stopping mid-file
+    // would leave the operation PENDING after paying for it. Same reasoning as
+    // the hash pool, which trims its batch before dispatch for the same
+    // reason.
+    let mut dispatched: u64 = 0;
 
     let bytes = std::thread::scope(|scope| -> DfResult<u64> {
         // The message channel is created *inside* the scope on purpose. A
@@ -718,7 +761,11 @@ fn run_parallel(
                 }
                 // Dispatch while capacity and work remain, and neither a
                 // cancellation nor a full destination has stopped the run.
-                while outstanding < in_flight_cap && !cancelled && !out_of_space {
+                while outstanding < in_flight_cap
+                    && !cancelled
+                    && !out_of_space
+                    && !options.max_operations.is_some_and(|max| dispatched >= max)
+                {
                     let Some(operation) = ready.pop_front() else {
                         break;
                     };
@@ -747,6 +794,10 @@ fn run_parallel(
                         })
                         .expect("workers dropped the work channel");
                     outstanding += 1;
+                    // This path only ever dispatches copies
+                    // (`executable_copy_operations`), so every dispatch is one
+                    // unit of the budget.
+                    dispatched += 1;
                 }
                 if outstanding == 0 {
                     // Nothing in flight. Flush any batched results first: until
@@ -770,7 +821,9 @@ fn run_parallel(
                         ready.extend(deferred.drain(..));
                         continue;
                     }
-                    if cancelled || out_of_space || (exhausted && ready.is_empty()) {
+                    let budget_spent = options.max_operations.is_some_and(|max| dispatched >= max);
+                    if cancelled || out_of_space || budget_spent || (exhausted && ready.is_empty())
+                    {
                         break;
                     }
                     if ready.is_empty() {
@@ -3410,6 +3463,66 @@ mod tests {
         assert_eq!(copied, 1, "only the copy before the wall may exist");
         // Space is not made worse: the doomed partial is cleaned up.
         assert!(no_partials_left(&fx.output));
+    }
+
+    #[test]
+    fn a_budget_stops_the_copy_and_leaves_the_rest_queued() {
+        // On the field corpus, executing took six and a half hours as one
+        // blocking call. Hashing had `max_files` for exactly this and the
+        // longest stage of all had nothing, so an agent driving over stdio
+        // could start a copy and never get an answer.
+        //
+        // Both paths, because a bound that only holds at one worker is not a
+        // bound -- the same lesson the full-disk stop had just taught.
+        for workers in [1, 4] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut fx = approved_project(tmp.path());
+
+            let first = execute_plan(
+                &mut fx.db,
+                Actor::Test,
+                &ExecuteOptions {
+                    workers,
+                    max_operations: Some(1),
+                    ..ExecuteOptions::default()
+                },
+                None,
+            )
+            .unwrap();
+
+            // Paused with work left, and *not* reported as cancelled: nobody
+            // cancelled anything. Like hash, the caller is told what is left
+            // rather than why it stopped.
+            assert_eq!(first.state, "EXECUTION_PAUSED", "workers {workers}");
+            assert!(!first.cancelled, "workers {workers}");
+            assert!(first.pending > 0, "workers {workers}");
+            assert_eq!(first.failed_final + first.failed_retryable, 0);
+
+            // Calling again finishes it. Nothing had to be made resumable for
+            // the budget: the plan was already a durable queue.
+            let second = execute_plan(
+                &mut fx.db,
+                Actor::Test,
+                &ExecuteOptions {
+                    workers,
+                    ..ExecuteOptions::default()
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(second.state, "EXECUTED", "workers {workers}");
+            assert_eq!(second.pending, 0, "workers {workers}");
+
+            // And the output is the same one an unbounded run produces: the
+            // budget decides when to stop, never what to write.
+            for relative in ["a.txt", "sub/b.txt", "c.txt"] {
+                assert!(
+                    fx.output.join("origen").join(relative).exists(),
+                    "{relative} missing at workers {workers}"
+                );
+            }
+            assert!(no_partials_left(&fx.output));
+        }
     }
 
     #[test]

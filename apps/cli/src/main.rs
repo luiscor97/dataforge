@@ -221,6 +221,14 @@ enum Command {
         /// the full crash-injection acceptance lands.
         #[arg(long, default_value_t = 1)]
         workers: usize,
+        /// Stop after this many copies and pause, leaving the rest queued.
+        ///
+        /// For a caller that cannot afford to block: on a real archive an
+        /// unbounded execute runs for hours and never returns. Call again to
+        /// continue; `Pending` says what is left. Directories do not count —
+        /// they cost nothing worth bounding.
+        #[arg(long, value_name = "N")]
+        max_operations: Option<u64>,
     },
     /// Verify the executed plan from primary evidence.
     Verify {
@@ -1122,12 +1130,14 @@ fn run(cli: &Cli) -> DfResult<Output> {
             path,
             allow_degraded_destination,
             workers,
+            max_operations,
         } => df_facade::execute_plan_with_options(
             path,
             actor,
             &df_facade::ExecuteOptions {
                 allow_degraded_destination: *allow_degraded_destination,
                 workers: *workers,
+                max_operations: *max_operations,
                 ..df_facade::ExecuteOptions::default()
             },
         )
