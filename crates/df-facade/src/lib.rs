@@ -3833,6 +3833,10 @@ mod tests {
         );
     }
 
+    // Executes, and execution refuses fail-closed off Windows until POSIX
+    // write safety exists (ADR-0017). `df-executor` gates its whole test
+    // module the same way and for the same reason.
+    #[cfg(windows)]
     #[test]
     fn the_preflight_counts_what_is_left_and_never_guesses_what_it_cannot_measure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4016,6 +4020,9 @@ mod tests {
         assert!(error.to_string().contains("entire archive"));
     }
 
+    // Reads the filesystem type through a Windows API; elsewhere the
+    // classification is honestly UNKNOWN, which is what this asserts against.
+    #[cfg(windows)]
     #[test]
     fn a_source_root_records_the_filesystem_it_actually_sits_on() {
         // Found by running the engine on a real archive: every origin ever
@@ -4043,6 +4050,10 @@ mod tests {
         assert_ne!(root.filesystem, "UNKNOWN");
     }
 
+    // Executes, and execution refuses fail-closed off Windows until POSIX
+    // write safety exists (ADR-0017). `df-executor` gates its whole test
+    // module the same way and for the same reason.
+    #[cfg(windows)]
     #[test]
     fn a_run_over_failing_media_finishes_and_says_what_it_could_not_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4139,6 +4150,10 @@ mod tests {
         }
     }
 
+    // Executes, and execution refuses fail-closed off Windows until POSIX
+    // write safety exists (ADR-0017). `df-executor` gates its whole test
+    // module the same way and for the same reason.
+    #[cfg(windows)]
     #[test]
     fn a_finished_result_can_be_replanned_without_rereading_the_origin() {
         // The real job was not one pass: ten days of deliver, look, correct.
@@ -4263,6 +4278,10 @@ mod tests {
         );
     }
 
+    // Executes, and execution refuses fail-closed off Windows until POSIX
+    // write safety exists (ADR-0017). `df-executor` gates its whole test
+    // module the same way and for the same reason.
+    #[cfg(windows)]
     #[test]
     fn a_delivery_package_covers_every_manifest_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4398,6 +4417,11 @@ mod tests {
     }
 
     /// Count CSV fields honouring quoting.
+    ///
+    /// Gated with its only caller: a helper left behind when the test that
+    /// used it is compiled out is dead code, and this workspace denies
+    /// warnings. Gating a test is never just gating the test.
+    #[cfg(windows)]
     fn csv_columns(line: &str) -> usize {
         let mut fields = 1;
         let mut quoted = false;
@@ -4622,7 +4646,10 @@ mod tests {
         assert_analysis_reports_unavailable(&req.project_dir);
     }
 
-    #[cfg(windows)] // drives execution, which is Windows-only for now
+    // Executes, and execution refuses fail-closed off Windows until POSIX
+    // write safety exists (ADR-0017). `df-executor` gates its whole test
+    // module the same way and for the same reason.
+    #[cfg(windows)]
     #[test]
     fn full_pipeline_reaches_completed_through_the_facade() {
         let tmp = tempfile::tempdir().unwrap();
