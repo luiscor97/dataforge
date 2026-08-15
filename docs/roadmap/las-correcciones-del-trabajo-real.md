@@ -255,13 +255,17 @@ todavía. Se anotan aquí para que no vivan solo en una conversación.
   execute 19,7 MB/s leyendo y escribiendo a la vez, **verify 53,4 MB/s**
   releyendo el árbol que el ejecutor acababa de escribir de una sentada. La
   salida quedó contigua; el origen son diez años de fragmentación. El aviso de
-  `device_preflight` sobre origen y destino en el mismo disco es correcto en
-  dirección y exagerado en magnitud: costó un 6%, no la mitad. Merece una
-  matización en el texto, con más medidas antes de tocarlo.
-- **Un plan descartado deja sus operaciones `PENDING` para siempre.** El
-  ejecutor filtra por `plan_id`, así que es inofensivo, pero cualquier conteo
-  global de `plan_operations` las suma. En el corpus real son 205.811 filas
-  fantasma tras un solo descarte.
+  `device_preflight` sobre origen y destino en el mismo disco era correcto en
+  dirección y exagerado en magnitud. **Corregido con las tres medidas
+  incorporadas al propio aviso**, incluida la comparación que importa: lo que
+  cuesta 2,5× no es la cola compartida, es la disposición del origen.
+- ~~**Un plan descartado deja sus operaciones `PENDING` para siempre.**~~
+  **Retirado: no era una deuda.** Las diez consultas de `plan_operations` del
+  producto filtran por `plan_id`, comprobado una a una. El conteo global que vi
+  era de un script mío sin filtrar, y apunté mi propio error como defecto del
+  motor. Se deja escrito en vez de borrarse porque el modo de fallo —afirmar un
+  defecto desde una observación sin comprobar si el producto lo tiene— es el
+  mismo que produjo los otros errores de esa sesión.
 - **La parada temprana por ENOSPC del coordinador paralelo** informa `false` en
   vez de arriesgar una suposición. Correcto y pendiente de cerrar.
 - **Ejemplo de contención al 100%**: dos carpetas de imágenes con nombre en dos
