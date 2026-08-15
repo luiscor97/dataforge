@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { resumeFrom } from "./resume";
+import { nextStage, resumeFrom } from "./resume";
 
 /**
  * Every state the engine can persist, from `df-domain::ProjectState`. Listed
@@ -98,9 +98,36 @@ describe("resumeFrom", () => {
     });
   });
 
-  test("a finished project is not re-run", () => {
+  test("a finished project is not re-run, and is asked about", () => {
+    // The end of the loop is a question, not a dead end: the job this engine
+    // reproduces was ten days of deliver, look, correct, and every correction
+    // came from seeing the result.
+    for (const state of ["COMPLETED", "COMPLETED_WITH_WARNINGS"]) {
+      expect(resumeFrom(state), state).toEqual({
+        kind: "finished",
+        state,
+        canReplan: true,
+        canRescan: true,
+      });
+    }
+    // A failed run is terminal in the state machine and terminal here.
+    // Offering to correct it would suggest the engine can carry on from a
+    // state it has no transition out of.
+    expect(resumeFrom("FAILED")).toEqual({
+      kind: "finished",
+      state: "FAILED",
+      canReplan: false,
+      canRescan: false,
+    });
+  });
+
+  test("re-planning is offered as a choice, never as the next stage", () => {
+    // `nextStage` answers "what runs next", and its caller renders that as the
+    // one button to press. A correction is not what comes next after a
+    // finished job -- it is one of several valid answers, including doing
+    // nothing -- so it must not arrive through that door.
     for (const state of ["COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED"]) {
-      expect(resumeFrom(state), state).toEqual({ kind: "finished", state });
+      expect(nextStage(state), state).toBeNull();
     }
   });
 

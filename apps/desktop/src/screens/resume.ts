@@ -39,8 +39,33 @@ export type Resume =
    * only thing that can turn "we copied it" into "we checked it".
    */
   | { kind: "copy"; approve: boolean; execute: boolean }
-  /** Nothing left to do: this destination already holds a finished run. */
-  | { kind: "finished"; state: string }
+  /**
+   * The run is over. Not a dead end: the end of the loop is a question.
+   *
+   * The job this engine reproduces was never one pass — it was deliver, look,
+   * correct, ten days of it, and every correction came from *seeing* the
+   * result. So this is where the flow asks "this is what came out, what do you
+   * want to do?" instead of only reporting that there is nothing left.
+   *
+   * Deliberately **not** folded into `nextStage`. Re-planning is a choice with
+   * several valid answers, including "nothing" — offering it as the one button
+   * that comes next would present a correction as the expected continuation of
+   * a finished job, which is a different claim and a wrong one.
+   */
+  | {
+      kind: "finished";
+      state: string;
+      /**
+       * A different plan can be built from the snapshot already taken, with
+       * no re-reading of the origin (`COMPLETED → PLANNING`).
+       *
+       * False for `FAILED`, which the state machine leaves terminal: a run
+       * that failed is not a result to correct.
+       */
+      canReplan: boolean;
+      /** The origin can be inventoried again, for when it has changed. */
+      canRescan: boolean;
+    }
   /** The engine offers no automatic continuation from here. */
   | { kind: "manual"; state: string };
 
@@ -85,12 +110,27 @@ const TABLE: Record<string, Resume> = {
   EXECUTION_PAUSED: COPY(false, true),
   // Everything is on disk; only the independent check is missing.
   EXECUTED: COPY(false, false),
-  COMPLETED: { kind: "finished", state: "COMPLETED" },
+  COMPLETED: {
+    kind: "finished",
+    state: "COMPLETED",
+    canReplan: true,
+    canRescan: true,
+  },
   COMPLETED_WITH_WARNINGS: {
     kind: "finished",
     state: "COMPLETED_WITH_WARNINGS",
+    canReplan: true,
+    canRescan: true,
   },
-  FAILED: { kind: "finished", state: "FAILED" },
+  // Terminal in the state machine, and terminal here: a run that failed is
+  // not a result to correct, and offering to re-plan it would suggest the
+  // engine can carry on from a state it has no transition out of.
+  FAILED: {
+    kind: "finished",
+    state: "FAILED",
+    canReplan: false,
+    canRescan: false,
+  },
 };
 
 /**
