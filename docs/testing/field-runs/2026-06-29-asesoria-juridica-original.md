@@ -227,6 +227,93 @@ perfil que nadie ha escrito, y es lo que un perfil `asesoria-juridica` con
 fronteras protegidas y categorías de material no documental resolvería
 (ADR-0026: los perfiles se compilan, así que es un cambio con su ADR).
 
+### El banco: puntuar un criterio sin ejecutar nada
+
+El trabajo original probaba criterios **ejecutando y corrigiendo**: diez días,
+nueve correcciones, cada una descubierta al ver una entrega entera. DataForge
+estaba heredando ese método — llegaron a proponerse runs de quince horas para
+ver qué forma salía.
+
+No hace falta. Ese trabajo dejó su resultado con identidad de contenido, así
+que un criterio candidato se aplica sobre el plan y se cruza contra la verdad
+**en segundos**, sin copiar un byte.
+
+```
+antes : criterio → 15 h de run → mirar la forma → corregir
+ahora : criterio → cruce contra el manifiesto → % de acuerdo → iterar
+```
+
+**Cobertura del plan construido con los criterios de la tabla anterior**
+(decisiones del registro + `CONSOLIDATE_ALL`):
+
+| | Contenidos |
+| --- | ---: |
+| Entregado por la persona | 29.239 |
+| Que el plan coloca en el árbol limpio | **29.227 — 100,0%** |
+| Que caen en revisión | 1 |
+| Que no coloca | 11 — *todos del informe que ella escribió al final* |
+| Que coloca de más | 20.572 (180,3 GB) |
+
+**El desvío es solo por exceso, nunca por omisión.** Para un motor probatorio
+ésa es la única dirección aceptable del error, y ahora está medida en vez de
+supuesta.
+
+**Cuatro criterios candidatos, evaluados en diez minutos:**
+
+| Regla | Árbol limpio | Cubre | Sobran |
+| --- | ---: | ---: | ---: |
+| ninguna (el plan tal cual) | 49.799 | 100,0% | 20.572 |
+| apartar software por extensión | 47.562 | 99,1% | 18.576 |
+| apartar fotografía por extensión | 41.452 | **89,8%** | 15.205 |
+| apartar volcaderos de foto **por carpeta** | 45.379 | **99,5%** | 16.279 |
+
+El resultado que vale es el negativo. La regla obvia —apartar fotografía por
+extensión, que es lo que el turno 272 parece decir— **destruye el 10,2% del
+entregable**, porque las fotos periciales *son* la prueba. La misma intención
+aplicada por ubicación conserva el 99,5%.
+
+**La señal que separa material documental de no documental no es el tipo de
+archivo: es dónde está.** Eso es lo que M2.3 tiene que dar, y deja de ser un
+argumento para ser una medida.
+
+### El criterio de representante, recuperado y contrastado
+
+`decisions` guarda las 47.982 elecciones con su puntuación y **cero
+intervenciones manuales**: no fue un juicio caso a caso, fue una fórmula que
+nadie tuvo que corregir ni una vez.
+
+```
+group_key  : sha256:000290ed…
+auto_score : 105.9
+auto_reason: "depth -8; path_length -1.1; oldest_mtime +15"
+```
+
+| Señal | Trabajo original | DataForge |
+| --- | --- | --- |
+| profundidad | −4 por nivel | sí |
+| longitud de ruta | penalización continua | no |
+| **antigüedad del contenido** | **+15** | **no la mira** |
+| carpeta genérica | no la usa | sí, pero inerte con el perfil vacío |
+| marcador de copia en el nombre | no la usa | sí |
+
+Comparando elección con elección sobre los grupos que ambos ven:
+
+> **20.442 de 27.861 — 73,4% de acuerdo.**
+
+Las discrepancias tienen forma reconocible. El trabajo original prefiere la
+importación original de la cámara; DataForge, la copia dentro del proyecto:
+
+```
+campo     : imagenes\100d5600\dsc_0908.jpg
+dataforge : fotos villar obra\garaje\dsc_0908.jpg
+```
+
+Que es exactamente lo que produce un bonus de antigüedad que uno tiene y el
+otro no.
+
+Ese 73,4% es el número que el hito del criterio tiene que subir, y ahora
+existe.
+
 ### Las fuentes, por orden de fuerza
 
 1. **`MANIFIESTO_FINAL_SHA256.csv`** — 29.240 filas: `rel_path, category, size,
