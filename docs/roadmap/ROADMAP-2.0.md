@@ -71,6 +71,17 @@ El orden es obligado: cada hito depende de que exista el anterior.
 > [superficie-derivada-del-trabajo-real.md](superficie-derivada-del-trabajo-real.md);
 > las secciones fechadas de cada hito son su resultado.
 
+> **Actualización del 2026-08-15.** Ejecutar el motor entero sobre el archivo
+> real y compararlo con el entregable que una persona produjo del mismo origen
+> añade **M2.7** y reencuadra M2.3. Las nueve correcciones que hubo que hacer
+> a mano en el trabajo original están clasificadas en
+> [las-correcciones-del-trabajo-real.md](las-correcciones-del-trabajo-real.md),
+> y ninguna es de clasificación: las nueve son de **colocación**. La cola de
+> revisión responde «qué es esto» cuando la pregunta era «dónde va esto», y un
+> ítem cuya única respuesta posible es una etiqueta de cubo no puede contener
+> la respuesta correcta. De ahí que la prueba de campo dejara 129.379 archivos
+> en revisión donde la persona dejó 175.
+
 ### M2.1 — Superficie agéntica
 
 Que un agente pueda conducir el motor sin acoplarse a la ABI de Rust.
@@ -545,6 +556,63 @@ Robustez de disco viejo como requisito duro, no como mejora: errores de
 lectura a `revisar/_ilegible/` sin abortar; pre-vuelo de espacio antes de
 copiar; reanudación exacta desde el manifiesto; fallo de verificación a
 `revisar/_verificacion-fallida/` con el run continuando.
+
+### M2.7 — Colocación por correspondencia
+
+El verbo que faltaba. Añadido el 2026-08-15 a partir de
+[las-correcciones-del-trabajo-real.md](las-correcciones-del-trabajo-real.md):
+de las nueve correcciones que un operador tuvo que hacer a mano en el trabajo
+original, **cuatro son la misma** — *los hijos de A se corresponden por nombre
+con los hijos de B; mete cada uno en el suyo* — repetida a tres profundidades
+distintas porque no había forma de decirla una vez.
+
+M2.3 demuestra que sin clasificación no hay deduplicación. Éste es su hermano:
+**sin correspondencia no hay colocación**. Clasificar dice *qué es* algo;
+colocarlo exige además decidir *dónde va*, y son dos capacidades.
+
+**Umbral, medido antes de construir nada.** Comparando el conjunto de
+contenidos de los dos subárboles de cada una de las 4.604 preguntas de carpeta
+del corpus real: 3.702 son contención estricta —el tipo de anomalía predice el
+veredicto sin una sola excepción— y de los 902 «parciales», 739 se separan de
+la contención total por **cinco archivos o menos**, 426 de ellos por uno solo.
+Quitando además `EXTREME_PATH`, la cola baja de 5.334 ítems a **169**. El
+trabajo humano terminó con **175**. Dos métodos sin nada en común coinciden en
+que la ambigüedad real de ese archivo son ~170 casos, así que el criterio de
+M2.7 no es «reducir la cola» sino **dejarla en ese orden**.
+
+- Detección de **árboles paralelos**: dos subárboles cuyos hijos se
+  corresponden por nombre y describen las mismas entidades. La evidencia ya se
+  calcula —`tree_relation_report` y el solapamiento por contenido— y no se usa
+  para decidir.
+- **Contención estricta no es una pregunta**: si el contenido de B está entero
+  dentro de A, eso es un hecho medido y la operación es mecánica. Con
+  tolerancia declarada para los casos al filo, y la lista explícita de las
+  excepciones que la tolerancia perdona — una tolerancia que oculta lo que
+  perdona no es tolerancia, es una pérdida.
+- La fusión se propone como **operaciones de plan**, nunca como efecto
+  inmediato: origen, destino y motivo por archivo, aprobable y verificable
+  como cualquier otra operación.
+- Una decisión de revisión puede responder **una ruta**, no solo una etiqueta
+  de cubo. Es el cambio que vacía la cola.
+- **Exención de subárbol**: «esto se copia tal cual y no se toca». Distinto de
+  `hash_exclusions`, que solo excluye de hashear.
+- **Deshacer una decisión de cubo** devolviendo a la ruta de origen, para
+  cuando una regla mecánica clasifica por tamaño algo que se define por
+  propósito.
+
+Dos correcciones más del registro no necesitan hito propio y sí un cambio de
+criterio, ambas medidas contra el entregable humano:
+
+- `EXTREME_PATH` **no debería ser una pregunta**. La persona conservó 347
+  rutas de 240+ caracteres a propósito, y el motor copió las 724 que marcó sin
+  un solo fallo.
+- «Separado» significa *no es trabajo del dominio* (613 archivos: música,
+  películas, vídeo personal), no *es una caché de miniaturas* (97 `Thumbs.db`).
+  Mismo nombre, concepto distinto; el de la taxonomía es el segundo.
+
+Y una que pertenece a M2.6: el agente del trabajo original **reprodujo en su
+salida el mismo anidado accidental que venía a arreglar**. `analyze` mira el
+origen; nadie mira el resultado con los mismos ojos.
 
 ## Definición de hecho
 
