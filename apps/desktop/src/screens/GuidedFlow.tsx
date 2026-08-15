@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { invoke } from "@tauri-apps/api/core";
 
 import {
   analyzeProject,
@@ -13,6 +14,7 @@ import {
   openProject,
   projectStatus,
   scanProject,
+  scanProgress,
   validatePlan,
   verifyProject,
 } from "../api";
@@ -167,6 +169,35 @@ export function GuidedFlow({
   const sourceBox = useRef<HTMLLabelElement | null>(null);
   const destinationBox = useRef<HTMLLabelElement | null>(null);
 
+  // A native folder picker, offered next to drag-and-drop and typing. Like the
+  // drag listener below it is best-effort: `invoke` rejects when no Tauri
+  // runtime is present (browser preview, tests), and a missing picker must
+  // never take the screen down — the text field and drag still work.
+  const browse = useCallback(async (field: "source" | "destination") => {
+    activeField.current = field;
+    try {
+      const picked = await invoke<string | string[] | null>(
+        "plugin:dialog|open",
+        {
+          options: {
+            directory: true,
+            multiple: false,
+            title:
+              field === "source"
+                ? "Elige la carpeta que quieres ordenar"
+                : "Elige dónde guardar el resultado",
+          },
+        },
+      );
+      if (typeof picked === "string") {
+        if (field === "source") setSource(picked);
+        else setDestination(picked);
+      }
+    } catch {
+      // Picker unavailable; drag-and-drop and manual entry remain.
+    }
+  }, []);
+
   // Dropping a folder onto the window beats typing a path from memory, and
   // Tauri gives us this without any extra dependency. Everything here is
   // wrapped because `getCurrentWebview` throws *synchronously* when no Tauri
@@ -304,6 +335,46 @@ export function GuidedFlow({
    * scratch — or refusing outright, which is what this used to do — would
    * throw away work the engine took care to make resumable.
    */
+  // While the scan runs, show the engine's real file count climbing so the user
+  // can tell work is happening — never a fabricated percentage. Best-effort: a
+  // failed poll (a momentary DB lock, or no Tauri runtime) simply skips a tick.
+  const pollScanProgress = useCallback((dir: string): (() => void) => {
+    let stopped = false;
+    let warned = false;
+    const tick = async (): Promise<void> => {
+      try {
+        const { files } = await scanProgress(dir);
+        if (!stopped && files > 0) {
+          setStage({
+            kind: "working",
+            label: "Mirando qué archivos tienes…",
+            // `humanCount`, not `toLocaleString`: the latter reads the
+            // runtime's locale data, so the same build shows "1.234" in the
+            // webview and "1234" under the test runner. See its doc comment.
+            detail: `Solo los leemos. Nada se modifica. · ${humanCount(files)} archivos vistos`,
+          });
+        }
+      } catch {
+        // A tick can fail for two very different reasons: a momentary database
+        // lock (skip it, the next one will do) or a wiring mistake such as the
+        // command not being registered. Swallowing both silently is how this
+        // feature could look alive in tests while doing nothing, so say so
+        // once — the console is where a developer looks, and the user still
+        // gets the stage text either way.
+        if (!warned) {
+          warned = true;
+          console.warn("scan progress unavailable; the counter stays hidden");
+        }
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 400);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const startReview = useCallback(
     async (
       plan: Resume & { kind: "review" },
@@ -323,7 +394,12 @@ export function GuidedFlow({
           label: "Mirando qué archivos tienes…",
           detail: "Solo los leemos. Nada se modifica.",
         });
-        scanErrors = (await scanProject(dir)).errors;
+        const stopPoll = pollScanProgress(dir);
+        try {
+          scanErrors = (await scanProject(dir)).errors;
+        } finally {
+          stopPoll();
+        }
       }
 
       if (plan.hash) {
@@ -392,7 +468,7 @@ export function GuidedFlow({
         },
       });
     },
-    [],
+    [pollScanProgress],
   );
 
   /**
@@ -557,15 +633,20 @@ export function GuidedFlow({
               className={`dropfield${dropTarget === "source" ? " dropfield-active" : ""}`}
             >
               Carpeta que quieres ordenar
-              <input
-                value={source}
-                onChange={(e) => setSource(e.target.value)}
-                onFocus={() => {
-                  activeField.current = "source";
-                }}
-                placeholder="Arrastra la carpeta aquí, o escribe su ruta"
-                required
-              />
+              <div className="input-action">
+                <input
+                  value={source}
+                  onChange={(e) => setSource(e.target.value)}
+                  onFocus={() => {
+                    activeField.current = "source";
+                  }}
+                  placeholder="Arrastra la carpeta aquí, o escribe su ruta"
+                  required
+                />
+                <button type="button" onClick={() => void browse("source")}>
+                  Explorar…
+                </button>
+              </div>
               <span className="field-help">
                 Puedes arrastrar la carpeta desde el explorador hasta esta
                 ventana. Solo la leeremos.
@@ -577,15 +658,23 @@ export function GuidedFlow({
               className={`dropfield${dropTarget === "destination" ? " dropfield-active" : ""}`}
             >
               Dónde guardar el resultado
-              <input
-                value={destination}
-                onChange={(e) => setDestination(e.target.value)}
-                onFocus={() => {
-                  activeField.current = "destination";
-                }}
-                placeholder="Arrastra una carpeta vacía, o escribe su ruta"
-                required
-              />
+              <div className="input-action">
+                <input
+                  value={destination}
+                  onChange={(e) => setDestination(e.target.value)}
+                  onFocus={() => {
+                    activeField.current = "destination";
+                  }}
+                  placeholder="Arrastra una carpeta vacía, o escribe su ruta"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => void browse("destination")}
+                >
+                  Explorar…
+                </button>
+              </div>
               <span className="field-help">
                 Debe ser una carpeta distinta de la anterior. Ahí aparecerá tu
                 copia ordenada.

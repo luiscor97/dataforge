@@ -1026,6 +1026,18 @@ pub fn scan_project(project_dir: &Path, actor: Actor) -> DfResult<ScanOutcome> {
     df_scan::scan_project(&mut db, actor, &df_scan::ScanOptions::default(), None)
 }
 
+/// Live scan counters (files, folders, bytes seen so far) of the latest run.
+///
+/// Read-only and safe to poll while [`scan_project`] runs: the scan commits its
+/// counters per batch, so this reflects real progress without inventing a
+/// percentage. Returns zeros before the first run.
+pub fn scan_progress(project_dir: &Path) -> DfResult<(u64, u64, u64)> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    Ok(df_db::inventory::latest_scan_progress(&db)?.unwrap_or((0, 0, 0)))
+}
+
 /// Hash every scanned occurrence of the latest snapshot (RFC-0001 §12.3,
 /// §14). Ends in `HASHED`; safe to re-run after an interruption.
 pub fn hash_project(project_dir: &Path, actor: Actor) -> DfResult<HashOutcome> {

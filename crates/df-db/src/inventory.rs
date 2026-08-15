@@ -183,6 +183,30 @@ pub fn insert_scan_batch(
     Ok(())
 }
 
+/// Live counters (files, folders, bytes) of the most recent scan run.
+///
+/// Read-only. The scan refreshes these in the same transaction that persists
+/// each batch ([`insert_scan_batch`]), so a second connection can poll this
+/// while a scan is running and watch the real file count climb — no fabricated
+/// percentage. `None` before the first run.
+pub fn latest_scan_progress(db: &Db) -> DfResult<Option<(u64, u64, u64)>> {
+    db.conn()
+        .query_row(
+            "SELECT files, folders, bytes FROM scan_runs \
+             ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_err)
+}
+
 /// Close a scan run and its snapshot with the given verdict — one tx.
 ///
 /// `COMPLETED` marks the snapshot `COMPLETE`; `CANCELLED` and `FAILED` mark
