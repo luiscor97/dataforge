@@ -193,12 +193,70 @@ probatoria (regla 9, §15.3 `ACROSS_PROTECTED_CONTEXTS`).
 Las dos reglas que DataForge ya afirma por diseño, con datos reales que
 demuestran que ambos casos existen a escala **en el mismo archivo**.
 
+## Los criterios, en forma ejecutable (extraídos 2026-08-16)
+
+Lo anterior explica el trabajo. Esta sección existe para que un agente pueda
+**actuar** sin volver a leer 1.528 mensajes: cada criterio con su cita, la
+acción que le corresponde en el motor, y si hoy se puede o no.
+
+La regla que gobierna la tabla: **se decide lo que el registro decide.** Lo que
+el trabajo original no resolvió se deja pendiente, no se inventa por simetría.
+
+| Criterio | Cita | Acción en el motor | Hoy |
+| --- | --- | --- | --- |
+| Un representante por grupo de clones exactos, elegido por profundidad, nombre, ruta y antigüedad | turno 736 | `plan create --duplicate-policy CONSOLIDATE_ALL` | intención sí, efecto **no** |
+| El destino conserva la estructura relativa del representante | turno 980 | comportamiento por defecto del planner | sí |
+| Un archivo duplicado cuyo uso está dentro de un expediente **no** se consolida | turno 1302 | regla 9, fronteras protegidas | **no dispara** |
+| Media, entretenimiento y material técnico se aíslan, no se borran | turno 272 | perfil + `95_Separated` | sí |
+| Árboles embebidos y parciales: se colocan ambos lados | turnos 736 + 1302 | `review decide-batch` → `COPY_ACTIVE` | sí |
+| Rutas de 240+ caracteres se conservan | informe final | `review decide-batch` → `COPY_ACTIVE` | sí |
+| Estructura por materia, no espejo del origen | estructura entregada | — | **no**, M2.7 |
+| Reglas de conservación por antigüedad | *«no apliqué reglas RGPD automáticas al no tener una política concreta»* (turno 1171) | — | **no se decidió** |
+
+### La pieza que faltaba aislar: el perfil vacío
+
+El criterio del turno 1302 es, palabra por palabra, la regla 9 de RFC-0001. El
+motor **la tiene implementada y nunca la dispara**: el run de campo reportó
+`Protected bounds: 0`, porque el perfil `generic` no marca ninguna carpeta como
+frontera protegida.
+
+Así que las dos mitades del criterio humano faltan a la vez y por causas
+distintas: no puede consolidar —§15.2 se lo prohíbe sin clasificación— y no
+tiene nada que proteger —el perfil está vacío—. No es un fallo de código. Es un
+perfil que nadie ha escrito, y es lo que un perfil `asesoria-juridica` con
+fronteras protegidas y categorías de material no documental resolvería
+(ADR-0026: los perfiles se compilan, así que es un cambio con su ADR).
+
+### Las fuentes, por orden de fuerza
+
+1. **`MANIFIESTO_FINAL_SHA256.csv`** — 29.240 filas: `rel_path, category, size,
+   sha256, path_length, hash_source`. El entregable entero con identidad de
+   contenido. **Es la fuente más fuerte y la que más tarde se usó**: hubo un
+   contraste que rehasheó 86,67 GB durante 26 minutos para reconstruir a mano
+   un subconjunto de lo que este fichero ya tenía. Cruzarlo contra
+   `content_objects` es cuestión de segundos.
+2. **`INFORME_FINAL_ORDENACION_...md`** — los criterios como se entregaron, y
+   los recuentos que permiten dimensionar el hueco.
+3. **La transcripción** — el *porqué* de cada criterio, que es lo que permite
+   aplicarlo a un caso nuevo en vez de copiarlo.
+
+### La validación que da confianza en todo lo anterior
+
+| | Documentos | Únicos |
+| --- | ---: | ---: |
+| Trabajo original | 154.681 no multimedia | **47.982 representantes** |
+| DataForge sobre el mismo origen | 158.219 archivos | **49.916 contenidos distintos** |
+
+Coinciden al 4%. El recuento de representantes de una persona y el de
+contenidos distintos del motor son la misma cifra medida de dos maneras. Lo que
+separa 48.000 de 158.000 en el árbol limpio no es detección: es permiso para
+consolidar, que es M2.3.
+
 ## Qué sigue faltando
 
+- ~~Un extracto de criterios sin nombres.~~ **Hecho**: la sección anterior.
 - **El informe final al asesor** (`INFORME_FINAL_ORDENACION_...docx` y PDF)
-  está en `D:\DataForge_Salida\05_Asesoria_Juridica_v2\00_INFORME_DE_ORGANIZACION\`.
-  Contiene datos del cliente: no debe entrar tal cual, pero un extracto de
-  criterios sin nombres sí valdría.
+  contiene datos del cliente: no debe entrar tal cual.
 - **Conciliar tres recuentos del mismo corpus**: 158.219 (ROADMAP-2.0),
   156.962 (base del trabajo original), 155.906 (medido hoy en disco). Momentos
   de medición distintos es la explicación probable, no la comprobada.
