@@ -555,6 +555,41 @@ pub fn approve_plan(
     Ok(())
 }
 
+/// An earlier plan of this project that already put files in the output root.
+///
+/// `Some((id, version))` means the destination is not empty and does not
+/// belong to `current`: somebody executed a different plan into it.
+///
+/// This exists because of what a *correction* does. A re-planned operation
+/// sends a file to a new destination, the executor copies it there — and the
+/// old copy stays, because nothing in this engine deletes (rule 2). Execute a
+/// corrected plan into the same output root and the result holds both, with
+/// verification rightly failing on the untracked one. The engine would have
+/// produced a mess by following its own rules.
+///
+/// So the answer is not to relax the rule, it is to refuse the combination.
+/// A corrected result belongs in its own output root, which is exactly what
+/// the human job it was built against did when it named its second attempt
+/// `..._v2` and left the first one standing.
+pub fn previously_executed_plan(
+    db: &Db,
+    project_id: ProjectId,
+    current: PlanId,
+) -> DfResult<Option<(String, u32)>> {
+    db.conn()
+        .query_row(
+            "SELECT p.id, p.version FROM plans p
+             WHERE p.project_id = ?1 AND p.id <> ?2
+               AND EXISTS (SELECT 1 FROM plan_operations op
+                           WHERE op.plan_id = p.id AND op.execution_state = 'COMPLETED')
+             ORDER BY p.version DESC LIMIT 1",
+            params![project_id.to_string(), current.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32)),
+        )
+        .optional()
+        .map_err(db_err)
+}
+
 /// Supersede a plan that was never approved, so another can be built.
 ///
 /// The status already existed — `SUPERSEDED` means "replaced by a newer

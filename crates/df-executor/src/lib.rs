@@ -192,6 +192,27 @@ pub fn execute_plan(
     }
     let plan = plans::current_plan(db, project.id)?
         .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    // A second plan must not be executed into an output root that already
+    // holds a different one. Not because copying is unsafe -- the executor
+    // never overwrites and recognises a destination that already holds the
+    // expected content (§27.3) -- but because a *correction* moves a file, and
+    // the copy left at the old destination stays: nothing here deletes
+    // (rule 2). The output would hold both, and verification would rightly
+    // fail on the untracked one. Refusing the combination is the honest
+    // answer; relaxing the rule is not.
+    if !recovering_executing && project.state == ProjectState::PlanApproved {
+        if let Some((earlier, version)) = plans::previously_executed_plan(db, project.id, plan.id)?
+        {
+            return Err(DfError::Validation(format!(
+                "plan v{version} ({earlier}) has already written into {}. A corrected \
+                 plan needs its own output root: this engine never deletes, so the \
+                 files the correction moves would be left behind at their old \
+                 destinations and the output would hold both. Create a project \
+                 pointing at a fresh output root and plan there",
+                project.output_root.display()
+            )));
+        }
+    }
     if plan.status != df_domain::PlanStatus::Approved {
         return Err(DfError::Validation(format!(
             "the current plan is {}, not APPROVED",

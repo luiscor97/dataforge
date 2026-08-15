@@ -4120,6 +4120,69 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_result_can_be_replanned_without_rereading_the_origin() {
+        // The real job was not one pass: ten days of deliver, look, correct.
+        // Every correction was about where something went, and none changed a
+        // byte of the origin -- yet the only way back from COMPLETED was to
+        // rescan and rehash, hours of work to answer a question the existing
+        // snapshot already contained.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        let first =
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        let verified = verify_project_output(&req.project_dir, Actor::Test).expect("verify");
+        assert_eq!(verified.verdict, "COMPLETED");
+
+        // No rescan: the same snapshot answers it.
+        let second = create_plan(
+            &req.project_dir,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateWithinContext,
+        )
+        .expect("re-plan from a completed result");
+        assert_eq!(second.version, first.version + 1);
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+
+        // And the executed plan keeps everything that made it evidence. Being
+        // superseded as *current* is not the same as being undone, and a
+        // result that quietly stopped being verifiable would be worse than
+        // refusing to re-plan at all.
+        let audit = verify_audit(&req.project_dir).expect("audit");
+        assert!(audit.ledger_ok);
+        let integrity = project_integrity(&req.project_dir)
+            .expect("integrity")
+            .integrity
+            .expect("a full pass reports one");
+        assert!(integrity.database_ok && integrity.ledger_ok);
+        assert!(integrity.problems.is_empty(), "{:?}", integrity.problems);
+
+        // Executing it into the same output root is refused, and says why.
+        approve_plan(&req.project_dir, Actor::Test).expect("approve the correction");
+        let refused = execute_plan(&req.project_dir, Actor::Test).expect_err("must refuse");
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("own output root"),
+            "the refusal has to explain the correction problem, got: {message}"
+        );
+        // A correction moves a file; the executor copies it to the new place
+        // and nothing removes the old one, because nothing here deletes. The
+        // output would hold both and verification would fail on the untracked
+        // copy -- the engine producing a mess by obeying its own rules.
+        assert!(message.contains("never deletes"), "got: {message}");
+    }
+
+    #[test]
     fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
         // Found on a 444 GB archive: `plan create` produced a tree whose shape
         // was wrong, and there was no way to build a second one. `create_plan`
