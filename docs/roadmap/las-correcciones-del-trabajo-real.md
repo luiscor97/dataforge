@@ -269,14 +269,34 @@ todavía. Se anotan aquí para que no vivan solo en una conversación.
   falta en el primero. Es el caso que mejor ilustra por qué la pregunta no
   necesitaba a nadie.
 
-## Comprobación pendiente
+## Comprobación cerrada por identidad de contenido (2026-08-15)
 
-El contraste con el entregable humano cruza por **(nombre, tamaño)**, no por
-SHA-256, y un 4,1% de los archivos entregados no está en este origen. Es señal
-fuerte, no prueba. El cruce por hash cuesta unas 1,5 h de disco y está sin
-hacer.
+El contraste anterior cruzaba por (nombre, tamaño), y quedaba pendiente
+hacerlo por SHA-256. Hecho: los 19.429 archivos del entregable rehasheados
+desde disco —86,67 GB, 26 min, **cero errores de lectura**— y cruzados contra
+las identidades del snapshot.
 
-La medición de solapamiento sí es exacta: usa las identidades SHA-256 del
-propio snapshot, no heurísticas de nombre.
+| | Archivos | | Bytes | |
+| --- | ---: | ---: | ---: | ---: |
+| Solo en revisión | 14.986 | 77,1% | 13,6 GB | 15,7% |
+| Colocado en el árbol limpio | 4.443 | 22,9% | 73,1 GB | 84,3% |
+| No está en el origen | **0** | | | |
+
+Dos correcciones sobre lo estimado:
+
+**El 4,1% «no está en el origen» era un artefacto del método.** Por contenido
+no falta ni un archivo: el 100% de lo entregado está en el snapshot. El
+inventario es completo, y eso queda demostrado y no estimado.
+
+**Y el reparto por bytes invierte la lectura.** El motor colocó el 84,3% de
+los bytes y solo el 22,9% de los archivos. Los que acertó pesan 16,8 MB de
+media; los que mandó a revisión, 0,9 MB. Es decir: **colocó bien el volumen y
+exilió la sustancia.** En un despacho el valor está en los 14.986 documentos,
+no en los 73 GB de material pesado.
+
+La razón es coherente con todo lo anterior: las carpetas enredadas en árboles
+embebidos son las de trabajo real, acumuladas y recopiadas durante años. Las
+de media están ordenadas porque nadie las ha tocado nunca. El enrutado a
+revisión no falla al azar — **falla exactamente donde está el trabajo**.
 
 [ADR-0041]: ../adr/ADR-0041-df-rules-canonical-recovery.md
