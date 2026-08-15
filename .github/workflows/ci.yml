@@ -21,7 +21,15 @@ jobs:
   rust-linux-experimental:
     name: Rust on Linux (experimental M0.8)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # No longer `continue-on-error`. It was, and the job spent weeks red while
+    # everyone learned to scroll past it — which is worse than having no Linux
+    # job at all, because a check nobody must heed stops being a check and
+    # starts being noise that hides the next real failure.
+    #
+    # It rotted one test at a time: the `#[cfg(windows)]` convention already
+    # existed in `df-facade`, and tests added since simply did not get it. A
+    # green blocking job is what makes the next omission visible on the day it
+    # happens instead of a month later.
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +43,10 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --exclude dataforge-desktop --all-targets -- -D warnings
 
+      # The subset is defined by `#[cfg(windows)]` on the tests that cannot
+      # pass here — execution refuses fail-closed off Windows (ADR-0017) and
+      # filesystem classification is a Windows API — not by a list kept in this
+      # file, which would drift the first time somebody adds a test.
       - name: Tests (platform-neutral subset)
         run: cargo test --workspace --exclude dataforge-desktop
 
