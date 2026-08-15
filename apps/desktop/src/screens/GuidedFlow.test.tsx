@@ -480,7 +480,12 @@ describe("GuidedFlow", () => {
     expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
   });
 
-  test("a finished destination is reported, not copied over", async () => {
+  test("a finished destination asks what to do, and copies nothing", async () => {
+    // The heading used to read "this folder is already done", which was true
+    // and closed the conversation. A finished result can now be re-planned
+    // from the snapshot already taken, so the end of the run is a question —
+    // which is how the job this engine reproduces was actually done: deliver,
+    // look, correct.
     vi.mocked(createProject).mockRejectedValue({
       code: "conflict",
       message: "x",
@@ -490,10 +495,28 @@ describe("GuidedFlow", () => {
     renderFlow();
     await fillFoldersAndSubmit();
 
-    await screen.findByRole("heading", { name: /ya está hecha/i });
+    await screen.findByRole("heading", { name: /qué quieres hacer/i });
+    // Asking is not doing: nothing is copied or approved by arriving here.
     expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
     expect(vi.mocked(approvePlan)).not.toHaveBeenCalled();
-    expect(screen.getByText(/no tocaremos esta/i)).toBeDefined();
+    expect(screen.getByText(/sin releer tus originales/i)).toBeDefined();
+  });
+
+  test("a failed run is not offered a correction", async () => {
+    // FAILED is terminal in the state machine. Asking "what do you want to
+    // do?" there would imply the engine can carry on from a state it has no
+    // transition out of.
+    vi.mocked(createProject).mockRejectedValue({
+      code: "conflict",
+      message: "x",
+    });
+    vi.mocked(openProject).mockResolvedValue(status("FAILED") as never);
+
+    renderFlow();
+    await fillFoldersAndSubmit();
+
+    await screen.findByRole("heading", { name: /ya está hecha/i });
+    expect(vi.mocked(executePlan)).not.toHaveBeenCalled();
   });
 
   test("a state the engine cannot continue is handed over, not guessed at", async () => {

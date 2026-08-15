@@ -62,7 +62,10 @@ type Stage =
       resume: Resume & { kind: "copy" };
       outputRoot: string;
     }
-  | { kind: "finished"; state: string }
+  // Reuses the engine-derived shape rather than restating it: the options a
+  // finished run offers come from the state machine, and a second copy of
+  // that table here is a second place for it to drift.
+  | (Resume & { kind: "finished" })
   | { kind: "manual"; state: string }
   | { kind: "done"; result: Result };
 
@@ -596,7 +599,7 @@ export function GuidedFlow({
           setStage({ kind: "resumeCopy", resume: plan, outputRoot: out });
           return;
         case "finished":
-          setStage({ kind: "finished", state: plan.state });
+          setStage(plan);
           return;
         case "manual":
           setStage({ kind: "manual", state: plan.state });
@@ -901,7 +904,11 @@ export function GuidedFlow({
 
       {stage.kind === "finished" && (
         <>
-          <h2>Esta carpeta ya está hecha</h2>
+          <h2>
+            {stage.canReplan
+              ? "Ha salido esto. ¿Qué quieres hacer?"
+              : "Esta carpeta ya está hecha"}
+          </h2>
           {stage.state === "FAILED" ? (
             <p className="notice notice-danger">
               El destino que has indicado guarda un trabajo anterior cuya
@@ -913,8 +920,9 @@ export function GuidedFlow({
               El destino que has indicado ya contiene una copia terminada y
               comprobada
               {stage.state === "COMPLETED_WITH_WARNINGS" ? ", con avisos" : ""}.
-              No hay nada que volver a copiar. Si quieres empezar de nuevo,
-              elige otra carpeta de destino: no tocaremos esta.
+              Mira el detalle y decide: si el reparto no te convence, se puede
+              volver a planificar sin releer tus originales. Y si prefieres
+              dejarlo como está, no hay nada más que hacer.
             </p>
           )}
           <div className="actions">
