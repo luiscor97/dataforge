@@ -39,6 +39,21 @@ impl Rng {
     }
 }
 
+/// One weighted size band of a corpus profile. Sizes inside a band are
+/// sampled log-uniformly (power-of-two bucket + uniform remainder) so small
+/// sizes dominate the band the way they do in real collections, using only
+/// integer arithmetic — float rounding must never make two platforms
+/// generate different corpora from the same seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeBand {
+    /// Relative weight in percent. All bands of a spec must sum to 100.
+    pub weight_percent: u8,
+    /// Smallest size in bytes (inclusive, >= 1).
+    pub min_bytes: u64,
+    /// Largest size in bytes (inclusive, >= min).
+    pub max_bytes: u64,
+}
+
 /// Shape of the corpus to generate.
 #[derive(Debug, Clone)]
 pub struct CorpusSpec {
@@ -50,8 +65,12 @@ pub struct CorpusSpec {
     pub duplicate_percent: u8,
     /// Maximum folder depth below the corpus root.
     pub max_depth: u8,
-    /// Every Nth file is ~1 MiB instead of a few KiB (0 disables).
+    /// Every Nth file is ~1 MiB instead of a few KiB (0 disables). Ignored
+    /// when `size_bands` is set.
     pub large_file_every: u64,
+    /// Optional weighted size distribution (benchmark profiles, M1.0.1).
+    /// `None` keeps the legacy small-file shape unchanged.
+    pub size_bands: Option<Vec<SizeBand>>,
 }
 
 impl Default for CorpusSpec {
@@ -62,7 +81,66 @@ impl Default for CorpusSpec {
             duplicate_percent: 20,
             max_depth: 6,
             large_file_every: 500,
+            size_bands: None,
         }
+    }
+}
+
+impl CorpusSpec {
+    /// Reject a spec whose bands cannot be sampled deterministically.
+    fn validate(&self) -> std::io::Result<()> {
+        if let Some(bands) = &self.size_bands {
+            let total: u32 = bands.iter().map(|b| u32::from(b.weight_percent)).sum();
+            if bands.is_empty() || total != 100 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("size band weights must sum to 100, got {total}"),
+                ));
+            }
+            for band in bands {
+                if band.min_bytes == 0 || band.max_bytes < band.min_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "size bands need 1 <= min <= max",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sample one size from the weighted bands: pick the band by cumulative
+/// weight, then a power-of-two bucket inside it, then a uniform remainder.
+/// Integer-only on purpose (see [`SizeBand`]).
+fn sample_banded_size(rng: &mut Rng, bands: &[SizeBand]) -> u64 {
+    let mut roll = rng.below(100);
+    let mut chosen = &bands[bands.len() - 1];
+    for band in bands {
+        let weight = u64::from(band.weight_percent);
+        if roll < weight {
+            chosen = band;
+            break;
+        }
+        roll -= weight;
+    }
+    // Log-uniform: choose an exponent bucket between min and max, then a
+    // uniform offset within the bucket, clamped into the band.
+    let span_log2 = 64 - (chosen.max_bytes / chosen.min_bytes).leading_zeros() as u64;
+    let bucket = rng.below(span_log2.max(1));
+    let base = chosen.min_bytes.saturating_shl(bucket as u32);
+    let size = base + rng.below(base.max(1));
+    size.clamp(chosen.min_bytes, chosen.max_bytes)
+}
+
+/// `u64::checked_shl` that saturates instead of wrapping.
+trait SaturatingShl {
+    fn saturating_shl(self, shift: u32) -> u64;
+}
+
+impl SaturatingShl for u64 {
+    fn saturating_shl(self, shift: u32) -> u64 {
+        self.checked_shl(shift).unwrap_or(u64::MAX)
     }
 }
 
@@ -103,6 +181,8 @@ const DIR_STEMS: &[&str] = &[
 ];
 
 /// Deterministic payload for one file: `len` bytes derived from `seed`.
+/// Reference implementation for the streaming writer; tests assert equality.
+#[cfg(test)]
 fn payload(seed: u64, len: usize) -> Vec<u8> {
     let mut rng = Rng::new(seed);
     let mut out = Vec::with_capacity(len);
@@ -111,6 +191,27 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// Stream the deterministic payload to `file` in bounded chunks so a
+/// multi-GiB corpus entry never allocates its full size in memory. Byte
+/// stream is identical to [`payload`] for the same `(seed, len)`.
+fn write_payload(file: &mut std::fs::File, seed: u64, len: u64) -> std::io::Result<()> {
+    const CHUNK: usize = 1024 * 1024;
+    let mut rng = Rng::new(seed);
+    let mut chunk = Vec::with_capacity(CHUNK.min(len as usize));
+    let mut remaining = len;
+    while remaining > 0 {
+        chunk.clear();
+        let want = remaining.min(CHUNK as u64) as usize;
+        while chunk.len() < want {
+            chunk.extend_from_slice(&rng.next().to_le_bytes());
+        }
+        chunk.truncate(want);
+        file.write_all(&chunk)?;
+        remaining -= want as u64;
+    }
+    Ok(())
 }
 
 /// Prepare a missing or empty corpus root before the first generated entry.
@@ -152,6 +253,7 @@ fn create_new_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// check makes generation fail instead of overwriting foreign data. Nothing
 /// outside `root` is touched and partial output is never cleaned implicitly.
 pub fn generate(root: &Path, spec: &CorpusSpec) -> std::io::Result<CorpusSummary> {
+    spec.validate()?;
     prepare_empty_root(root)?;
 
     let mut rng = Rng::new(spec.seed);
@@ -162,7 +264,7 @@ pub fn generate(root: &Path, spec: &CorpusSpec) -> std::io::Result<CorpusSummary
     let mut dirs: Vec<(PathBuf, u8)> = vec![(root.to_path_buf(), 0)];
     // Payload identities already written, so duplicates regenerate the exact
     // same bytes without holding file contents in memory.
-    let mut written_payloads: Vec<(u64, usize)> = Vec::new();
+    let mut written_payloads: Vec<(u64, u64)> = Vec::new();
 
     for index in 0..spec.files {
         // Occasionally grow the tree: one new folder every ~8 files.
@@ -203,12 +305,12 @@ pub fn generate(root: &Path, spec: &CorpusSpec) -> std::io::Result<CorpusSummary
             summary.duplicate_files += 1;
             written_payloads[rng.below(written_payloads.len() as u64) as usize]
         } else {
-            let large =
-                spec.large_file_every > 0 && index > 0 && index % spec.large_file_every == 0;
-            let len = if large {
+            let len = if let Some(bands) = &spec.size_bands {
+                sample_banded_size(&mut rng, bands)
+            } else if spec.large_file_every > 0 && index > 0 && index % spec.large_file_every == 0 {
                 1024 * 1024
             } else {
-                (64 + rng.below(4_032)) as usize
+                64 + rng.below(4_032)
             };
             let entry = (rng.next(), len);
             written_payloads.push(entry);
@@ -216,10 +318,9 @@ pub fn generate(root: &Path, spec: &CorpusSpec) -> std::io::Result<CorpusSummary
         };
 
         let mut file = create_new_file(&dir.join(name))?;
-        let bytes = payload(payload_seed, len);
-        file.write_all(&bytes)?;
+        write_payload(&mut file, payload_seed, len)?;
         summary.files_written += 1;
-        summary.bytes_written += bytes.len() as u64;
+        summary.bytes_written += len;
     }
 
     Ok(summary)
@@ -315,6 +416,95 @@ mod tests {
     fn duplicates_regenerate_identical_bytes() {
         assert_eq!(payload(7, 128), payload(7, 128));
         assert_ne!(payload(7, 128), payload(8, 128));
+    }
+
+    /// Streaming must emit byte-for-byte what the in-memory generator emits,
+    /// including odd lengths that cross the 1 MiB chunk boundary.
+    #[test]
+    fn streamed_payload_matches_in_memory_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        for len in [0u64, 1, 7, 8, 4_096, 1024 * 1024, 1024 * 1024 + 3] {
+            let path = tmp.path().join(format!("p-{len}"));
+            let mut file = create_new_file(&path).unwrap();
+            write_payload(&mut file, 99, len).unwrap();
+            drop(file);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                payload(99, len as usize),
+                "len {len} must match"
+            );
+        }
+    }
+
+    #[test]
+    fn banded_sizes_stay_in_range_and_are_deterministic() {
+        let bands = [
+            SizeBand {
+                weight_percent: 70,
+                min_bytes: 1,
+                max_bytes: 64 * 1024,
+            },
+            SizeBand {
+                weight_percent: 30,
+                min_bytes: 64 * 1024,
+                max_bytes: 10 * 1024 * 1024,
+            },
+        ];
+        let mut a = Rng::new(7);
+        let mut b = Rng::new(7);
+        for _ in 0..10_000 {
+            let size = sample_banded_size(&mut a, &bands);
+            assert!((1..=10 * 1024 * 1024).contains(&size));
+            assert_eq!(
+                size,
+                sample_banded_size(&mut b, &bands),
+                "must be deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn band_weights_must_sum_to_one_hundred() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = CorpusSpec {
+            files: 1,
+            size_bands: Some(vec![SizeBand {
+                weight_percent: 60,
+                min_bytes: 1,
+                max_bytes: 10,
+            }]),
+            ..CorpusSpec::default()
+        };
+        let error = generate(&tmp.path().join("bad"), &spec).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_banded_corpus_is_reproducible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = CorpusSpec {
+            files: 300,
+            size_bands: Some(vec![
+                SizeBand {
+                    weight_percent: 90,
+                    min_bytes: 1,
+                    max_bytes: 16 * 1024,
+                },
+                SizeBand {
+                    weight_percent: 10,
+                    min_bytes: 16 * 1024,
+                    max_bytes: 256 * 1024,
+                },
+            ]),
+            ..CorpusSpec::default()
+        };
+        let a = generate(&tmp.path().join("a"), &spec).unwrap();
+        let b = generate(&tmp.path().join("b"), &spec).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            tree_fingerprint(&tmp.path().join("a")),
+            tree_fingerprint(&tmp.path().join("b"))
+        );
     }
 
     #[test]

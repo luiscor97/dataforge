@@ -11,6 +11,7 @@ import {
   executePlan,
   hashProject,
   openProject,
+  planDestinationTree,
   projectStatus,
   scanProject,
   verifyProject,
@@ -115,6 +116,14 @@ export default function App(): React.JSX.Element {
       setBusy(false);
     }
   }, [openPath, handleFailure]);
+
+  // Memoised on the directory alone: the preview component reloads whenever
+  // this identity changes, so a fresh closure per render would loop.
+  const projectDir = status?.project_dir ?? "";
+  const loadPlanTree = useCallback(
+    () => planDestinationTree(projectDir, 1),
+    [projectDir],
+  );
 
   const refreshStatus = useCallback(async () => {
     if (status === null) {
@@ -450,6 +459,7 @@ export default function App(): React.JSX.Element {
           onAnalyzeSimilarity={() => void runSimilarity()}
           onAnalyzeMedia={() => void runMedia()}
           onRunStage={(stage) => void runStage(stage)}
+          onLoadPlanTree={loadPlanTree}
           onBack={goHome}
         />
       )}

@@ -6,16 +6,19 @@
 
 pub mod analysis;
 pub mod assistance;
+pub mod consent;
 pub mod context;
 pub mod dedup;
 pub mod extraction;
 pub mod integrity;
 pub mod inventory;
+pub mod liveness;
 pub mod media;
 pub mod migrations;
 pub mod plans;
 pub mod plugins;
 pub mod repository;
+pub mod rules;
 pub mod similarity;
 pub mod structure;
 

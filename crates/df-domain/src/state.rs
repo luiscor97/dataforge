@@ -99,6 +99,15 @@ impl ProjectState {
                 | (Planning, PlanReady | Failed)
                 | (PlanReady, PlanReview)
                 | (PlanReview, PlanReview | PlanApproved)
+                // Discarding an unapproved plan (`plan discard`). The only
+                // backward edge in the pipeline, and it is bounded on both
+                // ends: it starts before approval, so nothing is frozen and
+                // nothing was executed, and it lands on Analyzed, so the next
+                // step is planning again. There is deliberately no edge out of
+                // PlanApproved — approval froze a manifest, and the way back
+                // from that is a new snapshot, not a quieter database.
+                | (PlanReady, Analyzed)
+                | (PlanReview, Analyzed)
                 | (PlanApproved, Executing)
                 | (Executing, ExecutionPaused | Executed | Failed)
                 | (ExecutionPaused, Executing | Failed)
@@ -113,6 +122,20 @@ impl ProjectState {
                 | (Analyzed, Scanning)
                 | (Completed, Scanning)
                 | (CompletedWithWarnings, Scanning)
+                // Re-plan a finished result without re-reading the origin.
+                //
+                // The real job this engine was built against was not one pass:
+                // it was ten days of deliver, look, correct. Every correction
+                // was about *where* something went, and none of them changed a
+                // byte of the origin — yet the only way back from COMPLETED
+                // was to rescan and rehash it, hours of work to answer a
+                // question the existing snapshot already contains.
+                //
+                // Nothing is lost by coming here: the executed plan keeps its
+                // APPROVED status and its verification run, so the record of
+                // what was produced survives being superseded as *current*.
+                | (Completed, Planning)
+                | (CompletedWithWarnings, Planning)
         )
     }
 
@@ -262,12 +285,22 @@ mod tests {
     }
 
     #[test]
-    fn completed_states_only_reopen_into_a_new_scan() {
+    fn a_completed_result_reopens_only_to_rescan_or_to_replan() {
+        // Two exits and no more. `Scanning` asks the origin again; `Planning`
+        // asks a different question of the snapshot already taken, which is
+        // what correcting a result actually needs — the real job it was built
+        // against spent ten days deciding *where* things went and never once
+        // changed the origin.
+        //
+        // Everything else stays shut. In particular there is no way back to
+        // `Executing` or `Verifying`: an executed plan and its verification
+        // are the record of what was produced, and re-entering them would let
+        // a finished result be quietly rewritten instead of superseded.
         for state in [Completed, CompletedWithWarnings] {
             for next in ALL_STATES {
                 assert_eq!(
                     state.can_transition_to(next),
-                    next == Scanning,
+                    next == Scanning || next == Planning,
                     "{state} → {next}"
                 );
             }

@@ -100,6 +100,81 @@ pub struct ReviewQueue {
     pub items: Vec<ReviewItemView>,
 }
 
+/// One class of review item: the same question, asked many times.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReviewClass {
+    /// Anomaly kind or rule id — what is actually being asked.
+    pub kind: String,
+    /// Where the question comes from: `ANOMALY` or `RULE`.
+    pub source: String,
+    pub risk: String,
+    /// What the engine does absent a decision.
+    pub recommended_action: String,
+    pub items: u64,
+    pub pending: u64,
+    /// Distinct occurrences this class touches. Zero for tree-level findings,
+    /// which hang off a pair of folders rather than off a single file — read
+    /// `folders` for those.
+    pub occurrences: u64,
+    /// Distinct folders named by this class. A tree-level question covers
+    /// every file under those folders, which is why one decision here settles
+    /// thousands of copies and why grouping matters at all.
+    pub folders: u64,
+    /// True when no item in the class can be routed at all — unreadable
+    /// source evidence. Deciding these is not possible, only repairing them.
+    pub blocked: bool,
+    /// A pending item to inspect or hand to `ai explain`, absent when the
+    /// class is fully decided.
+    pub sample_item_id: Option<String>,
+    /// One reason from the class, verbatim.
+    pub sample_reason: String,
+    /// Items in this class whose evidence includes a subtree comparison.
+    /// Zero for occurrence-level classes, which compare nothing.
+    pub pairs_measured: u64,
+    /// Of those, pairs where **one side holds nothing the other lacks**.
+    ///
+    /// Not a recommendation. It is the count of questions the engine has
+    /// already answered with its own evidence and asked anyway: for these,
+    /// every distinct content of one subtree is provably present in the
+    /// other, so no content is at risk. Found by running a real archive,
+    /// where 3.702 of 4.604 folder questions were of exactly this shape —
+    /// including a folder dropped inside itself, same name, 225 files, zero
+    /// unique on either side, routed to a human.
+    pub pairs_with_nothing_unique: u64,
+    /// Distinct contents held by the *more contained* side and by nothing
+    /// else in the pair, summed over the class.
+    ///
+    /// Deliberately a total rather than a threshold: it says what a single
+    /// decision over the whole class would put at risk, and lets the reader
+    /// pick their own tolerance instead of inheriting one invented here. A
+    /// class with a thousand pairs and eleven unique contents is a different
+    /// proposition from one with a thousand of each, and a boolean would
+    /// report both the same.
+    pub unique_contents_on_contained_side: u64,
+}
+
+/// The review queue grouped by question instead of listed by item.
+///
+/// A queue over a real archive holds thousands of items, and most of them are
+/// repetitions: on the corpus this was built against, 3.702 of 5.334 items are
+/// the same `EMBEDDED_TREE` question. Listing them flat asks a reviewer — or
+/// an agent — to answer the same thing thousands of times, which is why the
+/// review bucket stays full and why 82% of the files in a plan end up routed
+/// there.
+///
+/// Grouping is a view over the same rows: it decides nothing, hides nothing,
+/// and the totals match the flat queue exactly.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReviewClassSummary {
+    pub snapshot_id: String,
+    pub items: u64,
+    pub pending: u64,
+    pub decided: u64,
+    /// Classes ordered by pending items, most first: the shortest path to an
+    /// empty queue is the biggest class.
+    pub classes: Vec<ReviewClass>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AnomalyView {
     pub id: String,
@@ -1079,7 +1154,16 @@ pub fn detect_anomalies(
                 (
                     AnomalyKind::EmbeddedTree,
                     AnomalySeverity::Info,
-                    "one folder tree is embedded in another; preserve until reviewed".to_string(),
+                    // Say the number. The sibling class above prints its two
+                    // figures, and this one — whose contained side holds
+                    // nothing of its own, by the definition of the relation —
+                    // used to say only "preserve until reviewed", hiding the
+                    // one fact that settles it.
+                    format!(
+                        "one folder tree is embedded in another: {shared} shared content(s), \
+                         {} unique to the contained side; preserve until reviewed",
+                        unique_a.min(unique_b)
+                    ),
                 )
             } else {
                 continue;
@@ -1615,18 +1699,100 @@ pub fn occurrence_guidance(
     Ok(guidance)
 }
 
-/// Append a human decision. Re-deciding appends another row; the latest row
-/// wins for future plans while the complete history remains auditable.
-pub fn decide_review_item(
+/// One decision of a batch.
+#[derive(Debug, Clone)]
+pub struct ReviewDecisionInput {
+    pub item_id: String,
+    pub decision: RuleAction,
+    pub rationale: String,
+}
+
+/// Append many decisions as one unit.
+///
+/// Every decision is still validated on its own and still gets its own
+/// ledger event, exactly as if it had been appended alone: a batch is a
+/// transport convenience, never a weaker record. What it adds is atomicity —
+/// a queue of thousands must not be left half-decided by a failure in the
+/// middle, because "some of them" is not a state a reviewer can reason about.
+pub fn decide_review_items(
     db: &mut Db,
     project_id: ProjectId,
-    item_id: &str,
-    decision: RuleAction,
-    rationale: &str,
+    decisions: &[ReviewDecisionInput],
     actor: Actor,
+) -> DfResult<u64> {
+    if decisions.is_empty() {
+        return Err(DfError::Validation(
+            "a review batch needs at least one decision".to_string(),
+        ));
+    }
+    // Two decisions for one item in a single batch have no defined order, so
+    // the result would depend on input order rather than on intent.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for input in decisions {
+        if !seen.insert(input.item_id.as_str()) {
+            return Err(DfError::Validation(format!(
+                "review item `{}` appears more than once in the same batch",
+                input.item_id
+            )));
+        }
+    }
+    // Validate the whole batch before writing any of it: a rejection must
+    // leave the queue exactly as it was.
+    for input in decisions {
+        validate_review_decision(db, project_id, &input.item_id, &input.rationale)?;
+    }
+
+    let now = to_stored_timestamp(chrono::Utc::now());
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for input in decisions {
+        let rationale = input.rationale.trim();
+        let sequence: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1
+                 FROM review_decisions WHERE review_item_id = ?1",
+                [input.item_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO review_decisions
+                (id, review_item_id, sequence, decision, rationale, actor, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                input.item_id,
+                sequence,
+                input.decision.as_str(),
+                rationale,
+                actor.as_str(),
+                now,
+            ],
+        )
+        .map_err(db_err)?;
+        append_event(
+            &tx,
+            project_id,
+            EVENT_REVIEW_DECIDED,
+            &serde_json::json!({
+                "review_item_id": input.item_id,
+                "decision": input.decision.as_str(),
+                "rationale": rationale,
+            }),
+            actor,
+        )?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(decisions.len() as u64)
+}
+
+/// Reject a decision that could not be honoured, before anything is written.
+fn validate_review_decision(
+    db: &Db,
+    project_id: ProjectId,
+    item_id: &str,
+    rationale: &str,
 ) -> DfResult<()> {
-    let rationale = rationale.trim();
-    if rationale.is_empty() {
+    if rationale.trim().is_empty() {
         return Err(DfError::Validation(
             "a review decision requires a rationale".to_string(),
         ));
@@ -1666,45 +1832,174 @@ pub fn decide_review_item(
             "review item `{item_id}` describes unreadable source evidence; copy-bucket decisions cannot materialize it — repair access and rescan"
         )));
     }
+    Ok(())
+}
 
-    let now = to_stored_timestamp(chrono::Utc::now());
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
-    let sequence: i64 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1
-             FROM review_decisions WHERE review_item_id = ?1",
-            [item_id],
-            |row| row.get(0),
+/// Append a human decision. Re-deciding appends another row; the latest row
+/// wins for future plans while the complete history remains auditable.
+///
+/// A batch of one, so the single and bulk paths cannot drift apart.
+pub fn decide_review_item(
+    db: &mut Db,
+    project_id: ProjectId,
+    item_id: &str,
+    decision: RuleAction,
+    rationale: &str,
+    actor: Actor,
+) -> DfResult<()> {
+    decide_review_items(
+        db,
+        project_id,
+        &[ReviewDecisionInput {
+            item_id: item_id.to_string(),
+            decision,
+            rationale: rationale.to_string(),
+        }],
+        actor,
+    )
+    .map(|_| ())
+}
+
+/// The review queue grouped by question.
+///
+/// Aggregated in SQL rather than by walking the flat queue: on a real archive
+/// that queue is thousands of rows, and the point of this view is to be the
+/// cheap thing a caller reaches for first.
+pub fn review_class_summary(db: &Db, snapshot_id: SnapshotId) -> DfResult<ReviewClassSummary> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(sa.kind, rm.rule_id) AS kind,
+                    CASE WHEN ri.anomaly_id IS NOT NULL THEN 'ANOMALY' ELSE 'RULE' END AS source,
+                    ri.risk,
+                    ri.recommended_action,
+                    COUNT(*) AS items,
+                    COUNT(*) FILTER (WHERE NOT EXISTS (
+                        SELECT 1 FROM review_decisions rd WHERE rd.review_item_id = ri.id
+                    )) AS pending,
+                    COUNT(DISTINCT ri.occurrence_id) AS occurrences,
+                    -- Tree-level anomalies name folders, not occurrences, so
+                    -- an occurrence count reads as zero for exactly the
+                    -- classes that cover the most files.
+                    (SELECT COUNT(DISTINCT folder) FROM (
+                        SELECT sa2.folder_a AS folder FROM review_items ri2
+                        JOIN structural_anomalies sa2 ON sa2.id = ri2.anomaly_id
+                        WHERE ri2.snapshot_id = ri.snapshot_id
+                          AND ri2.analysis_version = ri.analysis_version
+                          AND sa2.kind = COALESCE(sa.kind, rm.rule_id)
+                          AND sa2.folder_a IS NOT NULL
+                        UNION
+                        SELECT sa2.folder_b FROM review_items ri2
+                        JOIN structural_anomalies sa2 ON sa2.id = ri2.anomaly_id
+                        WHERE ri2.snapshot_id = ri.snapshot_id
+                          AND ri2.analysis_version = ri.analysis_version
+                          AND sa2.kind = COALESCE(sa.kind, rm.rule_id)
+                          AND sa2.folder_b IS NOT NULL
+                    )) AS folders,
+                    -- A pending item, so a caller has something to inspect or
+                    -- hand to `ai explain`. MIN over ids is arbitrary but
+                    -- stable, which is what makes the view reproducible.
+                    MIN(CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM review_decisions rd WHERE rd.review_item_id = ri.id
+                    ) THEN ri.id END) AS sample_pending,
+                    MIN(ri.reason) AS sample_reason
+             FROM review_items ri
+             LEFT JOIN structural_anomalies sa ON sa.id = ri.anomaly_id
+             LEFT JOIN rule_matches rm ON rm.id = ri.rule_match_id
+             WHERE ri.snapshot_id = ?1 AND ri.analysis_version = ?2
+             GROUP BY kind, source, ri.risk, ri.recommended_action
+             ORDER BY pending DESC, items DESC, kind",
         )
         .map_err(db_err)?;
-    let decision_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO review_decisions
-            (id, review_item_id, sequence, decision, rationale, actor, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            decision_id,
-            item_id,
-            sequence,
-            decision.as_str(),
-            rationale,
-            actor.as_str(),
-            now,
-        ],
-    )
-    .map_err(db_err)?;
-    append_event(
-        &tx,
-        project_id,
-        EVENT_REVIEW_DECIDED,
-        &serde_json::json!({
-            "review_item_id": item_id,
-            "decision": decision.as_str(),
-            "rationale": rationale,
-        }),
-        actor,
-    )?;
-    tx.commit().map_err(db_err)
+    let rows = stmt
+        .query_map(
+            params![snapshot_id.to_string(), ANALYSIS_VERSION as i64],
+            |row| {
+                let kind: String = row.get(0)?;
+                Ok(ReviewClass {
+                    blocked: kind == AnomalyKind::UnreadableEntry.as_str(),
+                    kind,
+                    source: row.get(1)?,
+                    risk: row.get(2)?,
+                    recommended_action: row.get(3)?,
+                    items: row.get::<_, i64>(4)? as u64,
+                    pending: row.get::<_, i64>(5)? as u64,
+                    occurrences: row.get::<_, i64>(6)? as u64,
+                    folders: row.get::<_, i64>(7)? as u64,
+                    sample_item_id: row.get(8)?,
+                    sample_reason: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    pairs_measured: 0,
+                    pairs_with_nothing_unique: 0,
+                    unique_contents_on_contained_side: 0,
+                })
+            },
+        )
+        .map_err(db_err)?;
+
+    // The subtree comparison is not computed here: the detector already wrote
+    // it onto the anomaly when it created the finding, and nothing has read it
+    // back since. `EMBEDDED_TREE` even omits the figures from its summary
+    // sentence while `PARTIAL_TREE_UNIQUE_CONTENT` spells them out — so the
+    // class that always has a zero is the one that hides it.
+    let mut measured: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT kind, COUNT(*), COUNT(*) FILTER (WHERE MIN(ua, ub) = 0),
+                        COALESCE(SUM(MIN(ua, ub)), 0)
+                 FROM (SELECT sa.kind AS kind,
+                              json_extract(sa.evidence_json, '$.unique_a_files') AS ua,
+                              json_extract(sa.evidence_json, '$.unique_b_files') AS ub
+                       FROM review_items ri
+                       JOIN structural_anomalies sa ON sa.id = ri.anomaly_id
+                       WHERE ri.snapshot_id = ?1 AND ri.analysis_version = ?2
+                         AND json_extract(sa.evidence_json, '$.unique_a_files') IS NOT NULL
+                         AND json_extract(sa.evidence_json, '$.unique_b_files') IS NOT NULL)
+                 GROUP BY kind",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![snapshot_id.to_string(), ANALYSIS_VERSION as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, i64>(2)? as u64,
+                            row.get::<_, i64>(3)? as u64,
+                        ),
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        for row in rows {
+            let (kind, counts) = row.map_err(db_err)?;
+            measured.insert(kind, counts);
+        }
+    }
+
+    let mut summary = ReviewClassSummary {
+        snapshot_id: snapshot_id.to_string(),
+        items: 0,
+        pending: 0,
+        decided: 0,
+        classes: Vec::new(),
+    };
+    for row in rows {
+        let mut class = row.map_err(db_err)?;
+        if let Some((pairs, zero, unique)) = measured.get(&class.kind) {
+            class.pairs_measured = *pairs;
+            class.pairs_with_nothing_unique = *zero;
+            class.unique_contents_on_contained_side = *unique;
+        }
+        summary.items += class.items;
+        summary.pending += class.pending;
+        summary.classes.push(class);
+    }
+    summary.decided = summary.items - summary.pending;
+    Ok(summary)
 }
 
 pub fn review_queue(db: &Db, snapshot_id: SnapshotId) -> DfResult<ReviewQueue> {
@@ -2319,6 +2614,397 @@ mod tests {
             matches!(&error, DfError::Validation(message) if message.contains("repair access and rescan")),
             "unexpected error: {error:?}"
         );
+    }
+
+    /// Add a plain review item that a decision can legitimately resolve.
+    fn seed_review_item(db: &Db, snapshot: SnapshotId, occurrence: &str, id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO structural_anomalies
+                    (id, snapshot_id, analysis_version, occurrence_id, folder_a,
+                     folder_b, kind, severity, requires_review, summary,
+                     evidence_json, created_at)
+                 VALUES (?4, ?1, ?2, ?3, NULL, NULL, 'EMBEDDED_TREE', 'INFO',
+                         1, 'test', '{}', 't')",
+                params![
+                    snapshot.to_string(),
+                    ANALYSIS_VERSION as i64,
+                    occurrence,
+                    format!("anomaly-{id}"),
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO review_items
+                    (id, snapshot_id, analysis_version, anomaly_id,
+                     rule_match_id, occurrence_id, recommended_action, risk,
+                     reason, created_at)
+                 VALUES (?4, ?1, ?2, ?5, NULL, ?3, 'COPY_REVIEW', 'LOW',
+                         'test', 't')",
+                params![
+                    snapshot.to_string(),
+                    ANALYSIS_VERSION as i64,
+                    occurrence,
+                    id,
+                    format!("anomaly-{id}"),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Grouping is a view, so its totals have to be the flat queue's totals.
+    /// A summary that quietly dropped a class would hide exactly the items a
+    /// reviewer is trying to find.
+    #[test]
+    fn class_totals_match_the_flat_queue() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        for id in ["item-a", "item-b", "item-c"] {
+            seed_review_item(&db, snapshot, &occurrence, id);
+        }
+        // Decide one, so pending and decided are both non-zero.
+        decide_review_items(
+            &mut db,
+            project,
+            &[ReviewDecisionInput {
+                item_id: "item-b".to_string(),
+                decision: RuleAction::CopyActive,
+                rationale: "revisado".to_string(),
+            }],
+            Actor::Agent,
+        )
+        .unwrap();
+
+        let flat = review_queue(&db, snapshot).unwrap();
+        let grouped = review_class_summary(&db, snapshot).unwrap();
+
+        assert_eq!(grouped.items, flat.items.len() as u64);
+        assert_eq!(grouped.pending, flat.pending);
+        assert_eq!(grouped.decided, flat.decided);
+        assert_eq!(
+            grouped.classes.iter().map(|c| c.items).sum::<u64>(),
+            grouped.items
+        );
+        assert_eq!(
+            grouped.classes.iter().map(|c| c.pending).sum::<u64>(),
+            grouped.pending
+        );
+
+        // The three items are one question asked three times: that collapse
+        // is the whole reason the view exists.
+        assert_eq!(grouped.classes.len(), 1);
+        let class = &grouped.classes[0];
+        assert_eq!(class.kind, "EMBEDDED_TREE");
+        assert_eq!(class.items, 3);
+        assert_eq!(class.pending, 2);
+        // A pending id, never a decided one: it is what a caller inspects next.
+        let sample = class.sample_item_id.as_deref().unwrap();
+        assert_ne!(sample, "item-b");
+        assert!(!class.blocked);
+    }
+
+    /// The detector writes the subtree comparison onto the anomaly and, until
+    /// this summary read it back, nothing ever used it. On a real archive that
+    /// meant 3.702 questions whose own evidence said "nothing is at risk" were
+    /// put to a person indistinguishably from 902 where something was.
+    #[test]
+    fn a_class_carries_what_the_detector_already_measured() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (_project, snapshot, _occurrence) = seed_rule_occurrence(&mut db, "uno.txt");
+        let root_id: String = db
+            .conn()
+            .query_row("SELECT id FROM source_roots LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        // A tree anomaly names folders, and the schema insists on it: an
+        // anomaly pointing at nothing is not evidence of anything.
+        for (id, path) in [("folder-a", "A"), ("folder-b", "A/B")] {
+            db.conn()
+                .execute(
+                    "INSERT INTO folders
+                        (id, snapshot_id, source_root_id, relative_path,
+                         parent_relative_path, name, normalized_name, depth,
+                         status, created_at)
+                     VALUES (?3, ?1, ?2, ?4, NULL, ?3, ?3, 0, 'OK', 't')",
+                    params![snapshot.to_string(), root_id, id, path],
+                )
+                .unwrap();
+        }
+
+        let seed = |id: &str, kind: &str, unique_a: u64, unique_b: u64| {
+            db.conn()
+                .execute(
+                    "INSERT INTO structural_anomalies
+                        (id, snapshot_id, analysis_version, occurrence_id, folder_a,
+                         folder_b, kind, severity, requires_review, summary,
+                         evidence_json, created_at)
+                     VALUES (?3, ?1, ?2, NULL, 'folder-a', 'folder-b', ?4, 'INFO',
+                             1, 'test', ?5, 't')",
+                    params![
+                        snapshot.to_string(),
+                        ANALYSIS_VERSION as i64,
+                        format!("anomaly-{id}"),
+                        kind,
+                        format!(r#"{{"unique_a_files":{unique_a},"unique_b_files":{unique_b}}}"#),
+                    ],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    // A tree question has no occurrence: it is about the pair
+                    // of folders, and the schema enforces that rather than
+                    // trusting the writer.
+                    "INSERT INTO review_items
+                        (id, snapshot_id, analysis_version, anomaly_id, rule_match_id,
+                         occurrence_id, recommended_action, risk, reason, created_at)
+                     VALUES (?3, ?1, ?2, ?4, NULL, NULL, 'COPY_REVIEW', 'LOW', 'r', 't')",
+                    params![
+                        snapshot.to_string(),
+                        ANALYSIS_VERSION as i64,
+                        id,
+                        format!("anomaly-{id}"),
+                    ],
+                )
+                .unwrap();
+        };
+        // Two contained pairs, and one where both sides hold something.
+        seed("a", "EMBEDDED_TREE", 4, 0);
+        seed("b", "EMBEDDED_TREE", 0, 9);
+        seed("c", "PARTIAL_TREE_UNIQUE_CONTENT", 3, 7);
+
+        let summary = review_class_summary(&db, snapshot).unwrap();
+        let embedded = summary
+            .classes
+            .iter()
+            .find(|c| c.kind == "EMBEDDED_TREE")
+            .expect("embedded class");
+        assert_eq!(embedded.pairs_measured, 2);
+        assert_eq!(embedded.pairs_with_nothing_unique, 2);
+        // Zero, and it must be said rather than inferred from the count: a
+        // class of contained pairs risks no content at all, and that is the
+        // fact a reviewer needs before deciding to keep them apart anyway.
+        assert_eq!(embedded.unique_contents_on_contained_side, 0);
+
+        let partial = summary
+            .classes
+            .iter()
+            .find(|c| c.kind == "PARTIAL_TREE_UNIQUE_CONTENT")
+            .expect("partial class");
+        assert_eq!(partial.pairs_measured, 1);
+        assert_eq!(partial.pairs_with_nothing_unique, 0);
+        // The smaller side, not the sum of both: what a single decision over
+        // the class would put at risk is what the contained side would lose.
+        assert_eq!(partial.unique_contents_on_contained_side, 3);
+    }
+
+    /// A class nobody can decide has to say so. Unreadable source evidence is
+    /// repaired and rescanned, not routed, and an agent working from the
+    /// summary would otherwise spend a batch on it and be refused per item.
+    #[test]
+    fn an_unroutable_class_is_reported_as_blocked() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (_project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "ilegible.txt");
+        db.conn()
+            .execute(
+                "INSERT INTO structural_anomalies
+                    (id, snapshot_id, analysis_version, occurrence_id, folder_a,
+                     folder_b, kind, severity, requires_review, summary,
+                     evidence_json, created_at)
+                 VALUES ('bad', ?1, ?2, ?3, NULL, NULL, 'UNREADABLE_ENTRY',
+                         'HIGH', 1, 'unreadable', '{}', 't')",
+                params![snapshot.to_string(), ANALYSIS_VERSION as i64, occurrence],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO review_items
+                    (id, snapshot_id, analysis_version, anomaly_id,
+                     rule_match_id, occurrence_id, recommended_action, risk,
+                     reason, created_at)
+                 VALUES ('blocked-item', ?1, ?2, 'bad', NULL, ?3,
+                         'COPY_REVIEW', 'HIGH', 'unreadable', 't')",
+                params![snapshot.to_string(), ANALYSIS_VERSION as i64, occurrence],
+            )
+            .unwrap();
+
+        let grouped = review_class_summary(&db, snapshot).unwrap();
+        let class = grouped
+            .classes
+            .iter()
+            .find(|c| c.kind == "UNREADABLE_ENTRY")
+            .expect("the unreadable class is reported");
+        assert!(class.blocked);
+    }
+
+    /// An agent may answer the queue, but the ledger has to say it was an
+    /// agent: an archive that cannot separate a human decision from a model's
+    /// has no audit trail worth the name.
+    #[test]
+    fn a_batch_records_every_decision_under_the_declared_actor() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        seed_review_item(&db, snapshot, &occurrence, "item-a");
+        seed_review_item(&db, snapshot, &occurrence, "item-b");
+
+        let decided = decide_review_items(
+            &mut db,
+            project,
+            &[
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "árbol embebido revisado".to_string(),
+                },
+                ReviewDecisionInput {
+                    item_id: "item-b".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "misma clase que el anterior".to_string(),
+                },
+            ],
+            Actor::Agent,
+        )
+        .unwrap();
+        assert_eq!(decided, 2);
+
+        let actors: Vec<String> = db
+            .conn()
+            .prepare("SELECT actor FROM review_decisions ORDER BY review_item_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(actors, vec!["agent".to_string(), "agent".to_string()]);
+
+        // A batch is transport only: each decision still gets its own event,
+        // with its own rationale, exactly as a single append would.
+        let events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = ?1",
+                [EVENT_REVIEW_DECIDED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 2);
+    }
+
+    /// Half a decided queue is a state nobody can reason about, so one bad
+    /// row must leave the queue exactly as it was.
+    #[test]
+    fn a_batch_with_one_bad_item_writes_nothing() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        seed_review_item(&db, snapshot, &occurrence, "item-a");
+
+        let error = decide_review_items(
+            &mut db,
+            project,
+            &[
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "válida".to_string(),
+                },
+                ReviewDecisionInput {
+                    item_id: "no-existe".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "inválida".to_string(),
+                },
+            ],
+            Actor::Agent,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(m) if m.contains("does not exist")),
+            "{error:?}"
+        );
+
+        let written: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM review_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(written, 0, "a rejected batch must not write partially");
+    }
+
+    /// Two decisions for one item in one batch have no defined winner, so
+    /// the result would depend on input order rather than on intent.
+    #[test]
+    fn a_batch_rejects_the_same_item_twice() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        seed_review_item(&db, snapshot, &occurrence, "item-a");
+
+        let error = decide_review_items(
+            &mut db,
+            project,
+            &[
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyActive,
+                    rationale: "una".to_string(),
+                },
+                ReviewDecisionInput {
+                    item_id: "item-a".to_string(),
+                    decision: RuleAction::CopyTemporary,
+                    rationale: "otra".to_string(),
+                },
+            ],
+            Actor::Agent,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, DfError::Validation(m) if m.contains("more than once")),
+            "{error:?}"
+        );
+    }
+
+    /// A batch appends one chained event per decision inside a single
+    /// transaction. Each `append_event` reads the previous link through that
+    /// same transaction, so event N+1 must hang off event N — if they all took
+    /// their parent from the state before the batch, every event after the
+    /// first would carry the wrong `previous_hash` and the audit trail of a
+    /// bulk review would be worthless. Nothing else asserts this, and the
+    /// whole point of the batch is that it stays as strong a record as
+    /// appending one at a time.
+    #[test]
+    fn a_batch_leaves_the_ledger_chain_verifiable() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project, snapshot, occurrence) = seed_rule_occurrence(&mut db, "a.txt");
+        for item in ["item-a", "item-b", "item-c", "item-d"] {
+            seed_review_item(&db, snapshot, &occurrence, item);
+        }
+
+        let decisions: Vec<ReviewDecisionInput> = ["item-a", "item-b", "item-c", "item-d"]
+            .into_iter()
+            .map(|item| ReviewDecisionInput {
+                item_id: item.to_string(),
+                decision: RuleAction::CopyActive,
+                rationale: format!("revisado: {item}"),
+            })
+            .collect();
+        assert_eq!(
+            decide_review_items(&mut db, project, &decisions, Actor::Agent).unwrap(),
+            4
+        );
+
+        let events = crate::repository::list_events(&db, project).unwrap();
+        df_ledger::verify_chain(&events).expect("a batch must not break the chain");
+
+        // One event per decision, each carrying its own rationale — the batch
+        // is transport, not a single lumped record.
+        let decided: Vec<&df_domain::AuditEvent> = events
+            .iter()
+            .filter(|e| e.event_type == EVENT_REVIEW_DECIDED)
+            .collect();
+        assert_eq!(decided.len(), 4);
+        for (event, input) in decided.iter().zip(&decisions) {
+            let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+            assert_eq!(payload["review_item_id"], input.item_id);
+            assert_eq!(payload["rationale"], input.rationale);
+        }
     }
 
     #[test]

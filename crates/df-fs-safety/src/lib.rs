@@ -746,6 +746,214 @@ pub fn classify_filesystem(path: &Path) -> df_domain::FileSystemKind {
     }
 }
 
+/// What kind of device a path lives on.
+///
+/// Facts only — no recommendation. What to do about a spinning disk is policy
+/// and belongs above this crate; what the disk *is* belongs here.
+///
+/// Every field is optional and `None` means **could not ask**, never a
+/// default. A wrong guess here would pick a parallelism strategy for hardware
+/// that is not there, and the whole point of measuring is to stop doing that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct DeviceProfile {
+    /// Index of the physical disk. Two paths reporting the same number share
+    /// one device, and therefore one head, one queue and one bandwidth budget
+    /// — which is what decides whether reading and writing at once helps or
+    /// fights itself.
+    pub device_number: Option<u32>,
+    /// Whether reads pay a seek penalty: `Some(true)` is a spinning disk,
+    /// `Some(false)` a solid-state one.
+    ///
+    /// This is the single most useful fact about a volume for this engine.
+    /// Concurrent readers on a platter make the head travel instead of read,
+    /// so the parallelism that measured 2.46× on NVMe can measure *less than
+    /// one* here. Nothing else about the machine — core count, RAM, GPU —
+    /// changes the answer as much.
+    ///
+    /// Measured in the field, hashing 444 GB off an external USB platter while
+    /// the counters were sampled: the device sat at **99–100% busy** for the
+    /// whole run at **6–39 MB/s** across 38–57 reads/s — roughly 330 KB moved
+    /// per read, the rest of the time being the head travelling. Writes were
+    /// ~0. The same engine reads 4.3 GB/s off this machine's NVMe. A device
+    /// already spending its time seeking has no spare capacity for a second
+    /// reader to use, so on this volume the honest worker count is one, and no
+    /// amount of CPU changes it.
+    pub incurs_seek_penalty: Option<bool>,
+}
+
+impl DeviceProfile {
+    /// Whether two paths sit on the same physical device.
+    ///
+    /// `None` when either could not be identified: "I do not know" must not
+    /// collapse into "they are different", because that is the answer that
+    /// would let a caller read and write on one platter at full tilt.
+    pub fn same_device_as(&self, other: &Self) -> Option<bool> {
+        match (self.device_number, other.device_number) {
+            (Some(a), Some(b)) => Some(a == b),
+            _ => None,
+        }
+    }
+}
+
+/// Identify the device behind a path.
+pub fn device_profile(path: &Path) -> DeviceProfile {
+    #[cfg(windows)]
+    {
+        windows_device_profile(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        DeviceProfile::default()
+    }
+}
+
+#[cfg(windows)]
+fn windows_device_profile(path: &Path) -> DeviceProfile {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
+        IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DEVICE_NUMBER,
+        STORAGE_PROPERTY_QUERY,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+
+    let mut profile = DeviceProfile::default();
+
+    // The volume device, not the file: `\\.\D:` without a trailing separator.
+    let Some(root) = path.ancestors().last() else {
+        return profile;
+    };
+    let drive = root.as_os_str().to_string_lossy();
+    let drive = drive.trim_end_matches(['\\', '/']);
+
+    // Zero desired access, through std's own opener so the handle is owned and
+    // closed for us. Zero access is enough to query properties and — unlike a
+    // read handle on a raw volume — needs no elevation and gives no way to
+    // read past the filesystem. This engine has no business holding such a
+    // handle even for a moment.
+    let Ok(volume) = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .open(format!(r"\\.\{drive}"))
+    else {
+        return profile;
+    };
+    let handle = volume.as_raw_handle() as HANDLE;
+
+    // Which physical disk this volume is on.
+    let mut number = STORAGE_DEVICE_NUMBER {
+        DeviceType: 0,
+        DeviceNumber: 0,
+        PartitionNumber: 0,
+    };
+    let mut returned: u32 = 0;
+    // SAFETY: the handle is open, and the out buffer is a stack struct of
+    // exactly the size the ioctl documents.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            std::ptr::null(),
+            0,
+            std::ptr::addr_of_mut!(number).cast(),
+            std::mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        profile.device_number = Some(number.DeviceNumber);
+    }
+
+    // Whether its reads pay a seek penalty.
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR {
+        Version: 0,
+        Size: 0,
+        IncursSeekPenalty: 0,
+    };
+    // SAFETY: both buffers are stack structs of the documented sizes, and the
+    // handle is still open.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            std::ptr::addr_of!(query).cast(),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            std::ptr::addr_of_mut!(descriptor).cast(),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        profile.incurs_seek_penalty = Some(descriptor.IncursSeekPenalty != 0);
+    }
+
+    drop(volume);
+    profile
+}
+
+/// Bytes still writable at `path`, or `None` where this build cannot ask.
+///
+/// `None` means **unknown**, never "none left" and never "plenty". A caller
+/// that cannot measure must not refuse work on that basis: refusing a run
+/// because the platform has no answer would turn a missing feature into a
+/// broken product, and the engine already stops cleanly on a real ENOSPC.
+///
+/// Measured for the calling process, so a volume with a per-user quota
+/// reports what this user may write rather than what the disk holds — which
+/// is the number that decides whether a copy finishes.
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        windows_available_bytes(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_available_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // The path need not exist for the API, but its directory must resolve, so
+    // walk up to the first ancestor that is actually there. A destination root
+    // about to be created is the normal case here.
+    let existing = path.ancestors().find(|candidate| candidate.exists())?;
+    let mut wide: Vec<u16> = existing.as_os_str().encode_wide().collect();
+    if wide.last() != Some(&(b'\\' as u16)) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
+
+    let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer that outlives the
+    // call, and the out parameter is a stack u64 the API writes at most once.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
 #[cfg(windows)]
 fn classify_windows_volume(path: &Path) -> df_domain::FileSystemKind {
     use std::os::windows::ffi::OsStrExt;

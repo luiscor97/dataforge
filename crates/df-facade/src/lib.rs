@@ -18,19 +18,26 @@ use df_db::extraction::{
 use df_db::inventory::{DuplicateSet, InventorySummary};
 use df_db::{integrity::IntegrityReport, repository, Db};
 use df_domain::{
-    Actor, ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus,
-    FileFingerprint, MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId,
-    SnapshotId, SourceRoot, TreeCloneSet,
+    ExtractionRun, ExtractionRunCounters, ExtractionRunId, ExtractionRunStatus, FileFingerprint,
+    MailThreadId, ProfileRef, Project, ProjectId, ProjectState, RepresentationId, SnapshotId,
+    SourceRoot, TreeCloneSet,
 };
 use sha2::{Digest, Sha256};
 
+/// Re-exported for the same reason as [`DuplicatePolicy`]: every facade call
+/// that changes state takes an [`Actor`], so a client that cannot name one
+/// cannot use the facade without reaching past it to `df-domain`.
+pub use df_domain::Actor;
 /// Re-exported so clients can name a policy without depending on `df-domain`
 /// (RFC-0001 rules 16/17: clients only ever talk to the facade).
 pub use df_domain::DuplicatePolicy;
 use df_error::{DfError, DfResult};
 use serde::{Deserialize, Serialize};
 
-pub use df_db::analysis::{AnomalyReport, ReviewItemView, ReviewQueue, StructuralDiagnostics};
+pub use df_db::analysis::{
+    AnomalyReport, ReviewClass, ReviewClassSummary, ReviewDecisionInput, ReviewItemView,
+    ReviewQueue, StructuralDiagnostics,
+};
 pub use df_domain::RuleAction;
 pub use df_executor::ExecuteOptions;
 pub use df_executor::ExecuteOutcome;
@@ -39,14 +46,19 @@ mod ai_transport;
 mod secrets;
 
 pub use df_db::assistance::AssistanceAuditView;
+pub use df_db::inventory::{NameCollision, NameCollisionReport};
+pub use df_db::liveness::{RunLiveness, RunStage};
+pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
-pub use df_planner::{AnalyzeOutcome, ApproveOutcome, PlanOutcome, PlanValidationReport};
+pub use df_planner::{
+    AnalyzeOutcome, ApproveOutcome, DiscardOutcome, PlanOutcome, PlanValidationReport,
+};
 pub use df_plugin::{
     Capability as PluginCapability, PluginProjectOptions, PluginsOutcome, RegisteredPluginMetadata,
 };
 pub use df_scan::ScanOutcome;
 pub use df_similarity::{SimilarityOptions, SimilarityOutcome};
-pub use df_verifier::VerifyOutcome;
+pub use df_verifier::{VerifyOptions, VerifyOutcome};
 pub use secrets::{ai_key_present, remove_ai_key, set_ai_key, AiKeyProvider};
 
 pub use df_extract::ExtractionLimits;
@@ -85,6 +97,15 @@ pub struct CreateProjectRequest {
     /// Profile name; defaults to `generic`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Material this project declines to hash, declared by the operator.
+    ///
+    /// Profiles can carry these too, but profiles are compiled into the
+    /// binary, so a profile rule is only reachable by whoever builds
+    /// DataForge. This is how the person holding the archive says "do not
+    /// spend six hours reading the video". Declared once, stored in the
+    /// project, and applied on top of whatever the profile already declares.
+    #[serde(default)]
+    pub hash_exclusions: Vec<df_domain::HashExclusion>,
 }
 
 /// Serializable view of a source root.
@@ -135,6 +156,10 @@ pub struct ProjectStatus {
     pub media: Option<MediaStatusReport>,
     /// Present when an integrity pass was executed (project_status).
     pub integrity: Option<IntegrityReport>,
+    /// The run holding this project, if one claimed it. Evidence only — who,
+    /// from where, and how long since it last said anything. It carries no
+    /// alive/dead verdict, because that is not a fact this database can hold.
+    pub active_run: Option<df_db::liveness::RunLiveness>,
 }
 
 /// Compact, human-readable relation. It is evidence only: `automatic_action`
@@ -609,6 +634,7 @@ fn status_from_db(
         similarity,
         media,
         integrity,
+        active_run: df_db::liveness::liveness(db, project.id)?,
     })
 }
 
@@ -854,13 +880,45 @@ fn build_project_in(
     let roots: Vec<SourceRoot> = request
         .source_roots
         .iter()
-        .map(|path| SourceRoot::new(project.id, path.clone()))
+        .map(|path| {
+            let mut root = SourceRoot::new(project.id, path.clone());
+            // `SourceRoot::new` cannot classify: `df-domain` sits below
+            // `df-fs-safety`, so the constructor has to default to Unknown and
+            // somebody above has to fill it in. Nobody did, so every project
+            // ever created recorded its origins as UNKNOWN — including origins
+            // on a network share, which then claimed `is_network: false`.
+            root.filesystem = df_fs_safety::classify_filesystem(path);
+            root.is_network = root.filesystem == df_domain::FileSystemKind::Network;
+            root
+        })
         .collect();
     project.source_roots = roots.iter().map(|r| r.id).collect();
+
+    // Reject an unusable exclusion before the project exists, not on the
+    // first hash run. One that matches on nothing would decline to read the
+    // whole archive, and finding that out after a scan is finding it out too
+    // late to be a rejection.
+    for exclusion in &request.hash_exclusions {
+        if exclusion.r#match.is_empty() {
+            return Err(DfError::Validation(format!(
+                "hash exclusion `{}` matches on nothing, which would exclude the \
+                 entire archive",
+                exclusion.id
+            )));
+        }
+        if exclusion.reason.trim().is_empty() {
+            return Err(DfError::Validation(format!(
+                "hash exclusion `{}` has no reason; material that was never read \
+                 must say why",
+                exclusion.id
+            )));
+        }
+    }
 
     // Opening applies the migrations.
     let mut db = Db::open(&db_path)?;
     repository::create_project(&mut db, &project, &roots, actor)?;
+    df_db::inventory::set_project_hash_exclusions(&mut db, project.id, &request.hash_exclusions)?;
 
     // Prove it is sound before advertising it as a project.
     let report = df_db::integrity::check(&db)?;
@@ -928,8 +986,30 @@ pub fn open_project(project_dir: &Path) -> DfResult<ProjectStatus> {
     status_from_db(&db, &project_dir, None)
 }
 
-/// Full status of a project, including a database + ledger integrity pass.
+/// Status of a project: state, roots, counters and who is running it.
+///
+/// Cheap on purpose, and it did not use to be. This ran `PRAGMA
+/// integrity_check` on every call — a full pass over every page — so the one
+/// command an operator uses to watch a long stage was the one doing the most
+/// work, and it got slower exactly as the archive got bigger. On a 293 MB
+/// database mid-hash it did not return within five minutes.
+///
+/// Integrity is a question you ask deliberately: [`project_integrity`]. The
+/// `integrity` field is `Option` precisely because it was always meant to be
+/// answered only when asked.
 pub fn project_status(project_dir: &Path) -> DfResult<ProjectStatus> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    status_from_db(&db, &project_dir, None)
+}
+
+/// Status plus a full database and ledger integrity pass.
+///
+/// Costs a scan of the whole database, so it is a thing you ask for rather
+/// than something every status call pays for. Worth running before a delivery
+/// and after any interruption; not worth running to see how a hash is going.
+pub fn project_integrity(project_dir: &Path) -> DfResult<ProjectStatus> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let db = open_db(&project_dir, &marker)?;
@@ -2115,6 +2195,58 @@ pub fn create_plan(
     df_planner::create_plan(&mut db, actor, policy)
 }
 
+/// Discard the current unapproved plan and return to `ANALYZED` (§26).
+///
+/// The way back from a plan you do not want. Reversible in the only sense
+/// that matters: nothing was executed, and the superseded plan keeps its row
+/// and its ledger entry, so the record still shows it was built and rejected.
+///
+/// An approved plan cannot be discarded — approval froze a manifest, and that
+/// is evidence of a decision (ADR-0018).
+pub fn discard_plan(project_dir: &Path, actor: Actor) -> DfResult<DiscardOutcome> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    df_planner::discard_plan(&mut db, actor)
+}
+
+/// The output tree the current plan would produce, `depth` levels deep.
+///
+/// Read-only. Answers the question the counts cannot: *where does my data
+/// end up*. Available from `PLAN_READY` onwards, so the tree can be judged
+/// before approving a manifest that freezes it.
+pub fn plan_destination_tree(project_dir: &Path, depth: u32) -> DfResult<PlanDestinationTree> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let tree = df_db::plans::destination_tree(&db, plan.id, depth)?;
+    Ok(PlanDestinationTree {
+        plan_id: plan.id.to_string(),
+        version: plan.version,
+        output_root: project.output_root.display().to_string(),
+        files: tree.files,
+        directories: tree.directories,
+        bytes: tree.bytes,
+        without_destination: tree.without_destination,
+        nodes: tree
+            .nodes
+            .into_iter()
+            .map(|n| PlanDestinationNode {
+                prefix: n.prefix,
+                depth: n.depth,
+                files: n.files,
+                directories: n.directories,
+                bytes: n.bytes,
+                by_operation: n.by_operation,
+                sample: n.sample,
+            })
+            .collect(),
+    })
+}
+
 /// Re-run the §26.5 invariants against the stored current plan.
 pub fn validate_plan(project_dir: &Path) -> DfResult<PlanValidationReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2182,10 +2314,57 @@ pub fn execute_plan_with_options(
 /// Verify the executed plan from primary evidence (§28). Ends in
 /// `COMPLETED`, `COMPLETED_WITH_WARNINGS` or `FAILED`.
 pub fn verify_project_output(project_dir: &Path, actor: Actor) -> DfResult<VerifyOutcome> {
+    verify_project_output_with_options(project_dir, actor, &df_verifier::VerifyOptions::default())
+}
+
+/// Verify with explicit tuning (parallel re-hash workers, M1.0.1). The
+/// verdict and findings are identical for any worker count.
+pub fn verify_project_output_with_options(
+    project_dir: &Path,
+    actor: Actor,
+    options: &df_verifier::VerifyOptions,
+) -> DfResult<VerifyOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_verifier::verify_project(&mut db, actor, &df_verifier::VerifyOptions::default())
+    df_verifier::verify_project(&mut db, actor, options)
+}
+
+/// One prefix of the projected output tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationNode {
+    /// Path relative to the output root.
+    pub prefix: String,
+    /// Path components in `prefix` (1 for a top-level root).
+    pub depth: u32,
+    /// Copies landing anywhere under this prefix.
+    pub files: u64,
+    /// Directories created under this prefix.
+    pub directories: u64,
+    /// Bytes the copies would write.
+    pub bytes: u64,
+    /// Copies by operation type, most frequent first.
+    pub by_operation: Vec<(String, u64)>,
+    /// A real destination path from this subtree.
+    pub sample: Option<String>,
+}
+
+/// What the current plan would produce on disk.
+///
+/// The plan already holds a destination for every occurrence; this only
+/// aggregates it. Reporting the shape of the output before it is frozen is
+/// what lets an approval be informed rather than blind.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanDestinationTree {
+    pub plan_id: String,
+    pub version: u32,
+    pub output_root: String,
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    /// Copies with no recorded destination. Surfaced, never hidden.
+    pub without_destination: u64,
+    pub nodes: Vec<PlanDestinationNode>,
 }
 
 /// Exact duplicate report of the latest snapshot (RFC-0001 §15).
@@ -2265,6 +2444,593 @@ pub fn duplicate_report(project_dir: &Path) -> DfResult<DuplicateReport> {
         redundant_bytes,
         sets,
     })
+}
+
+/// One path and the device underneath it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceView {
+    pub path: String,
+    pub filesystem: String,
+    pub device: df_fs_safety::DeviceProfile,
+}
+
+/// What the machine can be expected to do with this project.
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicePreflight {
+    pub sources: Vec<DeviceView>,
+    pub destination: DeviceView,
+    /// Whether an origin and the destination share one physical device.
+    /// `None` when either could not be identified.
+    pub source_shares_destination_device: Option<bool>,
+    /// Workers this machine should use for reading, and why.
+    pub recommended_workers: u32,
+    pub rationale: String,
+}
+
+/// Recommended read parallelism, and the sentence that explains it.
+///
+/// The measured sweeps (M1.0.1) put bounded parallelism at 2.46× on NVMe and
+/// saturating by 8 workers. Every one of those numbers was taken on
+/// solid-state storage, and none of them transfers to a platter: concurrent
+/// readers there make the head travel between requests instead of reading, so
+/// the same setting that wins on NVMe can lose outright.
+///
+/// So the recommendation follows the one fact that decides it — seek penalty —
+/// and says so in words. It is advice, never an override: nothing here changes
+/// what a run does, because a caller who asked for eight workers on a spinning
+/// disk may have a reason, and silently disagreeing with them is worse than
+/// telling them.
+fn recommend_workers(destination: &df_fs_safety::DeviceProfile) -> (u32, String) {
+    match destination.incurs_seek_penalty {
+        Some(true) => (
+            1,
+            "this volume reports a seek penalty, so it is a spinning disk. \
+             Concurrent readers make the head travel instead of read, and the \
+             parallelism that measured 2.46x on NVMe can measure less than one \
+             here. One worker, and expect the device — not the CPU — to set the \
+             pace."
+                .to_string(),
+        ),
+        Some(false) => (
+            8,
+            "solid-state: no seek penalty, so concurrent reads overlap. The \
+             measured sweeps saturate at 8 workers (2.46x hash, 2.59x verify); \
+             more threads bought nothing beyond that."
+                .to_string(),
+        ),
+        None => (
+            1,
+            "this build could not ask the volume whether its reads pay a seek \
+             penalty. One worker is the setting that is never actively wrong: \
+             it cannot thrash a platter, and on solid-state it only forgoes an \
+             improvement rather than causing a regression."
+                .to_string(),
+        ),
+    }
+}
+
+/// Report the storage this project sits on, before a long stage starts.
+///
+/// The engine has always taken its parallelism from a flag and its buffer
+/// sizes from constants, and looked at the machine not at all. That is fine
+/// until the archive turns out to live on an external spinning disk, where the
+/// setting measured as a 2.46x win becomes a loss — and nothing in the run
+/// would have said so.
+///
+/// Advice only. It changes no behaviour; it makes the decision visible before
+/// it costs hours.
+pub fn device_preflight(project_dir: &Path) -> DfResult<DevicePreflight> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let roots = repository::load_source_roots(&db, project.id)?;
+
+    let view = |path: &Path| DeviceView {
+        path: path.display().to_string(),
+        filesystem: df_fs_safety::classify_filesystem(path).as_str().to_string(),
+        device: df_fs_safety::device_profile(path),
+    };
+
+    let sources: Vec<DeviceView> = roots.iter().map(|r| view(&r.absolute_path)).collect();
+    let destination = view(&project.output_root);
+    // True if *any* origin shares the destination's device: one origin doing
+    // that is enough for reads and writes to contend.
+    let shared = sources
+        .iter()
+        .filter_map(|source| source.device.same_device_as(&destination.device))
+        .fold(None, |acc: Option<bool>, same| {
+            Some(acc.unwrap_or(false) || same)
+        });
+
+    let (recommended_workers, mut rationale) = recommend_workers(&destination.device);
+    if shared == Some(true) {
+        rationale.push_str(
+            " An origin and the destination are on the same physical device, so \
+             the copy stage will read and write through one queue; expect it to \
+             run slower than either would alone.",
+        );
+    }
+
+    Ok(DevicePreflight {
+        sources,
+        destination,
+        source_shares_destination_device: shared,
+        recommended_workers,
+        rationale,
+    })
+}
+
+/// Whether the destination has room for what is left to copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpacePreflight {
+    pub plan_id: String,
+    pub output_root: String,
+    /// Bytes the operations still to be attempted would write.
+    pub required_bytes: u64,
+    /// Bytes writable at the destination, or `None` where this build cannot
+    /// ask. `None` is **unknown**, never zero and never plenty.
+    pub available_bytes: Option<u64>,
+    /// True when there is measurably room; false when there measurably is not.
+    /// `None` when nothing could be measured, so a caller cannot mistake
+    /// "could not check" for "checked and fine".
+    pub sufficient: Option<bool>,
+    /// Where `required_bytes` came from: `"MANIFEST"` once approval has frozen
+    /// one, `"PLAN"` before that.
+    ///
+    /// Not decoration. The manifest is the execution contract and the better
+    /// answer, but it does not exist until approval, and a preflight is most
+    /// useful *before* deciding to approve. Saying which source answered lets
+    /// a caller tell a figure taken from the frozen contract from one taken
+    /// from a plan that can still change.
+    pub source: &'static str,
+}
+
+/// Check the destination has room before a long copy starts.
+///
+/// On a real archive a copy runs for hours, and finding out at hour six that
+/// the volume was always too small costs the whole run. The engine already
+/// stops cleanly on a real ENOSPC — this is about not starting.
+///
+/// It reports and refuses nothing by itself. Where free space cannot be
+/// measured the answer is `None`, and a caller must not read that as
+/// permission or as denial: turning "this platform has no answer" into a
+/// refusal would make a missing feature look like a full disk.
+pub fn plan_space_preflight(project_dir: &Path) -> DfResult<SpacePreflight> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+
+    // The frozen manifest is the better source, but it exists only from
+    // approval onwards. Falling back to the plan is what makes this answerable
+    // at the moment it is worth asking — before committing to the copy.
+    // Keyed on approval, not on the byte count: a run that has finished also
+    // has zero bytes pending, and calling that "the plan says zero" would be
+    // true by accident and wrong in meaning.
+    let (required_bytes, source) = if plan.status == df_domain::PlanStatus::Approved {
+        (df_db::plans::pending_bytes(&db, plan.id)?, "MANIFEST")
+    } else {
+        (df_db::plans::planned_bytes(&db, plan.id)?, "PLAN")
+    };
+    let available_bytes = df_fs_safety::available_bytes(&project.output_root);
+    Ok(SpacePreflight {
+        plan_id: plan.id.to_string(),
+        output_root: project.output_root.display().to_string(),
+        required_bytes,
+        available_bytes,
+        sufficient: available_bytes.map(|available| available >= required_bytes),
+        source,
+    })
+}
+
+/// What an exported delivery package contains.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryPackage {
+    pub plan_id: String,
+    /// Directory the files were written to, under the audit root.
+    pub directory: String,
+    /// Rows in the traceability map: one per manifest entry, always.
+    pub entries: u64,
+    /// Entries carrying an expected SHA-256, and therefore checkable.
+    pub checksummed: u64,
+    /// Entries with no destination recorded. Reported, never dropped.
+    pub without_destination: u64,
+    pub bytes: u64,
+}
+
+/// Export the evidence that nothing was lost.
+///
+/// The original this engine was built against was not accepted on a metric.
+/// It was accepted, in the client's words, when the adviser had no doubt that
+/// material could have gone missing — and what removed the doubt was a
+/// traceability map, a checksum manifest and a plain statement of guarantees
+/// they could check themselves. The engine already held every one of those
+/// facts and had no way to hand them over.
+///
+/// Three files, all derived from the **frozen manifest** rather than from a
+/// walk of the output, so the package describes what was approved and not
+/// merely what happens to be on disk:
+///
+/// - `traceability.csv` — origin → destination, one row per manifest entry.
+/// - `SHA256SUMS` — in `sha256sum -c` format, so it is checkable with a tool
+///   the recipient already trusts rather than only with this one.
+/// - `delivery.md` — the guarantees, in prose, with the counts behind them.
+///
+/// # Why it lands in the audit root and not in the output
+///
+/// The delivered folder is described by a manifest that was frozen before
+/// anything was copied, and the verifier re-reads the output against exactly
+/// that. Writing three files into it would add files the manifest never
+/// described and the verifier never expected. So the package is produced
+/// beside the output, and copying it in afterwards is the operator's call,
+/// taken knowingly.
+pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+    let entries = df_db::plans::manifest(&db, plan.id)?;
+    if entries.is_empty() {
+        return Err(DfError::Validation(
+            "the plan has no frozen manifest; approve it before exporting a delivery package"
+                .to_string(),
+        ));
+    }
+
+    let directory = project.audit_root.join("delivery");
+    std::fs::create_dir_all(&directory).map_err(|error| DfError::io(&directory, error))?;
+
+    let mut csv = String::from(
+        "source_root,source_relative_path,destination_relative_path,operation,sha256,bytes\n",
+    );
+    let mut sums = String::new();
+    let mut checksummed = 0u64;
+    let mut without_destination = 0u64;
+    let mut bytes = 0u64;
+
+    for entry in &entries {
+        let destination = entry.destination_relative_path.clone().unwrap_or_default();
+        if entry.destination_relative_path.is_none() {
+            without_destination += 1;
+        }
+        bytes += entry.expected_size_bytes.unwrap_or(0);
+        let sha = entry.expected_sha256.clone().unwrap_or_default();
+        if let (Some(sha), Some(destination)) = (
+            entry.expected_sha256.as_deref(),
+            entry.destination_relative_path.as_deref(),
+        ) {
+            checksummed += 1;
+            // The two-space form `sha256sum -c` expects for a binary file.
+            sums.push_str(&format!("{sha}  {destination}\n"));
+        }
+        csv.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            csv_field(entry.source_root_path_snapshot.as_deref().unwrap_or("")),
+            csv_field(entry.source_relative_path_exact.as_deref().unwrap_or("")),
+            csv_field(&destination),
+            entry.operation_type.as_str(),
+            sha,
+            entry.expected_size_bytes.unwrap_or(0),
+        ));
+    }
+
+    // The verdict is read back from the run that produced it, never asserted.
+    // "Not verified" is said in those words rather than left blank: a delivery
+    // that was never checked and one that passed must not look alike.
+    let verification = df_db::plans::latest_verification(&db, plan.id)?;
+    let verdict = match &verification {
+        Some(run) => format!(
+            "**{}** — {} checked, {} problems, {} warnings, finished {}",
+            run.verdict, run.checked, run.problems, run.warnings, run.finished_at
+        ),
+        None => {
+            "**not verified** — no verification run has been recorded for this plan".to_string()
+        }
+    };
+
+    // What the profile declined to read belongs in a document that claims
+    // nothing was lost. An exclusion is a legitimate decision; leaving it out
+    // of the delivery would make the claim broader than the evidence, which is
+    // the one thing this package must not do.
+    let skipped = match df_db::inventory::latest_complete_snapshot(&db, project.id)? {
+        Some(snapshot) => df_db::inventory::hash_exclusions(&db, snapshot.id)?,
+        None => Vec::new(),
+    };
+    let not_read = if skipped.is_empty() {
+        "Everything in the origin was read and identified by hash.".to_string()
+    } else {
+        let mut counts: std::collections::BTreeMap<&str, (u64, &str)> =
+            std::collections::BTreeMap::new();
+        for exclusion in &skipped {
+            let entry = counts
+                .entry(exclusion.rule_id.as_str())
+                .or_insert((0, exclusion.reason.as_str()));
+            entry.0 += 1;
+        }
+        let mut lines = format!(
+            "**{} files were deliberately not read** and carry no hash here. They \
+             remain in the origin, untouched, and stay listed in the project's \
+             inventory:\n",
+            skipped.len()
+        );
+        for (rule, (count, reason)) in counts {
+            lines.push_str(&format!("\n- `{rule}` — {count} files: {reason}"));
+        }
+        lines
+    };
+
+    let summary = format!(
+        "# Delivery package\n\n\
+         Plan `{}`, version {}.\n\n\
+         ## What this says\n\n\
+         - Entries in the frozen manifest: **{}**\n\
+         - Of those, carrying a SHA-256 anyone can check: **{}**\n\
+         - Without a recorded destination: **{}**\n\
+         - Bytes described: **{}**\n\
+         - Independent verification: {}\n\n\
+         ## What was not read\n\n\
+         {}\n\n\
+         ## Guarantees\n\n\
+         The origin was never written to: no code in this engine renames, \
+         deletes or modifies anything inside a source root. Nothing was \
+         overwritten in the destination. Every row of `traceability.csv` names \
+         where a file came from and where it went, and `SHA256SUMS` can be \
+         checked with `sha256sum -c` against the delivered folder — with a \
+         tool of your choosing, not only with this one.\n\n\
+         This package is derived from the manifest frozen at approval, not \
+         from a walk of the delivered folder, so it describes what was agreed \
+         rather than what happens to be present.\n",
+        plan.id,
+        plan.version,
+        entries.len(),
+        checksummed,
+        without_destination,
+        bytes,
+        verdict,
+        not_read,
+    );
+
+    write_delivery_file(&directory, "traceability.csv", &csv)?;
+    write_delivery_file(&directory, "SHA256SUMS", &sums)?;
+    write_delivery_file(&directory, "delivery.md", &summary)?;
+
+    Ok(DeliveryPackage {
+        plan_id: plan.id.to_string(),
+        directory: directory.display().to_string(),
+        entries: entries.len() as u64,
+        checksummed,
+        without_destination,
+        bytes,
+    })
+}
+
+fn write_delivery_file(directory: &Path, name: &str, contents: &str) -> DfResult<()> {
+    let path = directory.join(name);
+    std::fs::write(&path, contents).map_err(|error| DfError::io(&path, error))
+}
+
+/// Quote a CSV field so a path containing a comma or a quote cannot shift the
+/// columns. A traceability map whose rows can be misread is worse than none.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Store a rule set version in the project (ADR-0041).
+///
+/// Storing is not gating: nothing consults these at decision time yet. What it
+/// establishes is that a set has an identity — an id, a version and a digest
+/// over its exact bytes — before anything is allowed to cite one.
+///
+/// The digest is computed by `df-rules`, never here. Persistence keeps bytes;
+/// deciding what they mean belongs to the crate that owns the format, and a
+/// second implementation of the digest is a second thing that can disagree.
+pub fn save_rule_set(project_dir: &Path, set: &df_rules::RuleSet) -> DfResult<()> {
+    // Refuse a set whose digest no longer matches its params before it is
+    // written, so a set that drifted between being built and being stored
+    // never becomes the record other decisions cite.
+    set.verify()?;
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let params = df_ledger::canonical_json(
+        &serde_json::to_value(&set.params)
+            .map_err(|error| DfError::Serialization(format!("rule params: {error}")))?,
+    );
+    df_db::rules::save(
+        &db,
+        &df_db::rules::RuleSetRecord {
+            id: set.id.clone(),
+            version: set.version,
+            schema: df_rules::RULE_SET_SCHEMA_VERSION.to_string(),
+            params,
+            digest: set.digest.clone(),
+            created_at: String::new(),
+        },
+    )
+}
+
+/// Read a stored rule set back, refusing one whose bytes no longer match its
+/// digest.
+///
+/// Verified on read and not once at startup: a set that drifted between being
+/// loaded and being used is exactly the case a check at load time cannot see
+/// (ADR-0041, threat A4).
+pub fn rule_set(project_dir: &Path, id: &str, version: Option<u32>) -> DfResult<df_rules::RuleSet> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let record = match version {
+        Some(version) => df_db::rules::load(&db, id, version)?,
+        None => df_db::rules::latest(&db, id)?,
+    }
+    .ok_or_else(|| DfError::Validation(format!("no rule set `{id}` stored in this project")))?;
+
+    if record.schema != df_rules::RULE_SET_SCHEMA_VERSION {
+        return Err(DfError::Validation(format!(
+            "rule set `{}` version {} was written for schema {}, and this build speaks {}",
+            record.id,
+            record.version,
+            record.schema,
+            df_rules::RULE_SET_SCHEMA_VERSION
+        )));
+    }
+
+    let params: df_rules::RuleParams = serde_json::from_str(&record.params)
+        .map_err(|error| DfError::Serialization(format!("stored rule params: {error}")))?;
+    let set = df_rules::RuleSet {
+        id: record.id,
+        version: record.version,
+        params,
+        digest: record.digest,
+    };
+    set.verify()?;
+    Ok(set)
+}
+
+/// Absolute paths sampled per colliding name, one per distinct content.
+///
+/// Enough to make a collision concrete in a report without turning the
+/// response into a file listing: the finding is that the name disagrees, and
+/// four disagreeing paths show that as well as four hundred.
+const NAME_COLLISION_SAMPLES: usize = 4;
+
+/// File names that stand for different content in different places.
+///
+/// The evidence behind a rule the engine already follows and could not
+/// previously show: a name is not an identity. Report only — it proposes
+/// nothing (RFC-0001 §15.2).
+/// What a plan could not copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionFailureReport {
+    pub plan_id: String,
+    /// Failures that will not fix themselves.
+    pub failed_final: u64,
+    /// Failures a later run may still resolve.
+    pub failed_retryable: u64,
+    /// `[error_code, count]`, most frequent first — the shape of the damage.
+    pub by_error: Vec<(String, u64)>,
+    pub failures: Vec<df_db::plans::FailedOperationView>,
+}
+
+/// Report everything the current plan could not copy, and why.
+///
+/// A run over failing media finishes: per-file errors never abort it, which is
+/// what makes an old disk workable at all. The cost of that is that the run
+/// ends looking successful, and the operator has to be able to ask what did
+/// not make it. Every attempt and its error code were already recorded; this
+/// is what reads them back.
+pub fn execution_failure_report(project_dir: &Path) -> DfResult<ExecutionFailureReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let plan = df_db::plans::current_plan(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no plan".to_string()))?;
+
+    let progress = df_db::plans::plan_progress(&db, plan.id)?;
+    // Bounded: a plan over a dying disk can fail as many times as it has
+    // files, and a caller asking what went wrong wants the shape of it.
+    let failures = df_db::plans::failed_operations(&db, plan.id, MAX_REPORTED_FAILURES)?;
+
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for failure in &failures {
+        *counts.entry(failure.error_code.clone()).or_default() += 1;
+    }
+    let mut by_error: Vec<(String, u64)> = counts.into_iter().collect();
+    by_error.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(ExecutionFailureReport {
+        plan_id: plan.id.to_string(),
+        failed_final: progress.failed_final,
+        failed_retryable: progress.failed_retryable,
+        by_error,
+        failures,
+    })
+}
+
+/// Failures listed in one report. The counts above are never truncated.
+const MAX_REPORTED_FAILURES: usize = 1_000;
+
+/// What the profile declined to read, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct HashExclusionReport {
+    pub snapshot_id: String,
+    pub excluded: u64,
+    /// `[rule_id, count]`, most excluded first.
+    pub by_rule: Vec<(String, u64)>,
+    pub exclusions: Vec<df_db::inventory::HashExclusionView>,
+}
+
+/// Report the occurrences this project's profile declined to hash.
+///
+/// The answer to "was anything skipped?", which an operator is entitled to ask
+/// before trusting a delivery and which the inventory alone cannot give. An
+/// exclusion is a legitimate decision; an *undisclosed* one is not.
+pub fn hash_exclusion_report(project_dir: &Path) -> DfResult<HashExclusionReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    let exclusions = df_db::inventory::hash_exclusions(&db, snapshot.id)?;
+
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for exclusion in &exclusions {
+        *counts.entry(exclusion.rule_id.clone()).or_default() += 1;
+    }
+    let mut by_rule: Vec<(String, u64)> = counts.into_iter().collect();
+    by_rule.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(HashExclusionReport {
+        snapshot_id: snapshot.id.to_string(),
+        excluded: exclusions.len() as u64,
+        by_rule,
+        exclusions,
+    })
+}
+
+pub fn name_collision_report(
+    project_dir: &Path,
+) -> DfResult<df_db::inventory::NameCollisionReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Deliberately not gated on complete analysis, unlike the structural
+    // reports: this one reads hashes and names, which the hash stage already
+    // sealed. Requiring analysis would withhold an answer the database can
+    // give — and the collision matters most *before* anyone plans a merge.
+    df_db::inventory::name_collisions(&db, snapshot.id, NAME_COLLISION_SAMPLES)
+}
+
+/// Grafted subtrees and how much of each places itself.
+///
+/// A graft is a folder that acquired a leading prefix when a whole tree was
+/// copied under it; stripping the prefix recovers the canonical path. Evidence
+/// only — it proposes no move (RFC-0001 §15.2).
+pub fn grafted_tree_report(project_dir: &Path) -> DfResult<GraftedTreeReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Gated on complete analysis, unlike the name report: this one reads
+    // `tree_relations`, which only a finished analysis has written.
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::structure::grafted_trees(&db, snapshot.id)
 }
 
 /// Exact tree-clone report of the latest snapshot (RFC-0001 §19).
@@ -2359,6 +3125,66 @@ fn non_overlapping_redundant_bytes(sets: &[TreeCloneSet]) -> u64 {
     redundant_bytes
 }
 
+/// Bytes held by subtrees a `TREE_EMBEDDED` relation proves carry nothing of
+/// their own, counting no nested subtree twice.
+///
+/// An embedded relation requires the contained side to have zero unique files
+/// — the schema enforces it — so every content under it also exists outside,
+/// and `shared_bytes` is that subtree's content weight. This is the strongest
+/// redundancy claim the engine can make short of a duplicate set, and until
+/// now nothing surfaced its size: answering "how much is provably collapsible"
+/// meant querying SQLite by hand.
+///
+/// Deliberately conservative, exactly like the clone-set estimate: nested
+/// contained subtrees collapse to their shallowest ancestor, so the figure may
+/// undercount and never overcounts. Evidence only — it proposes no action, and
+/// no policy consolidates on it today (ADR-0045 is where that is decided).
+fn non_overlapping_embedded_bytes(
+    relations: &[df_db::structure::TreeRelationView],
+) -> (u64, u64, u64) {
+    let mut candidates: Vec<(Vec<String>, u64, u64)> = Vec::new();
+    for relation in relations {
+        if relation.relationship != "TREE_EMBEDDED" {
+            continue;
+        }
+        // `contained` names which side is inside the other; it is not implied
+        // by the ordering of the pair.
+        let (path, files) = match relation.contained.as_deref() {
+            Some("A") => (&relation.path_a, relation.shared_files),
+            Some("B") => (&relation.path_b, relation.shared_files),
+            // A relation without a contained side is not an embedding we can
+            // read, so it contributes nothing rather than a guess.
+            _ => continue,
+        };
+        candidates.push((clone_path_components(path), relation.shared_bytes, files));
+    }
+
+    // One folder can be the contained side of several relations; keep it once.
+    candidates.sort_by(|left, right| {
+        left.0
+            .len()
+            .cmp(&right.0.len())
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.dedup_by(|left, right| left.0 == right.0);
+
+    let mut selected = Vec::<Vec<String>>::new();
+    let (mut bytes, mut files) = (0_u64, 0_u64);
+    for (components, subtree_bytes, subtree_files) in candidates {
+        if selected
+            .iter()
+            .any(|path| clone_paths_overlap(path, &components))
+        {
+            continue;
+        }
+        bytes = bytes.saturating_add(subtree_bytes);
+        files = files.saturating_add(subtree_files);
+        selected.push(components);
+    }
+    (selected.len() as u64, files, bytes)
+}
+
 /// Compute the exact tree-clone report of the latest complete snapshot.
 pub fn tree_clone_report(project_dir: &Path) -> DfResult<TreeCloneReport> {
     let project_dir = absolutize(project_dir)?;
@@ -2393,6 +3219,25 @@ pub struct TreeRelationReport {
     pub embedded: u64,
     /// Pairs whose only meaningful overlap is a repeated component.
     pub repeated_components: u64,
+    /// Contained subtrees counted once, ancestors absorbing descendants.
+    pub embedded_contained_folders: u64,
+    /// Distinct contents shared by those subtrees with their outer tree.
+    /// Not a file count of the subtree: a subtree that holds the same content
+    /// twice contributes it once.
+    pub embedded_contained_files: u64,
+    /// Bytes of those distinct shared contents — the strongest redundancy
+    /// claim short of a duplicate set, since every one of them also exists
+    /// outside the contained subtree.
+    ///
+    /// A **lower bound** on what collapsing would avoid writing, twice over:
+    /// nested subtrees collapse into their ancestor, and internal duplication
+    /// inside a subtree is counted once here while a plan would copy it once
+    /// per occurrence. Erring low is deliberate — the same discipline as the
+    /// clone-set estimate — because overstating a saving is how a user ends
+    /// up surprised by a destination that does not fit.
+    ///
+    /// Still evidence: no policy consolidates on it today (ADR-0045).
+    pub embedded_redundant_bytes: u64,
     pub relations: Vec<df_db::structure::TreeRelationView>,
 }
 
@@ -2418,11 +3263,16 @@ pub fn tree_relation_report(project_dir: &Path) -> DfResult<TreeRelationReport> 
         .iter()
         .filter(|r| r.relationship == "REPEATED_COMPONENT_ONLY")
         .count() as u64;
+    let (embedded_contained_folders, embedded_contained_files, embedded_redundant_bytes) =
+        non_overlapping_embedded_bytes(&relations);
     Ok(TreeRelationReport {
         snapshot_id: snapshot.id.to_string(),
         partial_clones,
         embedded,
         repeated_components,
+        embedded_contained_folders,
+        embedded_contained_files,
+        embedded_redundant_bytes,
         relations,
     })
 }
@@ -2480,6 +3330,23 @@ pub fn structural_review_queue(project_dir: &Path) -> DfResult<ReviewQueue> {
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
+/// The review queue grouped by question rather than listed by item.
+///
+/// The flat queue is the wrong first call over a real archive: it returns
+/// thousands of rows that are mostly the same question repeated. This returns
+/// one row per class, ordered by how many decisions each would settle, so the
+/// shortest path to an empty review bucket is the first line of output.
+pub fn structural_review_classes(project_dir: &Path) -> DfResult<ReviewClassSummary> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::review_class_summary(&db, snapshot.id)
+}
+
 /// Append a review decision before planning. Decisions after a plan exists
 /// would not change that immutable plan, so they are rejected explicitly.
 pub fn decide_structural_review(
@@ -2503,6 +3370,34 @@ pub fn decide_structural_review(
         .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
     ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     df_db::analysis::decide_review_item(&mut db, project.id, item_id, decision, rationale, actor)?;
+    df_db::analysis::review_queue(&db, snapshot.id)
+}
+
+/// Append many review decisions atomically.
+///
+/// The queue over a real archive runs to thousands of items, most of them
+/// repetitions of a few questions, which is exactly the shape an agent can
+/// answer in one pass. Each decision keeps its own rationale and its own
+/// ledger event; the batch only removes the need for one process per item.
+pub fn decide_structural_review_batch(
+    project_dir: &Path,
+    decisions: &[ReviewDecisionInput],
+    actor: Actor,
+) -> DfResult<ReviewQueue> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let mut db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    if project.state != ProjectState::Analyzed {
+        return Err(DfError::Validation(format!(
+            "review decisions require ANALYZED state before planning (current {})",
+            project.state
+        )));
+    }
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    df_db::analysis::decide_review_items(&mut db, project.id, decisions, actor)?;
     df_db::analysis::review_queue(&db, snapshot.id)
 }
 
@@ -2537,6 +3432,82 @@ pub fn verify_audit(project_dir: &Path) -> DfResult<AuditReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embedded(
+        contained_path: &str,
+        outer_path: &str,
+        files: u64,
+        bytes: u64,
+    ) -> df_db::structure::TreeRelationView {
+        df_db::structure::TreeRelationView {
+            path_a: contained_path.to_owned(),
+            path_b: outer_path.to_owned(),
+            relationship: "TREE_EMBEDDED".to_string(),
+            contained: Some("A".to_string()),
+            shared_files: files,
+            // The schema forbids unique content on the contained side; that
+            // is precisely what makes the claim provable.
+            unique_a_files: 0,
+            unique_b_files: 3,
+            shared_bytes: bytes,
+            similarity: 1.0,
+        }
+    }
+
+    /// The size of a provable redundancy, counted once. Two nested contained
+    /// subtrees are one opportunity, not two, and reporting the sum would
+    /// overstate what collapsing them recovers.
+    #[test]
+    fn nested_contained_subtrees_are_counted_once() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz", 10, 1_000),
+            embedded(r"raiz\copia\dentro", r"raiz", 4, 400),
+        ];
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1, "the descendant is absorbed by its ancestor");
+        assert_eq!(files, 10);
+        assert_eq!(bytes, 1_000, "never the 1.400 of the naive sum");
+    }
+
+    /// One folder can be the contained side of several relations — embedded
+    /// in two different outer trees — and it is still one folder.
+    #[test]
+    fn a_folder_contained_twice_is_still_one_opportunity() {
+        let relations = vec![
+            embedded(r"raiz\copia", r"raiz\a", 10, 1_000),
+            embedded(r"raiz\copia", r"raiz\b", 10, 1_000),
+        ];
+        let (folders, _, bytes) = non_overlapping_embedded_bytes(&relations);
+        assert_eq!(folders, 1);
+        assert_eq!(bytes, 1_000);
+    }
+
+    /// Only embeddings count. A partial clone has unique content on both
+    /// sides — dropping either loses data (§19.4) — so it must never appear
+    /// in a figure that describes what is safe to collapse.
+    #[test]
+    fn partial_clones_contribute_nothing_to_the_provable_figure() {
+        let mut partial = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        partial.relationship = "PARTIAL_TREE_CLONE".to_string();
+        partial.contained = None;
+        partial.unique_a_files = 2;
+
+        let mut repeated = embedded(r"raiz\c", r"raiz\d", 5, 500);
+        repeated.relationship = "REPEATED_COMPONENT_ONLY".to_string();
+        repeated.contained = None;
+
+        let (folders, files, bytes) = non_overlapping_embedded_bytes(&[partial, repeated]);
+        assert_eq!((folders, files, bytes), (0, 0, 0));
+    }
+
+    /// An embedding whose contained side is not recorded is not readable as
+    /// an embedding, so it contributes nothing rather than a guess.
+    #[test]
+    fn an_embedding_without_a_contained_side_is_skipped() {
+        let mut orphan = embedded(r"raiz\a", r"raiz\b", 5, 500);
+        orphan.contained = None;
+        assert_eq!(non_overlapping_embedded_bytes(&[orphan]), (0, 0, 0));
+    }
 
     fn clone_set(tag: char, folders: &[&str], subtree_bytes: u64) -> TreeCloneSet {
         TreeCloneSet {
@@ -2611,6 +3582,7 @@ mod tests {
             audit_root: None,
             source_roots: vec![],
             profile: None,
+            hash_exclusions: Vec::new(),
         }
     }
 
@@ -2686,7 +3658,9 @@ mod tests {
         assert!(opened.integrity.is_none());
 
         let status = project_status(&req.project_dir).expect("status");
-        let integrity = status.integrity.expect("status runs integrity");
+        assert!(status.integrity.is_none(), "status is the cheap question");
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        let integrity = checked.integrity.expect("asked for, so answered");
         assert!(integrity.is_ok(), "{:?}", integrity.problems);
         assert_eq!(
             status.last_event.as_ref().map(|e| e.event_type.as_str()),
@@ -2852,6 +3826,612 @@ mod tests {
     }
 
     #[test]
+    fn the_preflight_counts_what_is_left_and_never_guesses_what_it_cannot_measure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"doce bytes!!").unwrap();
+        std::fs::write(origin.join("dos.txt"), b"otros doce!!").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+
+        // Before approval, and this is the case that matters: a preflight is
+        // consulted to decide *whether* to approve. It used to sum the frozen
+        // manifest, which approval creates, so an unapproved plan reported
+        // "0 bytes still to write, there is room" — the same answer it would
+        // give on a full disk. Found on a 444 GB plan; this test approved
+        // first and so asked the only question that already worked.
+        let unapproved = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(unapproved.source, "PLAN");
+        assert!(
+            unapproved.required_bytes >= 24,
+            "an unapproved plan still knows what it would write"
+        );
+
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let before = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(
+            before.source, "MANIFEST",
+            "approval freezes the better source"
+        );
+        assert!(before.required_bytes >= 24, "both files are still to copy");
+
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+
+        // The property that keeps a resume usable: what is already on disk is
+        // not demanded again. Without this, resuming a half-done 443 GB run
+        // would be refused for wanting room it no longer needs.
+        let after = plan_space_preflight(&req.project_dir).expect("preflight");
+        assert_eq!(
+            after.required_bytes, 0,
+            "nothing is left to copy, so nothing is required"
+        );
+
+        // `sufficient` is only ever an answer when something was measured.
+        match after.available_bytes {
+            Some(_) => assert_eq!(after.sufficient, Some(true)),
+            None => assert_eq!(
+                after.sufficient, None,
+                "unknown must not be reported as fine"
+            ),
+        }
+    }
+
+    #[test]
+    fn advice_never_recommends_parallelism_it_cannot_justify() {
+        use df_fs_safety::DeviceProfile;
+
+        let platter = DeviceProfile {
+            device_number: Some(1),
+            incurs_seek_penalty: Some(true),
+        };
+        let solid = DeviceProfile {
+            device_number: Some(0),
+            incurs_seek_penalty: Some(false),
+        };
+        let unknown = DeviceProfile::default();
+
+        assert_eq!(recommend_workers(&platter).0, 1, "a platter thrashes");
+        assert_eq!(recommend_workers(&solid).0, 8, "the sweeps saturate at 8");
+        // The case that matters most: not knowing must land on the setting
+        // that cannot be actively wrong. Recommending 8 into the dark risks a
+        // regression; recommending 1 only forgoes an improvement.
+        assert_eq!(recommend_workers(&unknown).0, 1);
+
+        // And the reason travels with the number, because "use 1 worker" that
+        // a caller cannot argue with is an order, not advice.
+        assert!(recommend_workers(&platter).1.contains("seek penalty"));
+    }
+
+    #[test]
+    fn not_knowing_the_device_is_not_the_same_as_knowing_they_differ() {
+        use df_fs_safety::DeviceProfile;
+
+        let one = DeviceProfile {
+            device_number: Some(3),
+            incurs_seek_penalty: None,
+        };
+        let same = DeviceProfile {
+            device_number: Some(3),
+            incurs_seek_penalty: None,
+        };
+        let other = DeviceProfile {
+            device_number: Some(4),
+            incurs_seek_penalty: None,
+        };
+        let unknown = DeviceProfile::default();
+
+        assert_eq!(one.same_device_as(&same), Some(true));
+        assert_eq!(one.same_device_as(&other), Some(false));
+        // Collapsing this to `false` is what would let a caller read and write
+        // flat out on one platter believing they were on two.
+        assert_eq!(one.same_device_as(&unknown), None);
+    }
+
+    #[test]
+    fn status_is_cheap_and_integrity_is_something_you_ask_for() {
+        // Found watching a real hash: `project_status` ran PRAGMA
+        // integrity_check on every call — a pass over every page — so the
+        // command an operator uses to see how a long stage is going was the
+        // one doing the most work, and got slower as the archive grew. On a
+        // 293 MB database mid-hash it did not return within five minutes.
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let status = project_status(&req.project_dir).expect("status");
+        assert!(
+            status.integrity.is_none(),
+            "status must not pay for an integrity pass nobody asked for"
+        );
+
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        let report = checked.integrity.expect("asked for, so answered");
+        assert!(report.database_ok && report.ledger_ok);
+    }
+
+    #[test]
+    fn an_operator_can_declare_exclusions_without_rebuilding_the_binary() {
+        // Migration 0024 taught a *profile* to decline reading material, and
+        // profiles are compiled in — so that feature was only ever reachable
+        // by whoever builds DataForge, never by the person holding the
+        // archive. Found by trying to use it on a real one.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom")).unwrap();
+        std::fs::write(origin.join("escrito.pdf"), b"material").unwrap();
+        std::fs::write(origin.join("TomTom").join("mapa.dat"), b"gps").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        req.hash_exclusions = vec![df_domain::HashExclusion {
+            id: "gps.tomtom".to_string(),
+            reason: "navigation data, not case material".to_string(),
+            r#match: df_domain::ExclusionMatch {
+                path_glob: Some("TomTom*".to_string()),
+                ..df_domain::ExclusionMatch::default()
+            },
+        }];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        let hash = hash_project(&req.project_dir, Actor::Test).expect("hash");
+
+        assert_eq!(hash.hashed, 1, "only the document was read");
+        let report = hash_exclusion_report(&req.project_dir).expect("exclusions");
+        assert_eq!(report.excluded, 1);
+        assert_eq!(report.exclusions[0].rule_id, "gps.tomtom");
+        // Excluded is not discarded: it stays in the inventory.
+        let status = project_status(&req.project_dir).expect("status");
+        assert_eq!(status.inventory.expect("inventory").files, 2);
+    }
+
+    #[test]
+    fn an_exclusion_that_would_swallow_the_archive_is_refused_at_creation() {
+        // Rejected before the project exists, not on the first hash run:
+        // finding out after a 16-minute scan is finding out too late for it
+        // to be a rejection.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut req = request(tmp.path());
+        req.hash_exclusions = vec![df_domain::HashExclusion {
+            id: "everything".to_string(),
+            reason: "oops".to_string(),
+            r#match: df_domain::ExclusionMatch::default(),
+        }];
+        let error = create_project(&req, Actor::Test).expect_err("must refuse");
+        assert!(error.to_string().contains("entire archive"));
+    }
+
+    #[test]
+    fn a_source_root_records_the_filesystem_it_actually_sits_on() {
+        // Found by running the engine on a real archive: every origin ever
+        // registered reported UNKNOWN, because `SourceRoot::new` has to
+        // default — `df-domain` sits below `df-fs-safety` — and nothing above
+        // ever filled it in. Harmless-looking, except an origin on a network
+        // share also claimed `is_network: false`.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+
+        let status = project_status(&req.project_dir).expect("status");
+        let root = &status.source_roots[0];
+        assert_eq!(
+            root.filesystem,
+            df_fs_safety::classify_filesystem(&origin).as_str(),
+            "the recorded filesystem must be the one the path is on"
+        );
+        // On any machine that can run this test the answer is knowable, so
+        // UNKNOWN here means the classification never happened.
+        assert_ne!(root.filesystem, "UNKNOWN");
+    }
+
+    #[test]
+    fn a_run_over_failing_media_finishes_and_says_what_it_could_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("bueno.txt"), b"se copia").unwrap();
+        std::fs::write(origin.join("roto.txt"), b"desaparece").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        // The disk loses one file between approval and the copy. This is what
+        // failing media looks like from the engine's side.
+        std::fs::remove_file(origin.join("roto.txt")).unwrap();
+
+        let outcome = execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        // The property that makes failing media workable: one unreadable file
+        // costs that file and nothing else. Both halves are asserted together,
+        // because either alone would pass for the wrong reason — a run that
+        // aborted, or one that quietly succeeded at nothing.
+        assert!(
+            outcome.failed_retryable + outcome.failed_final >= 1,
+            "the missing file must be recorded as a failure"
+        );
+        assert!(outcome.completed >= 1, "and the rest of the plan still ran");
+
+        let report = execution_failure_report(&req.project_dir).expect("failures");
+        assert_eq!(report.failures.len(), 1);
+        let failure = &report.failures[0];
+        assert!(failure.source_relative_path.contains("roto.txt"));
+        // Named by its cause, not merely counted: "one file failed" is not
+        // something an operator can act on.
+        assert_eq!(failure.error_code, "SOURCE_MISSING");
+        assert!(failure.attempts >= 1);
+        assert_eq!(report.by_error, vec![("SOURCE_MISSING".to_string(), 1)]);
+    }
+
+    #[test]
+    fn every_long_stage_says_it_is_running() {
+        // `RunStage` declared five stages and only three ever claimed one.
+        // Scan was fixed when a real scan reported `active_run: null`; Analyze
+        // and Verify kept the same defect for months, because a variant
+        // existing in the enum makes the stage look covered. Caught by running
+        // `verify` on a 438 GB archive and finding the table empty while a
+        // process held the project.
+        //
+        // The match below is exhaustive on purpose: adding a sixth stage will
+        // not compile until someone names what claims it. That is the part
+        // that stops this recurring — the previous fix left no such question
+        // behind, so nobody was ever asked it again.
+        fn claimant(stage: df_db::liveness::RunStage) -> &'static str {
+            use df_db::liveness::RunStage::*;
+            match stage {
+                Scan => "df-scan",
+                Hash => "df-hash",
+                Analyze => "df-planner",
+                Execute => "df-executor",
+                Verify => "df-verifier",
+            }
+        }
+
+        use df_db::liveness::RunStage;
+        for stage in [
+            RunStage::Scan,
+            RunStage::Hash,
+            RunStage::Analyze,
+            RunStage::Execute,
+            RunStage::Verify,
+        ] {
+            let crate_name = claimant(stage);
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(crate_name)
+                .join("src/lib.rs");
+            let text = std::fs::read_to_string(&source)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source.display()));
+            let claim = format!("RunStage::{}", stage.as_str_pascal());
+            assert!(
+                text.contains(&claim) && text.contains("liveness::claim"),
+                "{crate_name} runs the {} stage without claiming the project; \
+                 `project_status` would report nobody is working while it does",
+                stage.as_str()
+            );
+            assert!(
+                text.contains("liveness::release"),
+                "{crate_name} claims the project and never releases it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_result_can_be_replanned_without_rereading_the_origin() {
+        // The real job was not one pass: ten days of deliver, look, correct.
+        // Every correction was about where something went, and none changed a
+        // byte of the origin -- yet the only way back from COMPLETED was to
+        // rescan and rehash, hours of work to answer a question the existing
+        // snapshot already contained.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        let first =
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        let verified = verify_project_output(&req.project_dir, Actor::Test).expect("verify");
+        assert_eq!(verified.verdict, "COMPLETED");
+
+        // No rescan: the same snapshot answers it.
+        let second = create_plan(
+            &req.project_dir,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateWithinContext,
+        )
+        .expect("re-plan from a completed result");
+        assert_eq!(second.version, first.version + 1);
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+
+        // And the executed plan keeps everything that made it evidence. Being
+        // superseded as *current* is not the same as being undone, and a
+        // result that quietly stopped being verifiable would be worse than
+        // refusing to re-plan at all.
+        let audit = verify_audit(&req.project_dir).expect("audit");
+        assert!(audit.ledger_ok);
+        let integrity = project_integrity(&req.project_dir)
+            .expect("integrity")
+            .integrity
+            .expect("a full pass reports one");
+        assert!(integrity.database_ok && integrity.ledger_ok);
+        assert!(integrity.problems.is_empty(), "{:?}", integrity.problems);
+
+        // Executing it into the same output root is refused, and says why.
+        approve_plan(&req.project_dir, Actor::Test).expect("approve the correction");
+        let refused = execute_plan(&req.project_dir, Actor::Test).expect_err("must refuse");
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("own output root"),
+            "the refusal has to explain the correction problem, got: {message}"
+        );
+        // A correction moves a file; the executor copies it to the new place
+        // and nothing removes the old one, because nothing here deletes. The
+        // output would hold both and verification would fail on the untracked
+        // copy -- the engine producing a mess by obeying its own rules.
+        assert!(message.contains("never deletes"), "got: {message}");
+    }
+
+    #[test]
+    fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
+        // Found on a 444 GB archive: `plan create` produced a tree whose shape
+        // was wrong, and there was no way to build a second one. `create_plan`
+        // accepts only ANALYZED/PLANNING, so PLAN_READY was a dead end whose
+        // only exits were approving a plan nobody wanted or editing SQLite by
+        // hand. Four minutes to reach it; no way back.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("copias")).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("copias/uno.txt"), b"contenido uno").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+
+        let first =
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        assert_eq!(first.state, "PLAN_READY");
+        assert!(
+            create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::PreserveAll).is_err(),
+            "re-planning over a READY plan must stay refused; discarding is the way back"
+        );
+
+        let discarded = discard_plan(&req.project_dir, Actor::Test).expect("discard");
+        assert_eq!(discarded.plan_id, first.plan_id);
+        assert_eq!(discarded.state, "ANALYZED");
+        assert_eq!(discarded.operations_discarded, first.operations);
+
+        let second = create_plan(
+            &req.project_dir,
+            Actor::Test,
+            DuplicatePolicy::ConsolidateWithinContext,
+        )
+        .expect("re-plan");
+        assert_eq!(second.version, first.version + 1);
+        assert_ne!(second.plan_id, first.plan_id);
+        assert_eq!(second.duplicate_policy, "CONSOLIDATE_WITHIN_CONTEXT");
+
+        // The discarded plan is superseded, not erased: the record still shows
+        // it was built and rejected, and the ledger says who did it.
+        let audit = verify_audit(&req.project_dir).expect("audit");
+        assert!(
+            audit.ledger_ok,
+            "discarding must not break the ledger chain"
+        );
+
+        // And once approval has frozen a manifest, there is no way back at
+        // all. That is the line this feature must never cross.
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+        let refused = discard_plan(&req.project_dir, Actor::Test);
+        assert!(
+            refused.is_err(),
+            "an approved plan is evidence of a decision, not a draft"
+        );
+    }
+
+    #[test]
+    fn a_delivery_package_covers_every_manifest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("dos, con coma.txt"), b"contenido dos").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+
+        let directory = std::path::Path::new(&package.directory);
+        let csv = std::fs::read_to_string(directory.join("traceability.csv")).expect("csv");
+        // Header plus one row per entry, always. A package that quietly
+        // omitted rows would defeat the only thing it exists to show.
+        assert_eq!(
+            csv.lines().count() as u64,
+            package.entries + 1,
+            "every manifest entry has a row"
+        );
+        // A path with a comma must not shift the columns; every row has the
+        // same field count as the header.
+        let columns = csv.lines().next().expect("header").split(',').count();
+        for line in csv.lines().skip(1) {
+            assert_eq!(
+                csv_columns(line),
+                columns,
+                "a quoted path changed the column count: {line}"
+            );
+        }
+
+        let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).expect("sums");
+        assert_eq!(sums.lines().count() as u64, package.checksummed);
+        // `sha256sum -c` format: 64 hex chars, two spaces, then the path.
+        for line in sums.lines() {
+            assert!(line.len() > 66 && &line[64..66] == "  ", "bad line: {line}");
+        }
+
+        let summary = std::fs::read_to_string(directory.join("delivery.md")).expect("summary");
+        assert!(summary.contains("The origin was never written to"));
+        // Never verified and verified-and-passed must not read alike, so the
+        // unchecked case says so in words rather than leaving a blank.
+        assert!(
+            summary.contains("not verified"),
+            "an unverified delivery must say so: {summary}"
+        );
+        // Nothing was excluded here, and the package says so rather than
+        // leaving the reader to assume it.
+        assert!(summary.contains("Everything in the origin was read"));
+
+        // After a real verification the package reports what that run found,
+        // read back from the run itself rather than re-derived.
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+        let verify = verify_project_output(&req.project_dir, Actor::Test).expect("verify");
+        let after = export_delivery_package(&req.project_dir).expect("exported again");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&after.directory).join("delivery.md"))
+                .expect("summary");
+        assert!(
+            summary.contains(&verify.verdict),
+            "the package must carry the verdict the run produced: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_delivery_discloses_what_was_never_read() {
+        // The property that keeps "nothing was lost" honest. Excluding is a
+        // legitimate decision; an undisclosed exclusion makes the claim
+        // broader than the evidence, which is the one thing this document
+        // must never do.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(origin.join("TomTom")).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"material").unwrap();
+        std::fs::write(origin.join("TomTom").join("mapa.dat"), b"gps").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+
+        // Exclude by path, then hash: the GPS folder is never read.
+        {
+            let marker = read_marker(&req.project_dir).unwrap();
+            let mut db = open_db(&req.project_dir, &marker).unwrap();
+            let project = repository::load_project(&db).unwrap();
+            let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)
+                .unwrap()
+                .unwrap();
+            df_db::inventory::enqueue_hash_jobs_with(
+                &mut db,
+                snapshot.id,
+                Actor::Test,
+                &[df_domain::HashExclusion {
+                    id: "gps.tomtom".to_string(),
+                    reason: "navigation data, not case material".to_string(),
+                    r#match: df_domain::ExclusionMatch {
+                        path_glob: Some("TomTom*".to_string()),
+                        ..df_domain::ExclusionMatch::default()
+                    },
+                }],
+            )
+            .unwrap();
+        }
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let report = hash_exclusion_report(&req.project_dir).expect("exclusions");
+        assert_eq!(report.excluded, 1);
+        assert_eq!(report.by_rule, vec![("gps.tomtom".to_string(), 1)]);
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&package.directory).join("delivery.md"))
+                .expect("summary");
+        assert!(
+            summary.contains("deliberately not read"),
+            "the delivery must disclose the skip: {summary}"
+        );
+        // With the rule's own words, so the reader can judge the decision
+        // rather than only learn that one was taken.
+        assert!(summary.contains("navigation data, not case material"));
+    }
+
+    /// Count CSV fields honouring quoting.
+    fn csv_columns(line: &str) -> usize {
+        let mut fields = 1;
+        let mut quoted = false;
+        for character in line.chars() {
+            match character {
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields += 1,
+                _ => {}
+            }
+        }
+        fields
+    }
+
+    #[test]
+    fn a_rule_set_survives_a_round_trip_and_a_tampered_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = request(tmp.path());
+        create_project(&req, Actor::Test).unwrap();
+
+        let set = df_rules::RuleSet::new("legal", 1, df_rules::RuleParams::default())
+            .expect("a valid set");
+        save_rule_set(&req.project_dir, &set).expect("stored");
+
+        let read = rule_set(&req.project_dir, "legal", None).expect("read back");
+        assert_eq!(read.version, 1);
+        assert_eq!(read.digest, set.digest);
+        assert_eq!(read.params, set.params);
+
+        // A set whose digest no longer covers its params is refused on the way
+        // in. Storing it would make it the record other decisions cite, and a
+        // decision citing parameters nobody can reproduce is not auditable.
+        let mut tampered = set.clone();
+        tampered.params.auto_approve_confidence = 0.01;
+        save_rule_set(&req.project_dir, &tampered)
+            .expect_err("a digest that no longer matches is not storable");
+
+        // Version 1 still says what it said.
+        let again = rule_set(&req.project_dir, "legal", Some(1)).expect("still there");
+        assert_eq!(again.params, set.params);
+    }
+
+    #[test]
     fn scan_hash_analyze_and_reports_through_the_facade() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
@@ -2890,7 +4470,8 @@ mod tests {
         let inventory = status.inventory.expect("inventory populated after scan");
         assert_eq!(inventory.files, 3);
         assert_eq!(inventory.hash_done, 3);
-        assert!(status.integrity.expect("integrity ran").is_ok());
+        let checked = project_integrity(&req.project_dir).expect("integrity");
+        assert!(checked.integrity.expect("integrity ran").is_ok());
 
         let audit = verify_audit(&req.project_dir).expect("audit");
         assert!(audit.ledger_ok);
@@ -3459,15 +5040,22 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 19, "migration count");
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 25, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(df_db::migrations::MIGRATIONS[18].name, "incremental_reuse");
+        assert_eq!(
+            df_db::migrations::MIGRATIONS[24].name,
+            "project_hash_exclusions"
+        );
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");
         }
         assert_eq!(df_domain::PROFILE_SCHEMA, "dataforge.profile");
-        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "1.1.0");
+        // 2.0.0 (M2.2, ADR-0040 §6) adds `destination_roots`. Major, not
+        // minor: a 2.0 profile may declare roots a 1.x engine knows nothing
+        // about, and a 1.x engine would ignore the field and quietly produce
+        // different destination paths.
+        assert_eq!(df_domain::PROFILE_SCHEMA_VERSION, "2.0.0");
         assert_eq!(super::MARKER_SCHEMA_VERSION, "1.0.0");
 
         // Similarity (M0.3).
@@ -3519,6 +5107,136 @@ mod frozen_contracts {
         assert_eq!(
             df_ai::PROMPT_VERSION,
             "dataforge.assisted-intelligence-prompt/0.7.0"
+        );
+
+        // Agent tool surface (M2.1, ADR-0043 §4). Recorded here, next to every
+        // other frozen contract, rather than only in `df-tools`: external
+        // agents pin these names, so they belong in the one test whose job is
+        // to fail when a contract moves. The dependency is a dev-dependency
+        // cycle — `df-tools` sits on top of the facade — which Cargo permits
+        // precisely for this.
+        // 0.9.0 adds `discard_plan`: the way back from an unapproved plan,
+        // added after a real archive produced one whose shape was wrong and
+        // PLAN_READY turned out to be a dead end. 0.10.0 adds
+        // `export_delivery_package`, which had been reachable from nowhere —
+        // the last stage of the pipeline, callable only from its own tests.
+        assert_eq!(
+            df_tools::TOOL_SURFACE_VERSION,
+            "dataforge.tool-surface/0.10.0"
+        );
+        assert_eq!(df_tools::TOOLS.len(), 32, "tool count");
+
+        // Reports bound what they list. These two are contract, not tuning: an
+        // agent sizes its own reading against them, and raising the ceiling
+        // later would hand a pinned caller a response it budgeted against.
+        assert_eq!(df_tools::DEFAULT_REPORT_ITEMS, 50);
+        assert_eq!(df_tools::MAX_REPORT_ITEMS, 1_000);
+
+        // Deterministic gate (M2.4, ADR-0041). The hard-boundary count is
+        // frozen alongside the schema: turning an invariant into a tunable
+        // parameter is exactly the change this test exists to catch.
+        assert_eq!(
+            df_rules::RULE_SET_SCHEMA_VERSION,
+            "dataforge.rule-set/0.1.0"
+        );
+        assert_eq!(df_rules::HARD_BOUNDARY_COUNT, 4);
+
+        // Consent by policy (M2.5, ADR-0042). A caller that pins this version
+        // is pinning what a single human approval is allowed to authorise.
+        assert_eq!(
+            df_ai::DISCLOSURE_POLICY_SCHEMA_VERSION,
+            "dataforge.ai-disclosure-policy/0.1.0"
+        );
+
+        // Agent run loop (M2.6, ADR-0044).
+        assert_eq!(
+            df_agent::AGENT_RUN_SCHEMA_VERSION,
+            "dataforge.agent-run/0.1.0"
+        );
+        assert_eq!(df_agent::Stage::ORDER.len(), 10, "run stages");
+        assert_eq!(
+            df_tools::tools_with(df_tools::Capability::Commit).count(),
+            3,
+            "the gated class is approve, execute and verify — nothing else"
+        );
+    }
+
+    /// Every ADR is listed in the index.
+    ///
+    /// Reads the directory rather than a list, because a list is one more
+    /// thing to forget. The index is how anyone arriving at the repo finds
+    /// the decisions, so an ADR missing from it is a decision nobody will
+    /// read — which is the same as not having written it.
+    #[test]
+    fn every_adr_is_in_the_index() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("adr");
+        let index = std::fs::read_to_string(root.join("README.md")).expect("the ADR index");
+
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&root).expect("docs/adr") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if !name.starts_with("ADR-") || !name.ends_with(".md") {
+                continue;
+            }
+            if !index.contains(&name) {
+                missing.push(name);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "ADRs missing from docs/adr/README.md: {missing:?}"
+        );
+    }
+
+    /// No two ADRs may claim the same number.
+    ///
+    /// This has gone wrong twice while several lines of work ran in parallel:
+    /// each branch picked "the next free number" against its own tree and two
+    /// of them picked the same one. Nothing caught it, because a duplicate is
+    /// only a conflict once both branches reach `main`, and by then one of the
+    /// two decisions is being cited by a number that means something else.
+    ///
+    /// Reading the directory rather than a list is deliberate: a list would be
+    /// one more thing to update, and the failure being prevented is precisely
+    /// someone forgetting to update something.
+    #[test]
+    fn adr_numbers_are_unique() {
+        use std::collections::BTreeMap;
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("adr");
+        let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).expect("docs/adr must exist") {
+            let name = entry.expect("readable entry").file_name();
+            let name = name.to_string_lossy().to_string();
+            // `ADR-1234-slug.md`; README and anything else is not an ADR.
+            let Some(number) = name
+                .strip_prefix("ADR-")
+                .and_then(|rest| rest.get(..4))
+                .filter(|number| number.chars().all(|c| c.is_ascii_digit()))
+            else {
+                continue;
+            };
+            seen.entry(number.to_string()).or_default().push(name);
+        }
+
+        assert!(!seen.is_empty(), "no ADR was found in {}", dir.display());
+        let duplicates: Vec<_> = seen.iter().filter(|(_, files)| files.len() > 1).collect();
+        assert!(
+            duplicates.is_empty(),
+            "two ADRs share a number: {duplicates:?}"
         );
     }
 }

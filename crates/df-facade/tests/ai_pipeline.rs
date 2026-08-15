@@ -46,6 +46,7 @@ fn project_with_review_item(base: &Path) -> (PathBuf, String) {
             audit_root: None,
             source_roots: vec![origin],
             profile: Some("generic".to_string()),
+            hash_exclusions: Vec::new(),
         },
         Actor::Test,
     )

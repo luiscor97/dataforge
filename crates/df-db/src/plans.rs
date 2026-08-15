@@ -23,6 +23,7 @@ use crate::{db_err, Db};
 pub const EVENT_ANALYSIS_COMPLETED: &str = "ANALYSIS_COMPLETED";
 pub const EVENT_PLAN_CREATED: &str = "PLAN_CREATED";
 pub const EVENT_PLAN_APPROVED: &str = "PLAN_APPROVED";
+pub const EVENT_PLAN_DISCARDED: &str = "PLAN_DISCARDED";
 pub const EVENT_EXECUTION_COMPLETED: &str = "EXECUTION_COMPLETED";
 pub const EVENT_EXECUTION_PAUSED: &str = "EXECUTION_PAUSED";
 pub const EVENT_VERIFICATION_COMPLETED: &str = "VERIFICATION_COMPLETED";
@@ -329,10 +330,10 @@ pub fn insert_plan(
         tx.execute(
             "INSERT INTO plan_operations
                 (id, plan_id, sequence, operation_type, source_occurrence,
-                 content_id, destination_relative_path, confidence, risk,
-                 approval, execution_state, idempotency_key, reason,
-                 created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                 content_id, destination_relative_path, destination_root_id,
+                 confidence, risk, approval, execution_state, idempotency_key,
+                 reason, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
             params![
                 op.id.to_string(),
                 op.plan_id.to_string(),
@@ -341,6 +342,7 @@ pub fn insert_plan(
                 op.source_occurrence.map(|id| id.to_string()),
                 op.content_id.map(|id| id.to_string()),
                 op.destination_relative_path,
+                op.destination_root_id,
                 op.confidence,
                 op.risk.as_str(),
                 op.approval.as_str(),
@@ -438,8 +440,9 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
         .conn()
         .prepare(
             "SELECT id, plan_id, sequence, operation_type, source_occurrence,
-                    content_id, destination_relative_path, confidence, risk,
-                    approval, execution_state, idempotency_key, reason
+                    content_id, destination_relative_path, destination_root_id,
+                    confidence, risk, approval, execution_state,
+                    idempotency_key, reason
              FROM plan_operations WHERE plan_id = ?1 ORDER BY sequence",
         )
         .map_err(db_err)?;
@@ -453,12 +456,13 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, f64>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, f64>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
             ))
         })
         .map_err(db_err)?
@@ -471,6 +475,7 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
                 occurrence,
                 content,
                 destination,
+                destination_root,
                 confidence,
                 risk,
                 approval,
@@ -489,6 +494,7 @@ pub fn list_operations(db: &Db, plan_id: PlanId) -> DfResult<Vec<PlanOperation>>
                     .transpose()?,
                 content_id: content.as_deref().map(ContentId::from_str).transpose()?,
                 destination_relative_path: destination,
+                destination_root_id: destination_root,
                 confidence,
                 risk: RiskLevel::parse(&risk)?,
                 approval: ApprovalState::parse(&approval)?,
@@ -545,6 +551,83 @@ pub fn approve_plan(
         "serialized_sha256": serialized_sha256,
     });
     append_event(&tx, plan.project_id, EVENT_PLAN_APPROVED, &payload, actor)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// An earlier plan of this project that already put files in the output root.
+///
+/// `Some((id, version))` means the destination is not empty and does not
+/// belong to `current`: somebody executed a different plan into it.
+///
+/// This exists because of what a *correction* does. A re-planned operation
+/// sends a file to a new destination, the executor copies it there — and the
+/// old copy stays, because nothing in this engine deletes (rule 2). Execute a
+/// corrected plan into the same output root and the result holds both, with
+/// verification rightly failing on the untracked one. The engine would have
+/// produced a mess by following its own rules.
+///
+/// So the answer is not to relax the rule, it is to refuse the combination.
+/// A corrected result belongs in its own output root, which is exactly what
+/// the human job it was built against did when it named its second attempt
+/// `..._v2` and left the first one standing.
+pub fn previously_executed_plan(
+    db: &Db,
+    project_id: ProjectId,
+    current: PlanId,
+) -> DfResult<Option<(String, u32)>> {
+    db.conn()
+        .query_row(
+            "SELECT p.id, p.version FROM plans p
+             WHERE p.project_id = ?1 AND p.id <> ?2
+               AND EXISTS (SELECT 1 FROM plan_operations op
+                           WHERE op.plan_id = p.id AND op.execution_state = 'COMPLETED')
+             ORDER BY p.version DESC LIMIT 1",
+            params![project_id.to_string(), current.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32)),
+        )
+        .optional()
+        .map_err(db_err)
+}
+
+/// Supersede a plan that was never approved, so another can be built.
+///
+/// The status already existed — `SUPERSEDED` means "replaced by a newer
+/// version before approval" — and `insert_plan` has always set it when a new
+/// version lands. What was missing is the deliberate move: a way to say "this
+/// plan is not the one" *without* having to produce a replacement in the same
+/// breath. Comparing two duplicate policies before committing to one is the
+/// most ordinary thing an operator does, and until now the only exits from
+/// `PLAN_READY` were to approve or to edit the database by hand.
+///
+/// An `APPROVED` plan is refused here and always will be. Approval freezes the
+/// manifest (§26.4, ADR-0018); after it, the plan is evidence of a decision,
+/// and evidence is not discarded because someone changed their mind. The way
+/// back from an approved plan is a new snapshot, not a quieter database.
+///
+/// Nothing on disk is touched: the operations were never executed, and the
+/// superseded plan stays in the table with its ledger entry. This removes a
+/// plan from the *future*, never from the record.
+pub fn discard_plan(db: &mut Db, plan: &Plan, actor: Actor) -> DfResult<()> {
+    if plan.status != PlanStatus::Ready {
+        return Err(DfError::Validation(format!(
+            "only READY plans can be discarded (plan v{} is {})",
+            plan.version,
+            plan.status.as_str()
+        )));
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    tx.execute(
+        "UPDATE plans SET status = 'SUPERSEDED' WHERE id = ?1 AND status = 'READY'",
+        [plan.id.to_string()],
+    )
+    .map_err(db_err)?;
+    let payload = serde_json::json!({
+        "plan_id": plan.id.to_string(),
+        "version": plan.version,
+        "snapshot_id": plan.snapshot_id.to_string(),
+    });
+    append_event(&tx, plan.project_id, EVENT_PLAN_DISCARDED, &payload, actor)?;
     tx.commit().map_err(db_err)?;
     Ok(())
 }
@@ -805,33 +888,74 @@ pub struct ExecutableOperation {
 /// hash (threat T5). `plan_operations` is still joined, but only for the
 /// mutable *progress* columns (approval, execution_state) — never for what to
 /// read or expect.
+/// Copy-family operation types (everything that opens a partial and finalises).
+const COPY_OPERATION_TYPES: &str =
+    "'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY', \
+     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT'";
+
+/// Every executable operation type (copies plus directories).
+const ALL_EXECUTABLE_TYPES: &str =
+    "'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY', \
+     'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY'";
+
+/// Executable operations of any type (copies and directories interleaved by
+/// sequence). Used by the sequential executor, which completes each operation
+/// before the next fetch so a filtered window never masks pending work.
 pub fn executable_operations(
     db: &Db,
     plan_id: PlanId,
     limit: u32,
 ) -> DfResult<Vec<ExecutableOperation>> {
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT m.operation_id, m.sequence, m.operation_type,
-                    m.destination_relative_path, m.source_root_path_snapshot,
-                    m.source_relative_path_exact, m.source_fingerprint,
-                    m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
-                    m.source_raw_relative_path, m.source_root_identity,
-                    p.execution_state, p.partial_lease_token,
-                    p.partial_lease_identity
-             FROM execution_manifest m
-             JOIN plan_operations p ON p.id = m.operation_id
-             WHERE m.plan_id = ?1
-               AND p.approval = 'APPROVED'
-               AND m.operation_type IN
-                   ('COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED', 'COPY_TEMPORARY',
-                    'COPY_WITH_SUFFIX', 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY')
-               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
-             ORDER BY m.sequence
-             LIMIT ?2",
-        )
-        .map_err(db_err)?;
+    query_executable_operations(db, plan_id, limit, ALL_EXECUTABLE_TYPES)
+}
+
+/// Executable **copy** operations only. The parallel executor pages copies
+/// separately from directories: `ORDER BY sequence LIMIT n` over a mixed set
+/// can return a window full of the other type, which the caller would misread
+/// as "no work left" while operations remain past the window.
+pub fn executable_copy_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+) -> DfResult<Vec<ExecutableOperation>> {
+    query_executable_operations(db, plan_id, limit, COPY_OPERATION_TYPES)
+}
+
+/// Executable **directory** operations only (the parallel executor's
+/// sequential pre-stage), paged the same way for the same reason.
+pub fn executable_directory_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+) -> DfResult<Vec<ExecutableOperation>> {
+    query_executable_operations(db, plan_id, limit, "'CREATE_DIRECTORY'")
+}
+
+fn query_executable_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: u32,
+    operation_types: &str,
+) -> DfResult<Vec<ExecutableOperation>> {
+    // `operation_types` is a hardcoded constant list, never caller input.
+    let sql = format!(
+        "SELECT m.operation_id, m.sequence, m.operation_type,
+                m.destination_relative_path, m.source_root_path_snapshot,
+                m.source_relative_path_exact, m.source_fingerprint,
+                m.expected_size_bytes, m.expected_sha256, m.expected_blake3,
+                m.source_raw_relative_path, m.source_root_identity,
+                p.execution_state, p.partial_lease_token,
+                p.partial_lease_identity
+         FROM execution_manifest m
+         JOIN plan_operations p ON p.id = m.operation_id
+         WHERE m.plan_id = ?1
+           AND p.approval = 'APPROVED'
+           AND m.operation_type IN ({operation_types})
+           AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')
+         ORDER BY m.sequence
+         LIMIT ?2"
+    );
+    let mut stmt = db.conn().prepare(&sql).map_err(db_err)?;
     let rows: Vec<DfResult<ExecutableOperation>> = stmt
         .query_map(params![plan_id.to_string(), limit], |row| {
             Ok((
@@ -1017,12 +1141,50 @@ pub fn record_operation_outcome(
     operation_id: OperationId,
     outcome: &OperationOutcome,
 ) -> DfResult<()> {
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    record_outcome_in(&tx, operation_id, outcome)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Record several finished operations in **one** transaction (M1.0.1).
+///
+/// Safe to batch because every operation in the batch has already finalised on
+/// disk: if the commit never lands, each one sits in the "finalised but not
+/// recorded" window, where the next run finds the destination holding the
+/// expected content and resolves it idempotently as `SKIP_REPRESENTED` while
+/// clearing the lease (the window is pinned by
+/// `crash_after_finalize_before_outcome_resumes_and_clears_lease`). What must
+/// **not** be batched is the ownership claim: it is the durable barrier that
+/// has to commit before a worker writes a byte, so it stays one commit per
+/// operation.
+pub fn record_operation_outcomes(
+    db: &mut Db,
+    outcomes: &[(OperationId, OperationOutcome)],
+) -> DfResult<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let tx = db.conn_mut().transaction().map_err(db_err)?;
+    for (operation_id, outcome) in outcomes {
+        record_outcome_in(&tx, *operation_id, outcome)?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// The per-operation body shared by the single and batched paths, so both
+/// write exactly the same rows and enforce the same invariants.
+fn record_outcome_in(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outcome: &OperationOutcome,
+) -> DfResult<()> {
     if outcome.retain_partial_lease && outcome.execution_state != ExecutionState::Running {
         return Err(DfError::Validation(
             "a retained partial lease requires RUNNING execution state".to_string(),
         ));
     }
-    let tx = db.conn_mut().transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO operation_results
             (id, operation_id, outcome, error_code, detail, final_relative_path,
@@ -1075,7 +1237,6 @@ pub fn record_operation_outcome(
             "operation {operation_id} cannot record its outcome/lease state"
         )));
     }
-    tx.commit().map_err(db_err)?;
     Ok(())
 }
 
@@ -1090,6 +1251,222 @@ pub struct PlanProgress {
     pub failed_retryable: u64,
     pub failed_final: u64,
     pub blocked: u64,
+}
+
+/// Bytes the operations still to be attempted would write.
+///
+/// Counts what is left, not what the plan describes: resuming a half-finished
+/// execution must not demand room for the copies already on disk, or a run
+/// that only needs a few gigabytes would be refused for wanting hundreds.
+///
+/// Read from the **frozen manifest**, so it is the size that was approved
+/// rather than whatever the source measures now.
+pub fn pending_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
+    db.conn()
+        .query_row(
+            "SELECT COALESCE(SUM(m.expected_size_bytes), 0)
+             FROM execution_manifest m
+             JOIN plan_operations p ON p.id = m.operation_id
+             WHERE m.plan_id = ?1
+               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')",
+            params![plan_id.to_string()],
+            |row| row.get::<_, i64>(0).map(|bytes| bytes as u64),
+        )
+        .map_err(db_err)
+}
+
+/// Bytes a plan would still write, for a plan that has not been approved.
+///
+/// [`pending_bytes`] sums the frozen manifest, which is the right source once
+/// it exists — but it only exists from approval onwards, so before then it
+/// sums nothing and answers zero. That zero was found in the field by running
+/// `report space-preflight` on a 444 GB plan: it reported "0 bytes still to
+/// write, there is room", which is the answer it would also have given on a
+/// full disk. A preflight exists to be consulted *before* committing, so
+/// being blind until after approval defeats it.
+///
+/// Sizes come from `content_objects` — the size recorded at hash time,
+/// alongside the identity — so this measures the same bytes the manifest will
+/// freeze. Directory operations contribute nothing, which is why the join is
+/// on `content_id`.
+pub fn planned_bytes(db: &Db, plan_id: PlanId) -> DfResult<u64> {
+    db.conn()
+        .query_row(
+            "SELECT COALESCE(SUM(c.size_bytes), 0)
+             FROM plan_operations p
+             JOIN content_objects c ON c.id = p.content_id
+             WHERE p.plan_id = ?1
+               AND p.execution_state IN ('PENDING', 'RUNNING', 'FAILED_RETRYABLE')",
+            params![plan_id.to_string()],
+            |row| row.get::<_, i64>(0).map(|bytes| bytes as u64),
+        )
+        .map_err(db_err)
+}
+
+/// One operation that did not complete, and what stopped it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FailedOperationView {
+    /// Source path, as the manifest recorded it.
+    pub source_relative_path: String,
+    /// Where it would have gone.
+    pub destination_relative_path: String,
+    /// Current state: `FAILED_RETRYABLE` or `FAILED_FINAL`.
+    pub execution_state: String,
+    /// `SOURCE_MISSING`, `PERMISSION_DENIED`, `IO_ERROR`, …
+    pub error_code: String,
+    pub detail: String,
+    /// Attempts recorded for this operation.
+    pub attempts: u64,
+}
+
+/// Everything a plan could not copy, worst first.
+///
+/// An old disk is the normal case here, not the exception: a run over failing
+/// media completes — per-file errors never abort it — and then the operator
+/// has to find out what did not make it. The engine recorded every attempt and
+/// its error code from the start and never read them back, so the answer
+/// existed only in the log of the run that happened to be watched.
+///
+/// Final failures before retryable ones, because a caller asking what went
+/// wrong wants what will not fix itself.
+pub fn failed_operations(
+    db: &Db,
+    plan_id: PlanId,
+    limit: usize,
+) -> DfResult<Vec<FailedOperationView>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT COALESCE(m.source_relative_path_exact, ''),
+                    COALESCE(m.destination_relative_path, ''),
+                    p.execution_state,
+                    COALESCE(r.error_code, 'UNKNOWN'),
+                    COALESCE(r.detail, ''),
+                    (SELECT COUNT(*) FROM operation_results a
+                      WHERE a.operation_id = p.id)
+             FROM plan_operations p
+             JOIN execution_manifest m ON m.operation_id = p.id
+             LEFT JOIN operation_results r ON r.id = (
+                 SELECT r2.id FROM operation_results r2
+                  WHERE r2.operation_id = p.id
+                  ORDER BY r2.finished_at DESC, r2.created_at DESC
+                  LIMIT 1
+             )
+             WHERE p.plan_id = ?1
+               AND p.execution_state IN ('FAILED_FINAL', 'FAILED_RETRYABLE')
+             ORDER BY CASE p.execution_state WHEN 'FAILED_FINAL' THEN 0 ELSE 1 END,
+                      m.source_relative_path_exact
+             LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![plan_id.to_string(), limit as i64], |row| {
+            Ok(FailedOperationView {
+                source_relative_path: row.get(0)?,
+                destination_relative_path: row.get(1)?,
+                execution_state: row.get(2)?,
+                error_code: row.get(3)?,
+                detail: row.get(4)?,
+                attempts: row.get::<_, i64>(5)? as u64,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
+/// One completed verification run, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerificationRunView {
+    pub id: String,
+    pub plan_id: String,
+    /// `COMPLETED`, `COMPLETED_WITH_WARNINGS` or `FAILED`.
+    pub verdict: String,
+    pub checked: u64,
+    pub problems: u64,
+    pub warnings: u64,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+/// One thing a verification run found.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerificationFindingView {
+    pub kind: String,
+    /// `PROBLEM` or `WARNING`.
+    pub severity: String,
+    /// What the finding is about — a destination path, usually.
+    pub subject: String,
+    pub detail: String,
+}
+
+/// The most recent verification of a plan, if it has been verified.
+///
+/// The verifier has always written these; nothing read them back, so the
+/// verdict existed only as the return value of the call that produced it. A
+/// result you can only learn by re-running the check is not a record, and
+/// re-reading a delivered archive to answer "did this verify?" is exactly the
+/// work the run already did.
+pub fn latest_verification(db: &Db, plan_id: PlanId) -> DfResult<Option<VerificationRunView>> {
+    db.conn()
+        .query_row(
+            "SELECT id, plan_id, verdict, checked, problems, warnings, started_at, finished_at
+             FROM verification_runs
+             WHERE plan_id = ?1
+             ORDER BY finished_at DESC, created_at DESC
+             LIMIT 1",
+            params![plan_id.to_string()],
+            |row| {
+                Ok(VerificationRunView {
+                    id: row.get(0)?,
+                    plan_id: row.get(1)?,
+                    verdict: row.get(2)?,
+                    checked: row.get::<_, i64>(3)? as u64,
+                    problems: row.get::<_, i64>(4)? as u64,
+                    warnings: row.get::<_, i64>(5)? as u64,
+                    started_at: row.get(6)?,
+                    finished_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_err)
+}
+
+/// What a verification run found, problems before warnings.
+///
+/// Bounded by `limit`, because a failed verification of a large archive can
+/// hold as many findings as there are files, and a caller asking what went
+/// wrong wants the worst of it rather than all of it.
+pub fn verification_findings(
+    db: &Db,
+    verification_run_id: &str,
+    limit: usize,
+) -> DfResult<Vec<VerificationFindingView>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT kind, severity, subject, detail
+             FROM verification_findings
+             WHERE verification_run_id = ?1
+             ORDER BY CASE severity WHEN 'PROBLEM' THEN 0 ELSE 1 END, subject
+             LIMIT ?2",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![verification_run_id, limit as i64], |row| {
+            Ok(VerificationFindingView {
+                kind: row.get(0)?,
+                severity: row.get(1)?,
+                subject: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
 }
 
 pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
@@ -1123,6 +1500,149 @@ pub fn plan_progress(db: &Db, plan_id: PlanId) -> DfResult<PlanProgress> {
         )
         .map_err(db_err)?;
     Ok(progress)
+}
+
+/// One node of the projected output tree: a destination prefix with what
+/// the plan would put under it.
+#[derive(Debug, Clone, Default)]
+pub struct DestinationNode {
+    /// Destination prefix relative to the output root, e.g.
+    /// `90_DataForge_Review\Discolocal`. Empty for files planned at the root.
+    pub prefix: String,
+    /// How many path components `prefix` has (1 for a top-level root).
+    pub depth: u32,
+    /// Copy operations landing anywhere under this prefix.
+    pub files: u64,
+    /// Directory creations under this prefix.
+    pub directories: u64,
+    /// Bytes those copies would write. Directories contribute nothing.
+    pub bytes: u64,
+    /// Copy operations by operation type, most frequent first.
+    pub by_operation: Vec<(String, u64)>,
+    /// One real destination path from this subtree — a plan is easier to
+    /// judge from an example than from a count.
+    pub sample: Option<String>,
+}
+
+/// What the approved-or-pending plan would actually produce on disk.
+#[derive(Debug, Clone, Default)]
+pub struct DestinationTree {
+    pub files: u64,
+    pub directories: u64,
+    pub bytes: u64,
+    /// Copy operations whose destination is not recorded. Reported rather
+    /// than hidden: a plan that cannot say where something lands is exactly
+    /// what this view exists to surface.
+    pub without_destination: u64,
+    /// Nodes from depth 1 up to the requested depth, ordered by prefix.
+    pub nodes: Vec<DestinationNode>,
+}
+
+/// Aggregate the plan's destinations into a tree, `depth` levels deep.
+///
+/// Pure read over `plan_operations`: it neither validates nor changes the
+/// plan. Sizes come from the content object each copy carries, so the total
+/// is what the executor would write, not what the source occupies.
+pub fn destination_tree(db: &Db, plan_id: PlanId, depth: u32) -> DfResult<DestinationTree> {
+    if depth == 0 {
+        return Err(DfError::Validation(
+            "destination tree depth must be at least 1".to_string(),
+        ));
+    }
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT po.operation_type, po.destination_relative_path,
+                    COALESCE(co.size_bytes, 0)
+             FROM plan_operations po
+             LEFT JOIN content_objects co ON co.id = po.content_id
+             WHERE po.plan_id = ?1",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([plan_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(db_err)?;
+
+    let mut tree = DestinationTree::default();
+    // Keyed by prefix; `by_operation` accumulates in a map and is flattened
+    // once at the end so the hot loop stays a single lookup per level.
+    let mut nodes: std::collections::BTreeMap<String, DestinationNode> =
+        std::collections::BTreeMap::new();
+    let mut counters: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        let (operation_type, destination, size) = row.map_err(db_err)?;
+        let is_directory = operation_type == "CREATE_DIRECTORY";
+        let Some(destination) = destination else {
+            if !is_directory {
+                tree.without_destination += 1;
+            }
+            continue;
+        };
+        let size = size.max(0) as u64;
+        if is_directory {
+            tree.directories += 1;
+        } else {
+            tree.files += 1;
+            tree.bytes += size;
+        }
+
+        // Walk the prefixes of this destination and credit each level, so a
+        // parent always totals its children.
+        let components: Vec<&str> = destination
+            .split(['\\', '/'])
+            .filter(|c| !c.is_empty())
+            .collect();
+        // The last component is the file name itself for copies; a directory
+        // operation names the directory, so it counts at its own level.
+        let levels = if is_directory {
+            components.len()
+        } else {
+            components.len().saturating_sub(1)
+        };
+        let levels = levels.min(depth as usize);
+        for level in 1..=levels {
+            let prefix = components[..level].join("\\");
+            let node = nodes
+                .entry(prefix.clone())
+                .or_insert_with(|| DestinationNode {
+                    prefix: prefix.clone(),
+                    depth: level as u32,
+                    ..DestinationNode::default()
+                });
+            if is_directory {
+                node.directories += 1;
+            } else {
+                node.files += 1;
+                node.bytes += size;
+                if node.sample.is_none() {
+                    node.sample = Some(destination.clone());
+                }
+                *counters
+                    .entry(prefix)
+                    .or_default()
+                    .entry(operation_type.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    for (prefix, ops) in counters {
+        if let Some(node) = nodes.get_mut(&prefix) {
+            let mut flat: Vec<(String, u64)> = ops.into_iter().collect();
+            flat.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            node.by_operation = flat;
+        }
+    }
+    tree.nodes = nodes.into_values().collect();
+    Ok(tree)
 }
 
 /// A completed materialisation, as the verifier re-checks it (§28).
@@ -1310,6 +1830,7 @@ mod tests {
             source_occurrence: None,
             content_id: None,
             destination_relative_path: Some("origen".to_string()),
+            destination_root_id: Some("active".to_string()),
             confidence: 1.0,
             risk: RiskLevel::Low,
             approval: ApprovalState::Pending,
@@ -1352,6 +1873,115 @@ mod tests {
                 [plan.id.to_string()],
             )
             .expect("execution progress stays writable");
+    }
+
+    /// Insert one copy operation with a content object of `size` bytes.
+    fn add_copy(db: &mut Db, plan: &Plan, seq: i64, op: &str, dest: &str, size: i64) {
+        let content = ContentId::new();
+        db.conn()
+            .execute(
+                "INSERT INTO content_objects
+                    (id, size_bytes, sha256, blake3, first_seen_snapshot,
+                     hash_state, created_at)
+                 VALUES (?1, ?2, NULL, NULL, ?3, 'HASHED', 't')",
+                params![content.to_string(), size, plan.snapshot_id.to_string()],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type, content_id,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, 'LOW', 'PENDING',
+                         'PENDING', ?7, 'test', ?8, ?8)",
+                params![
+                    OperationId::new().to_string(),
+                    plan.id.to_string(),
+                    seq,
+                    op,
+                    content.to_string(),
+                    dest,
+                    format!("{seq:064}"),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// The counts in a plan outcome say how much will be copied; only the
+    /// destination tree says *where*, which is what an approval commits to.
+    #[test]
+    fn destination_tree_reports_where_the_plan_would_write() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+
+        add_copy(&mut db, &plan, 2, "COPY_ACTIVE", r"origen\a.txt", 100);
+        add_copy(&mut db, &plan, 3, "COPY_ACTIVE", r"origen\sub\b.txt", 200);
+        add_copy(
+            &mut db,
+            &plan,
+            4,
+            "COPY_REVIEW",
+            r"90_Review\origen\c.txt",
+            400,
+        );
+
+        let tree = destination_tree(&db, plan.id, 2).unwrap();
+        assert_eq!(tree.files, 3);
+        assert_eq!(tree.directories, 1);
+        assert_eq!(tree.bytes, 700);
+        assert_eq!(tree.without_destination, 0);
+
+        let root = |p: &str| tree.nodes.iter().find(|n| n.prefix == p).unwrap();
+        // A parent totals its children: `origen` carries the two copies below
+        // it, not the third one, which lives under a different root.
+        assert_eq!(root("origen").files, 2);
+        assert_eq!(root("origen").bytes, 300);
+        assert_eq!(root("origen").directories, 1);
+        assert_eq!(root(r"origen\sub").files, 1);
+        assert_eq!(root("90_Review").files, 1);
+        assert_eq!(root("90_Review").bytes, 400);
+        assert_eq!(
+            root("90_Review").by_operation,
+            vec![("COPY_REVIEW".to_string(), 1)]
+        );
+        assert!(root("90_Review").sample.is_some());
+
+        // Depth is a view, never a filter: the totals do not change.
+        let shallow = destination_tree(&db, plan.id, 1).unwrap();
+        assert_eq!(shallow.files, 3);
+        assert_eq!(shallow.bytes, 700);
+        assert!(shallow.nodes.iter().all(|n| n.depth == 1));
+        assert!(destination_tree(&db, plan.id, 0).is_err());
+    }
+
+    /// A copy with nowhere to land is reported, not silently dropped from
+    /// the totals: that is precisely the defect this view should expose.
+    #[test]
+    fn destination_tree_surfaces_copies_without_a_destination() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, 9, 'COPY_ACTIVE', NULL, 1.0, 'LOW', 'PENDING',
+                         'PENDING', ?3, 'test', ?4, ?4)",
+                params![
+                    OperationId::new().to_string(),
+                    plan.id.to_string(),
+                    "9".repeat(64),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+
+        let tree = destination_tree(&db, plan.id, 2).unwrap();
+        assert_eq!(tree.without_destination, 1);
+        assert_eq!(tree.files, 0);
     }
 
     #[test]
