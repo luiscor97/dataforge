@@ -217,6 +217,41 @@ motor ya había hecho y se negaba a usar.
 Eso también fija el umbral de M2.7: no «reducir la cola», sino **dejarla en el
 orden de 170**, que es donde la dejó una persona.
 
+## ¿Existen de verdad las taxonomías paralelas? (medido, 2026-08-15)
+
+El verbo que piden cuatro de las nueve correcciones opera sobre pares de
+carpetas cuyos **hijos se llaman igual** aunque contengan cosas distintas. Toda
+relación de árbol que el motor detecta hoy es una comparación de *contenido*,
+así que la pregunta previa es si esa estructura existe y si el detector actual
+puede verla.
+
+Sobre las 3.041 carpetas con hijas del corpus real, exigiendo al menos tres
+hijas homónimas y descartando pares anidados:
+
+| | Pares |
+| --- | ---: |
+| Con 3+ hijas homónimas | 935 |
+| — de ellos, con <5% de contenido compartido | **88** |
+| — con contenido compartido (los ve `tree_relations`) | 847 |
+
+Los 88 son el hueco: correspondencia perfecta de nombres, ninguna fila en
+`tree_relations`, porque no hay contenido que comparar. El mayor tiene **333
+carpetas hijas con nombres idénticos, Jaccard 1,00 y 0% de contenido común**:
+dos inventarios completos de las mismas 333 entidades con documentos distintos
+en cada uno. Exactamente lo que las correcciones 4–6 pedían fusionar, y
+exactamente lo que el motor no puede nombrar.
+
+**Y la mitad de los mayores son ruido.** De los doce primeros, seis son
+carpetas de recursos de una aplicación instalada, que comparten subcarpetas de
+idioma entre sí. La correspondencia por nombre, sola, se dispara sobre software
+y sobre cualquier estructura repetida que no sea del usuario.
+
+Eso invierte el orden que parecía obvio. **M2.7 no puede ir antes que M2.3**:
+sin clasificación de contexto, un detector de árboles paralelos propone fusionar
+directorios de programas con la misma confianza que dos inventarios de clientes.
+No es que M2.3 sea prerrequisito por planificación — es que la señal por sí sola
+no distingue las dos cosas, y está medido.
+
 ## Dónde entra en la 2.0
 
 **M2.3 — Clasificación** ya demuestra que sin contexto no hay deduplicación.
