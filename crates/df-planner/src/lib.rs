@@ -282,10 +282,17 @@ pub fn create_plan(db: &mut Db, actor: Actor, policy: DuplicatePolicy) -> DfResu
     let project = repository::load_project(db)?;
     if !matches!(
         project.state,
-        ProjectState::Analyzed | ProjectState::Planning
+        ProjectState::Analyzed
+            | ProjectState::Planning
+            // A finished result is a legitimate place to plan from. Correcting
+            // an output is about where things went, not about what the origin
+            // holds, and the snapshot that answers it already exists.
+            | ProjectState::Completed
+            | ProjectState::CompletedWithWarnings
     ) {
         return Err(DfError::Validation(format!(
-            "cannot plan a project in state {} (expected ANALYZED or PLANNING)",
+            "cannot plan a project in state {} (expected ANALYZED, PLANNING or a \
+             completed result to re-plan)",
             project.state
         )));
     }
