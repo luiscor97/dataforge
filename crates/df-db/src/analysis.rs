@@ -128,6 +128,29 @@ pub struct ReviewClass {
     pub sample_item_id: Option<String>,
     /// One reason from the class, verbatim.
     pub sample_reason: String,
+    /// Items in this class whose evidence includes a subtree comparison.
+    /// Zero for occurrence-level classes, which compare nothing.
+    pub pairs_measured: u64,
+    /// Of those, pairs where **one side holds nothing the other lacks**.
+    ///
+    /// Not a recommendation. It is the count of questions the engine has
+    /// already answered with its own evidence and asked anyway: for these,
+    /// every distinct content of one subtree is provably present in the
+    /// other, so no content is at risk. Found by running a real archive,
+    /// where 3.702 of 4.604 folder questions were of exactly this shape —
+    /// including a folder dropped inside itself, same name, 225 files, zero
+    /// unique on either side, routed to a human.
+    pub pairs_with_nothing_unique: u64,
+    /// Distinct contents held by the *more contained* side and by nothing
+    /// else in the pair, summed over the class.
+    ///
+    /// Deliberately a total rather than a threshold: it says what a single
+    /// decision over the whole class would put at risk, and lets the reader
+    /// pick their own tolerance instead of inheriting one invented here. A
+    /// class with a thousand pairs and eleven unique contents is a different
+    /// proposition from one with a thousand of each, and a boolean would
+    /// report both the same.
+    pub unique_contents_on_contained_side: u64,
 }
 
 /// The review queue grouped by question instead of listed by item.
@@ -1131,7 +1154,16 @@ pub fn detect_anomalies(
                 (
                     AnomalyKind::EmbeddedTree,
                     AnomalySeverity::Info,
-                    "one folder tree is embedded in another; preserve until reviewed".to_string(),
+                    // Say the number. The sibling class above prints its two
+                    // figures, and this one — whose contained side holds
+                    // nothing of its own, by the definition of the relation —
+                    // used to say only "preserve until reviewed", hiding the
+                    // one fact that settles it.
+                    format!(
+                        "one folder tree is embedded in another: {shared} shared content(s), \
+                         {} unique to the contained side; preserve until reviewed",
+                        unique_a.min(unique_b)
+                    ),
                 )
             } else {
                 continue;
@@ -1896,10 +1928,57 @@ pub fn review_class_summary(db: &Db, snapshot_id: SnapshotId) -> DfResult<Review
                     folders: row.get::<_, i64>(7)? as u64,
                     sample_item_id: row.get(8)?,
                     sample_reason: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    pairs_measured: 0,
+                    pairs_with_nothing_unique: 0,
+                    unique_contents_on_contained_side: 0,
                 })
             },
         )
         .map_err(db_err)?;
+
+    // The subtree comparison is not computed here: the detector already wrote
+    // it onto the anomaly when it created the finding, and nothing has read it
+    // back since. `EMBEDDED_TREE` even omits the figures from its summary
+    // sentence while `PARTIAL_TREE_UNIQUE_CONTENT` spells them out — so the
+    // class that always has a zero is the one that hides it.
+    let mut measured: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT kind, COUNT(*), COUNT(*) FILTER (WHERE MIN(ua, ub) = 0),
+                        COALESCE(SUM(MIN(ua, ub)), 0)
+                 FROM (SELECT sa.kind AS kind,
+                              json_extract(sa.evidence_json, '$.unique_a_files') AS ua,
+                              json_extract(sa.evidence_json, '$.unique_b_files') AS ub
+                       FROM review_items ri
+                       JOIN structural_anomalies sa ON sa.id = ri.anomaly_id
+                       WHERE ri.snapshot_id = ?1 AND ri.analysis_version = ?2
+                         AND json_extract(sa.evidence_json, '$.unique_a_files') IS NOT NULL
+                         AND json_extract(sa.evidence_json, '$.unique_b_files') IS NOT NULL)
+                 GROUP BY kind",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![snapshot_id.to_string(), ANALYSIS_VERSION as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, i64>(2)? as u64,
+                            row.get::<_, i64>(3)? as u64,
+                        ),
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        for row in rows {
+            let (kind, counts) = row.map_err(db_err)?;
+            measured.insert(kind, counts);
+        }
+    }
 
     let mut summary = ReviewClassSummary {
         snapshot_id: snapshot_id.to_string(),
@@ -1909,7 +1988,12 @@ pub fn review_class_summary(db: &Db, snapshot_id: SnapshotId) -> DfResult<Review
         classes: Vec::new(),
     };
     for row in rows {
-        let class = row.map_err(db_err)?;
+        let mut class = row.map_err(db_err)?;
+        if let Some((pairs, zero, unique)) = measured.get(&class.kind) {
+            class.pairs_measured = *pairs;
+            class.pairs_with_nothing_unique = *zero;
+            class.unique_contents_on_contained_side = *unique;
+        }
         summary.items += class.items;
         summary.pending += class.pending;
         summary.classes.push(class);
@@ -2618,6 +2702,99 @@ mod tests {
         let sample = class.sample_item_id.as_deref().unwrap();
         assert_ne!(sample, "item-b");
         assert!(!class.blocked);
+    }
+
+    /// The detector writes the subtree comparison onto the anomaly and, until
+    /// this summary read it back, nothing ever used it. On a real archive that
+    /// meant 3.702 questions whose own evidence said "nothing is at risk" were
+    /// put to a person indistinguishably from 902 where something was.
+    #[test]
+    fn a_class_carries_what_the_detector_already_measured() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (_project, snapshot, _occurrence) = seed_rule_occurrence(&mut db, "uno.txt");
+        let root_id: String = db
+            .conn()
+            .query_row("SELECT id FROM source_roots LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        // A tree anomaly names folders, and the schema insists on it: an
+        // anomaly pointing at nothing is not evidence of anything.
+        for (id, path) in [("folder-a", "A"), ("folder-b", "A/B")] {
+            db.conn()
+                .execute(
+                    "INSERT INTO folders
+                        (id, snapshot_id, source_root_id, relative_path,
+                         parent_relative_path, name, normalized_name, depth,
+                         status, created_at)
+                     VALUES (?3, ?1, ?2, ?4, NULL, ?3, ?3, 0, 'OK', 't')",
+                    params![snapshot.to_string(), root_id, id, path],
+                )
+                .unwrap();
+        }
+
+        let seed = |id: &str, kind: &str, unique_a: u64, unique_b: u64| {
+            db.conn()
+                .execute(
+                    "INSERT INTO structural_anomalies
+                        (id, snapshot_id, analysis_version, occurrence_id, folder_a,
+                         folder_b, kind, severity, requires_review, summary,
+                         evidence_json, created_at)
+                     VALUES (?3, ?1, ?2, NULL, 'folder-a', 'folder-b', ?4, 'INFO',
+                             1, 'test', ?5, 't')",
+                    params![
+                        snapshot.to_string(),
+                        ANALYSIS_VERSION as i64,
+                        format!("anomaly-{id}"),
+                        kind,
+                        format!(r#"{{"unique_a_files":{unique_a},"unique_b_files":{unique_b}}}"#),
+                    ],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    // A tree question has no occurrence: it is about the pair
+                    // of folders, and the schema enforces that rather than
+                    // trusting the writer.
+                    "INSERT INTO review_items
+                        (id, snapshot_id, analysis_version, anomaly_id, rule_match_id,
+                         occurrence_id, recommended_action, risk, reason, created_at)
+                     VALUES (?3, ?1, ?2, ?4, NULL, NULL, 'COPY_REVIEW', 'LOW', 'r', 't')",
+                    params![
+                        snapshot.to_string(),
+                        ANALYSIS_VERSION as i64,
+                        id,
+                        format!("anomaly-{id}"),
+                    ],
+                )
+                .unwrap();
+        };
+        // Two contained pairs, and one where both sides hold something.
+        seed("a", "EMBEDDED_TREE", 4, 0);
+        seed("b", "EMBEDDED_TREE", 0, 9);
+        seed("c", "PARTIAL_TREE_UNIQUE_CONTENT", 3, 7);
+
+        let summary = review_class_summary(&db, snapshot).unwrap();
+        let embedded = summary
+            .classes
+            .iter()
+            .find(|c| c.kind == "EMBEDDED_TREE")
+            .expect("embedded class");
+        assert_eq!(embedded.pairs_measured, 2);
+        assert_eq!(embedded.pairs_with_nothing_unique, 2);
+        // Zero, and it must be said rather than inferred from the count: a
+        // class of contained pairs risks no content at all, and that is the
+        // fact a reviewer needs before deciding to keep them apart anyway.
+        assert_eq!(embedded.unique_contents_on_contained_side, 0);
+
+        let partial = summary
+            .classes
+            .iter()
+            .find(|c| c.kind == "PARTIAL_TREE_UNIQUE_CONTENT")
+            .expect("partial class");
+        assert_eq!(partial.pairs_measured, 1);
+        assert_eq!(partial.pairs_with_nothing_unique, 0);
+        // The smaller side, not the sum of both: what a single decision over
+        // the class would put at risk is what the contained side would lose.
+        assert_eq!(partial.unique_contents_on_contained_side, 3);
     }
 
     /// A class nobody can decide has to say so. Unreadable source evidence is

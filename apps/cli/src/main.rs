@@ -2185,6 +2185,21 @@ fn print_review_classes(summary: &ReviewClassSummary) {
             class.pending, class.items
         );
         println!("    default    : {}", class.recommended_action);
+        if class.pairs_measured > 0 {
+            // Evidence, never a verdict: it says what the engine already
+            // measured about these pairs, and leaves the decision where the
+            // RFC puts it. Reading "3702 of 3702 ... 0 unique" and choosing to
+            // keep them apart is a legitimate answer; not being shown it is
+            // not a legitimate question.
+            println!(
+                "    measured   : {} of {} pair(s) hold nothing the other side lacks",
+                class.pairs_with_nothing_unique, class.pairs_measured
+            );
+            println!(
+                "                 {} distinct content(s) unique to a contained side, class-wide",
+                class.unique_contents_on_contained_side
+            );
+        }
         if class.blocked {
             println!(
                 "    BLOCKED    : unreadable source evidence; repair access and \
