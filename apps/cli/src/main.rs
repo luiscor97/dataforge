@@ -14,13 +14,14 @@ use df_facade::{
     AiAssistOutcome, AnalyzeOutcome, AnomalyReport, ApproveOutcome, AssistanceAuditView,
     AuditReport, ContentArtifactBuildOutcome, ContentExtractionOptions, ContentExtractionOutcome,
     ContentQueryOutcome, ContentSearchOutcome, ContextReport, CreateProjectRequest,
-    DeliveryPackage, DevicePreflight, DiscardOutcome, DuplicateReport, ExecuteOutcome,
-    ExtractionLimits, GraftedTreeReport, HashOutcome, MediaOutcome, MediaProjectOptions,
-    MediaReport, MediaSidecars, NameCollisionReport, PlanDestinationTree, PlanOutcome,
-    PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome, ProjectStatus,
-    QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue, ScanOutcome,
-    SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome, SimilarityReport,
-    SnapshotBuildOptions, SpacePreflight, TreeCloneReport, TreeRelationReport, VerifyOutcome,
+    DeliveryPackage, DevicePreflight, DiscardOutcome, DragScarReport, DuplicateReport,
+    ExecuteOutcome, ExtractionLimits, GraftedTreeReport, HashOutcome, MediaOutcome,
+    MediaProjectOptions, MediaReport, MediaSidecars, NameCollisionReport, PlanDestinationTree,
+    PlanOutcome, PlanValidationReport, PluginRegistrationView, PluginReport, PluginsOutcome,
+    ProjectStatus, QueryOptions, RegisteredPluginMetadata, ReviewClassSummary, ReviewQueue,
+    ScanOutcome, SearchBuildOptions, SearchRequest, SimilarityOptions, SimilarityOutcome,
+    SimilarityReport, SnapshotBuildOptions, SpacePreflight, TreeCloneReport, TreeRelationReport,
+    VerifyOutcome,
 };
 use serde::Serialize;
 
@@ -530,6 +531,12 @@ enum ReportCommand {
         #[arg(long)]
         path: PathBuf,
     },
+    /// Folders repeating an ancestor's name that hold nothing of their own.
+    DragScars {
+        /// Project directory.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Exact tree clones (folders with byte-for-byte identical subtrees).
     TreeClones {
         /// Project directory.
@@ -758,6 +765,7 @@ enum Output {
     Duplicates(DuplicateReport),
     NameCollisions(NameCollisionReport),
     GraftedTrees(GraftedTreeReport),
+    DragScars(DragScarReport),
     SpacePreflight(SpacePreflight),
     Devices(DevicePreflight),
     TreeClones(TreeCloneReport),
@@ -1167,6 +1175,9 @@ fn run(cli: &Cli) -> DfResult<Output> {
             }
             ReportCommand::GraftedTrees { path } => {
                 df_facade::grafted_tree_report(path).map(Output::GraftedTrees)
+            }
+            ReportCommand::DragScars { path } => {
+                df_facade::drag_scar_report(path).map(Output::DragScars)
             }
             ReportCommand::TreeClones { path } => {
                 df_facade::tree_clone_report(path).map(Output::TreeClones)
@@ -1742,6 +1753,30 @@ fn print_grafted_trees(report: &GraftedTreeReport) {
     }
 }
 
+fn print_drag_scars(report: &DragScarReport) {
+    println!("Snapshot        : {}", report.snapshot_id);
+    println!("Scar folders    : {}", report.folders);
+    println!("Occurrences     : {}", report.occurrences);
+    println!("Distinct contents: {}", report.contents);
+    for scar in &report.scars {
+        println!();
+        println!("  {}", scar.relative_path);
+        println!("    occurrences inside : {}", scar.occurrences);
+        println!("    distinct contents  : {}", scar.contents);
+    }
+    if report.scars.is_empty() {
+        println!();
+        println!("No folder in this snapshot repeats an ancestor's name emptily.");
+    } else {
+        println!();
+        // The list is where a drag went wrong, not a list of things to delete.
+        // Two scars can be each other's only copy, and a naive prune of this
+        // very list was measured to drop 744 contents from the tree.
+        println!("Evidence only: every content above exists outside its branch,");
+        println!("but deciding what to do with a scar stays a human decision.");
+    }
+}
+
 fn print_name_collisions(report: &NameCollisionReport) {
     println!("Snapshot          : {}", report.snapshot_id);
     println!("Colliding names   : {}", report.colliding_names);
@@ -2304,6 +2339,7 @@ fn print_human(output: &Output) {
         Output::Duplicates(report) => print_duplicates(report),
         Output::NameCollisions(report) => print_name_collisions(report),
         Output::GraftedTrees(report) => print_grafted_trees(report),
+        Output::DragScars(report) => print_drag_scars(report),
         Output::SpacePreflight(report) => print_space_preflight(report),
         Output::Devices(report) => print_devices(report),
         Output::TreeClones(report) => print_tree_clones(report),
@@ -2470,6 +2506,10 @@ fn verdict_exit_code(output: &Output) -> i32 {
         Output::Duplicates(_) => 0,
         Output::NameCollisions(_) => 0,
         Output::GraftedTrees(_) => 0,
+        // A scar is a finding about the origin, not about this run: exiting
+        // non-zero on one would make every script over a real archive treat
+        // the diagnosis itself as the failure.
+        Output::DragScars(_) => 0,
         Output::SpacePreflight(_) => 0,
         Output::Devices(_) => 0,
         Output::TreeClones(_) => 0,

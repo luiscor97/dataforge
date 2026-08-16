@@ -98,7 +98,7 @@ pub use df_facade::{Actor, DuplicatePolicy, RuleAction};
 /// Bumped when a tool is added; a tool that changes meaning gets a new name
 /// instead, so a caller pinned to a version can never be silently handed
 /// different semantics.
-pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.10.0";
+pub const TOOL_SURFACE_VERSION: &str = "dataforge.tool-surface/0.11.0";
 
 /// What a tool is allowed to do, and therefore what it has to pass through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +178,11 @@ pub const TOOLS: &[Tool] = &[
         name: "grafted_tree_report",
         capability: Capability::Observe,
         summary: "Grafted subtrees, their canonical paths, and what places itself.",
+    },
+    Tool {
+        name: "drag_scar_report",
+        capability: Capability::Observe,
+        summary: "Folders repeating an ancestor's name that hold nothing of their own.",
     },
     Tool {
         name: "tree_clone_report",
@@ -565,6 +570,7 @@ pub fn report_collections(name: &str) -> Option<&'static [&'static str]> {
         "hash_exclusion_report" => &["exclusions"],
         "name_collision_report" => &["collisions"],
         "grafted_tree_report" => &["grafts"],
+        "drag_scar_report" => &["scars"],
         "tree_relation_report" => &["relations"],
         "context_report" => &["generic_folders", "protected_folders"],
         "structural_anomaly_report" => &["anomalies"],
@@ -658,6 +664,14 @@ pub fn invoke(name: &str, input: Value, actor: Actor) -> DfResult<Value> {
             encode_report(
                 name,
                 df_facade::grafted_tree_report(&input.project_dir)?,
+                input.window(),
+            )
+        }
+        "drag_scar_report" => {
+            let input: ReportInput = parse(name, input)?;
+            encode_report(
+                name,
+                df_facade::drag_scar_report(&input.project_dir)?,
                 input.window(),
             )
         }
@@ -1011,6 +1025,7 @@ mod tests {
                 ("hash_exclusion_report", Capability::Observe),
                 ("name_collision_report", Capability::Observe),
                 ("grafted_tree_report", Capability::Observe),
+                ("drag_scar_report", Capability::Observe),
                 ("tree_clone_report", Capability::Observe),
                 ("tree_relation_report", Capability::Observe),
                 ("context_report", Capability::Observe),
@@ -1041,7 +1056,7 @@ mod tests {
             ],
             "the tool surface changed; bump TOOL_SURFACE_VERSION and say why"
         );
-        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.10.0");
+        assert_eq!(TOOL_SURFACE_VERSION, "dataforge.tool-surface/0.11.0");
     }
 
     /// A report shaped like the real ones: scalar totals beside the detail.

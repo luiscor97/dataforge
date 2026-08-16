@@ -48,7 +48,7 @@ mod secrets;
 pub use df_db::assistance::AssistanceAuditView;
 pub use df_db::inventory::{NameCollision, NameCollisionReport};
 pub use df_db::liveness::{RunLiveness, RunStage};
-pub use df_db::structure::{GraftMatch, GraftedPrefix, GraftedTreeReport};
+pub use df_db::structure::{DragScar, GraftMatch, GraftedPrefix, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{
     AnalyzeOutcome, ApproveOutcome, DiscardOutcome, PlanOutcome, PlanValidationReport,
@@ -3152,6 +3152,70 @@ pub fn grafted_tree_report(project_dir: &Path) -> DfResult<GraftedTreeReport> {
     df_db::structure::grafted_trees(&db, snapshot.id)
 }
 
+/// Drag-and-drop scars and the weight they carry, over the whole snapshot.
+///
+/// The scalars are computed before any window narrows the list, because the
+/// question an operator asks first — *how much of this archive is scar tissue?*
+/// — must not change with how many rows came back.
+///
+/// `occurrences` and `contents` are sums over the listed folders, not distinct
+/// counts. Scars nest: a drag repeated twice leaves `X\X` and `X\X\X`, and the
+/// inner branch is inside the outer one's subtree, so its files are counted by
+/// both rows. Deduplicating them would need a second pass over the tree to
+/// produce a number nobody asked for; what the sums do answer honestly is the
+/// order of magnitude, and each row remains exact on its own.
+#[derive(Debug, Clone, Serialize)]
+pub struct DragScarReport {
+    pub snapshot_id: String,
+    /// Folders whose name repeats an ancestor's and that hold nothing of their
+    /// own. On the 158,219-file archive this was built against, 127 folders
+    /// repeat an ancestor's name and all 127 land here.
+    pub folders: u64,
+    /// Occurrences inside those folders, summed row by row.
+    pub occurrences: u64,
+    /// Distinct contents inside them, summed row by row — every one of which
+    /// was proven to exist somewhere outside its branch.
+    pub contents: u64,
+    pub scars: Vec<DragScar>,
+}
+
+/// Report the folders that are scars of a bad drag-and-drop.
+///
+/// The detector already existed and `plan validate` already refused to let a
+/// plan place one in the active tree silently. That is the last possible
+/// moment to learn it: by then a plan exists, an agent has spent a session
+/// deciding thousands of review items, and the finding arrives as an objection
+/// to work already done. The same evidence read straight after `analyze` is
+/// what lets those decisions be made knowing where the scars are.
+///
+/// Evidence only, and deliberately so. Pruning these branches was measured not
+/// to be safe — contents living only inside two scars vanish from both, and a
+/// naive prune of this very list dropped 744 contents — so this says where
+/// they are and never what to do about them (RFC-0001 §15.2).
+pub fn drag_scar_report(project_dir: &Path) -> DfResult<DragScarReport> {
+    let project_dir = absolutize(project_dir)?;
+    let marker = read_marker(&project_dir)?;
+    let db = open_db(&project_dir, &marker)?;
+    let project = repository::load_project(&db)?;
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?
+        .ok_or_else(|| DfError::Validation("the project has no complete snapshot".to_string()))?;
+    // Gated like every other structural report even though the detector reads
+    // only occurrences and their content ids: "every content exists outside
+    // this branch" is a claim about the whole snapshot, and answering it from
+    // a half-hashed one would be a wrong answer wearing the same shape as a
+    // right one.
+    ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
+    let scars = df_db::structure::drag_scars(&db, snapshot.id)?;
+
+    Ok(DragScarReport {
+        snapshot_id: snapshot.id.to_string(),
+        folders: scars.len() as u64,
+        occurrences: scars.iter().map(|scar| scar.occurrences).sum(),
+        contents: scars.iter().map(|scar| scar.contents).sum(),
+        scars,
+    })
+}
+
 /// Exact tree-clone report of the latest snapshot (RFC-0001 §19).
 ///
 /// Evidence only: DataForge reports directory trees that are byte-for-byte
@@ -4392,6 +4456,62 @@ mod tests {
     }
 
     #[test]
+    fn the_drag_scar_report_names_the_branch_before_any_plan_exists() {
+        // Same corpus shape as the validation test above, read at the other
+        // end of the pipeline. That test proves a plan cannot place a scar
+        // silently; this one proves nobody has to build a plan to find out
+        // where the scars are. The detector was the same all along — only its
+        // reachability was wrong, and a finding that arrives after thousands
+        // of review decisions arrives as an objection instead of as evidence.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let scar = origin.join("EXPEDIENTES").join("EXPEDIENTES");
+        std::fs::create_dir_all(&scar).unwrap();
+        std::fs::write(origin.join("EXPEDIENTES/uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("EXPEDIENTES/dos.txt"), b"contenido dos").unwrap();
+        // The nested copy holds only what its parent already holds, which is
+        // what makes it a scar rather than a folder that happens to repeat a
+        // name — the distinction the detector is built on.
+        std::fs::write(scar.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(scar.join("dos.txt"), b"contenido dos").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+
+        // No `create_plan` anywhere above: this is the whole point.
+        let report = drag_scar_report(&req.project_dir).expect("report");
+        assert_eq!(report.folders, 1, "{:?}", report.scars);
+        let named = report
+            .scars
+            .iter()
+            .find(|scar| scar.relative_path.contains("EXPEDIENTES\\EXPEDIENTES"))
+            .unwrap_or_else(|| panic!("the report must name the branch: {:?}", report.scars));
+        assert_eq!(named.contents, 2, "both contents live in the parent too");
+        assert_eq!(named.occurrences, 2);
+
+        // The totals describe the same thing the rows do, so a caller that
+        // reads only the scalars is not reading a different archive.
+        assert_eq!(report.contents, 2);
+        assert_eq!(report.occurrences, 2);
+
+        // The parent is not a scar: it repeats no ancestor's name and its own
+        // copies are the ones the nested branch duplicates. A detector that
+        // flagged it would be proposing to empty the tree.
+        assert!(
+            !report
+                .scars
+                .iter()
+                .any(|scar| scar.relative_path.ends_with("origen")),
+            "{:?}",
+            report.scars
+        );
+    }
+
+    #[test]
     fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
         // Found on a 444 GB archive: `plan create` produced a tree whose shape
         // was wrong, and there was no way to build a second one. `create_plan`
@@ -5413,11 +5533,14 @@ mod frozen_contracts {
         // PLAN_READY turned out to be a dead end. 0.10.0 adds
         // `export_delivery_package`, which had been reachable from nowhere —
         // the last stage of the pipeline, callable only from its own tests.
+        // 0.11.0 adds `drag_scar_report`, whose detector existed but was only
+        // reachable from `plan validate` — evidence arriving as an objection to
+        // a plan already built, when it is what should have informed it.
         assert_eq!(
             df_tools::TOOL_SURFACE_VERSION,
-            "dataforge.tool-surface/0.10.0"
+            "dataforge.tool-surface/0.11.0"
         );
-        assert_eq!(df_tools::TOOLS.len(), 32, "tool count");
+        assert_eq!(df_tools::TOOLS.len(), 33, "tool count");
 
         // Reports bound what they list. These two are contract, not tuning: an
         // agent sizes its own reading against them, and raising the ceiling

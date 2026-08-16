@@ -612,8 +612,8 @@ mod tests {
             checked += 1;
         }
         assert_eq!(
-            checked, 10,
-            "the windowed reports are ten; a new one needs a schema"
+            checked, 11,
+            "the windowed reports are eleven; a new one needs a schema"
         );
     }
 
