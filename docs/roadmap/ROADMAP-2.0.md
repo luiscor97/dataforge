@@ -82,6 +82,19 @@ El orden es obligado: cada hito depende de que exista el anterior.
 > la respuesta correcta. De ahí que la prueba de campo dejara 129.379 archivos
 > en revisión donde la persona dejó 175.
 
+> **Actualización del 2026-08-16.** Un run completo con una sola versión y las
+> decisiones sacadas del registro dejó la cola en **6 ítems** — y aun así
+> reprodujo en la salida el anidado accidental que el proyecto existe para
+> reparar. Nada de aquella decisión era insegura y **ninguna regla la rechazó**,
+> que es el hueco real: RFC-0002 dice que el agente propone y algo determinista
+> verifica, y la verificación no existía. `plan validate` ya la hace.
+>
+> Eso reordena el peso de los hitos: **M2.4 pasa al centro**. Un agente propone
+> bien con la evidencia que M2.3 le dé, y lo que impide que una propuesta
+> razonable produzca basura es la autoridad determinista, no mejores
+> instrucciones. Y M2.7 se reescribe como lo que es —**reparar el árbol**— con
+> cinco reglas puntuadas contra el entregable real.
+
 ### M2.1 — Superficie agéntica
 
 Que un agente pueda conducir el motor sin acoplarse a la ABI de Rust.
@@ -557,16 +570,71 @@ lectura a `revisar/_ilegible/` sin abortar; pre-vuelo de espacio antes de
 copiar; reanudación exacta desde el manifiesto; fallo de verificación a
 `revisar/_verificacion-fallida/` con el run continuando.
 
-### M2.7 — Colocación por correspondencia
+### M2.7 — Reparación del árbol
 
-> **Va después de M2.3, y no por planificación.** Medido sobre el corpus real:
-> hay 88 pares de carpetas con hijas homónimas y menos del 5% de contenido
-> común —invisibles para `tree_relations`, que compara contenido— y el mayor
-> tiene 333 hijas con nombres idénticos y 0% compartido. Pero la mitad de los
-> mayores son directorios de recursos de aplicaciones instaladas. **La
-> correspondencia por nombre no distingue por sí sola un inventario de clientes
-> de una carpeta de programa**, así que sin clasificación de contexto un
-> detector propondría fusionar las dos con la misma confianza.
+> **Reescrito el 2026-08-16.** Se llamó «colocación por correspondencia» y eso
+> era una de tres reparaciones, no la capacidad. El nombre lo corrigió el
+> operador al preguntar por el orden del pipeline: *«inventarías, luego lees las
+> rutas y las arreglas, y luego mueves los archivos»*.
+>
+> **La decisión no es por archivo, es sobre aristas del árbol.** Hoy el plan
+> enruta cada archivo a un cubo, y esa pregunta **no puede expresar** «esta rama
+> entera sobra porque es una copia de su propio padre». Por eso la cola de
+> revisión preguntaba *qué es esto* cuando la respuesta necesaria era *dónde va
+> esto*, y por eso un agente decidió `COPY_ACTIVE` sobre 3.702 árboles embebidos
+> —una respuesta correcta a la pregunta equivocada— y la salida reprodujo el
+> defecto que el motor existe para reparar: una carpeta dentro de otra del
+> mismo nombre, tres niveles, 11.816 archivos sin nada propio.
+
+**El orden que falta:**
+
+```
+inventariar  →  REPARAR RUTAS  →  mover
+ (scan+hash)     (sin copiar)      (execute)
+```
+
+La reparación es una operación **sobre rutas**, y eso le da tres propiedades
+que ninguna otra etapa tiene: no copia nada, se puede iterar en segundos, y es
+la única capaz de expresar la respuesta. Podar una rama no es una etiqueta que
+se pueda poner a 11.816 archivos.
+
+**Las cinco reglas candidatas, puntuadas contra el entregable humano** (29.239
+contenidos con SHA-256). El banco las evaluó en minutos, sin copiar un byte:
+
+| Regla | Archivos | Cubre | Contenidos perdidos |
+| --- | ---: | ---: | ---: |
+| ninguna (lo que se ejecutó) | 158.219 | 100,0% | 0 |
+| podar cicatrices de arrastre | 129.532 | 98,9% | **744** |
+| una copia por contenido, por profundidad | 49.916 | 100,0% | 0 |
+| **una copia, antigüedad→profundidad→longitud** | **49.916** | **100,0%** | **0** |
+| cicatrices + una copia | 49.127 | 98,7% | 789 |
+
+**Gana la más simple, y es la del registro de julio**: *«un representante por
+grupo de clones exactos»* (turno 736). 49.916 contra los 47.982 representantes
+del trabajo humano — al 4%. Lo que la bloquea no es la detección: es §15.2, que
+prohíbe suponer redundancia sin clasificación. **Permiso, no capacidad.**
+
+Y la regla que parecía obvia —podar las cicatrices— **pierde 744 contenidos**,
+porque lo que vive solo dentro de dos cicatrices desaparece de las dos. Por eso
+`drag_scars` reporta y no poda: encontrarlas es un hecho, quitarlas es una
+decisión.
+
+**La invariante que ninguna regla puede romper:** ningún contenido desaparece
+del árbol. Es lo que descartó la regla que este documento defendía.
+
+**Lo que el banco no puede puntuar**, y hay que decirlo: el manifiesto compara
+*contenidos*, no *ubicaciones*. Una foto usada en tres expedientes se colapsaría
+a una sola ruta y el banco diría «100%, cero pérdidas» mientras el asesor pierde
+el contexto de dos asuntos. Eso es el turno 1302 —*«su uso dentro de un asunto
+es información jurídica»*— y es exactamente por qué §15.2 existe y por qué la
+regla ganadora necesita el perfil de M2.3 antes que el permiso.
+
+**Umbral de aceptación, por dos caminos independientes.** Comparando los
+subárboles de las 4.604 preguntas de carpeta: 3.702 son contención estricta y
+de los 902 «parciales», 739 se separan de la contención total por cinco
+archivos o menos. Quitando `EXTREME_PATH`, la cola baja a **169**; el trabajo
+humano terminó con **175**. El criterio no es «reducir la cola» sino dejarla en
+ese orden.
 
 El verbo que faltaba. Añadido el 2026-08-15 a partir de
 [las-correcciones-del-trabajo-real.md](las-correcciones-del-trabajo-real.md):
@@ -589,10 +657,23 @@ trabajo humano terminó con **175**. Dos métodos sin nada en común coinciden e
 que la ambigüedad real de ese archivo son ~170 casos, así que el criterio de
 M2.7 no es «reducir la cola» sino **dejarla en ese orden**.
 
+**Las tres reparaciones**, de la más medida a la más incierta:
+
+- **Colapsar a una copia por contenido.** La ganadora de la tabla, y la que más
+  quita: 158.219 → 49.916. Necesita el permiso de M2.3, no capacidad nueva.
+- **Podar cicatrices de arrastre.** `drag_scars` ya las encuentra y
+  `plan validate` ya las nombra: 127 carpetas repiten el nombre de un ancestro
+  en el corpus real y **las 127 no tienen nada propio**. Falta decidir qué
+  hacer con ellas, y la medición dice que no es podarlas por separado.
 - Detección de **árboles paralelos**: dos subárboles cuyos hijos se
   corresponden por nombre y describen las mismas entidades. La evidencia ya se
   calcula —`tree_relation_report` y el solapamiento por contenido— y no se usa
-  para decidir.
+  para decidir. **Va después de M2.3 y no por planificación**: hay 88 pares con
+  hijas homónimas y menos del 5% de contenido común, invisibles para
+  `tree_relations` porque compara contenido, y el mayor tiene 333 hijas
+  idénticas con 0% compartido — pero la mitad de los mayores son directorios de
+  recursos de aplicaciones instaladas. La correspondencia por nombre no
+  distingue por sí sola un inventario de clientes de una carpeta de programa.
 - **Contención estricta no es una pregunta**: si el contenido de B está entero
   dentro de A, eso es un hecho medido y la operación es mecánica. Con
   tolerancia declarada para los casos al filo, y la lista explícita de las
