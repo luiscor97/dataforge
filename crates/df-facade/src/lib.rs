@@ -2646,6 +2646,10 @@ pub struct DeliveryPackage {
     pub checksummed: u64,
     /// Entries with no destination recorded. Reported, never dropped.
     pub without_destination: u64,
+    /// Operations the run could not copy, final and retryable together. Here
+    /// as a number so a caller learns of them without reading the prose, and
+    /// stated even when it is zero.
+    pub failed: u64,
     pub bytes: u64,
 }
 
@@ -2666,6 +2670,15 @@ pub struct DeliveryPackage {
 /// - `SHA256SUMS` — in `sha256sum -c` format, so it is checkable with a tool
 ///   the recipient already trusts rather than only with this one.
 /// - `delivery.md` — the guarantees, in prose, with the counts behind them.
+///
+/// And a fourth, `failures.csv`, only when the run could not copy something.
+/// The manifest describes what was *planned*; on ageing media a run finishes
+/// with per-file errors rather than aborting, so a package built from the
+/// manifest alone hands over a map of intentions and stays silent about the
+/// gaps in it. `delivery.md` therefore always states the failure count —
+/// including when it is zero, because a stated zero is evidence and a missing
+/// section is only an absence — and the list itself is written only when
+/// there is something to list.
 ///
 /// # Why it lands in the audit root and not in the output
 ///
@@ -2772,6 +2785,63 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         lines
     };
 
+    // What the run could not copy. The manifest is a record of intent, and a
+    // package derived from it alone describes a delivery that was planned
+    // rather than one that happened — on ageing media those differ by exactly
+    // the files nobody could read. The totals come from the operations table
+    // and not from the listing below, so a plan that failed more times than
+    // one document should enumerate still states the true count.
+    let progress = df_db::plans::plan_progress(&db, plan.id)?;
+    let failed = progress.failed_final + progress.failed_retryable;
+    let failures = if failed == 0 {
+        Vec::new()
+    } else {
+        df_db::plans::failed_operations(&db, plan.id, MAX_REPORTED_FAILURES)?
+    };
+    let could_not_copy = if failed == 0 {
+        // Said in words rather than left out. A recipient cannot tell a clean
+        // run from a section nobody wrote, and the completed count travels
+        // with the zero so a plan that was never executed cannot be read as
+        // one that ran without a single error.
+        format!(
+            "**No operation failed.** {} of the plan's {} have completed and none \
+             is recorded as failed, so this package carries no `failures.csv`: a \
+             stated zero is evidence, an empty file is not.",
+            progress.completed,
+            operations(progress.total)
+        )
+    } else {
+        let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        for failure in &failures {
+            *counts.entry(failure.error_code.as_str()).or_default() += 1;
+        }
+        let mut by_error: Vec<(&str, u64)> = counts.into_iter().collect();
+        by_error.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let mut lines = format!(
+            "**{} could not be copied** — {} recorded as final and {} as \
+             retryable, which a later run may still resolve. A per-file error \
+             never aborts a run, which is what makes failing media workable at \
+             all: the {} that completed are unaffected and are described above. \
+             Each failure is a row in `failures.csv`, with the error its last \
+             attempt returned:\n",
+            operations(failed),
+            progress.failed_final,
+            progress.failed_retryable,
+            operations(progress.completed)
+        );
+        for (code, count) in by_error {
+            lines.push_str(&format!("\n- `{code}` — {}", operations(count)));
+        }
+        if (failures.len() as u64) < failed {
+            lines.push_str(&format!(
+                "\n\nThe list and the breakdown stop at {} rows; the total above \
+                 counts every failure.",
+                failures.len()
+            ));
+        }
+        lines
+    };
+
     let summary = format!(
         "# Delivery package\n\n\
          Plan `{}`, version {}.\n\n\
@@ -2782,6 +2852,8 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
          - Bytes described: **{}**\n\
          - Independent verification: {}\n\n\
          ## What was not read\n\n\
+         {}\n\n\
+         ## What could not be copied\n\n\
          {}\n\n\
          ## Guarantees\n\n\
          The origin was never written to: no code in this engine renames, \
@@ -2801,11 +2873,38 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         bytes,
         verdict,
         not_read,
+        could_not_copy,
     );
 
     write_delivery_file(&directory, "traceability.csv", &csv)?;
     write_delivery_file(&directory, "SHA256SUMS", &sums)?;
     write_delivery_file(&directory, "delivery.md", &summary)?;
+
+    let failures_path = directory.join("failures.csv");
+    if failures.is_empty() {
+        // An export taken after the failures were retried away would otherwise
+        // leave the earlier run's list beside a report that says there were
+        // none, and of the two the recipient would believe the file.
+        if failures_path.exists() {
+            std::fs::remove_file(&failures_path)
+                .map_err(|error| DfError::io(&failures_path, error))?;
+        }
+    } else {
+        let mut failures_csv = String::from(
+            "source_relative_path,destination_relative_path,error_code,detail,attempts\n",
+        );
+        for failure in &failures {
+            failures_csv.push_str(&format!(
+                "{},{},{},{},{}\n",
+                csv_field(&failure.source_relative_path),
+                csv_field(&failure.destination_relative_path),
+                csv_field(&failure.error_code),
+                csv_field(&failure.detail),
+                failure.attempts,
+            ));
+        }
+        write_delivery_file(&directory, "failures.csv", &failures_csv)?;
+    }
 
     Ok(DeliveryPackage {
         plan_id: plan.id.to_string(),
@@ -2813,8 +2912,20 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         entries: entries.len() as u64,
         checksummed,
         without_destination,
+        failed,
         bytes,
     })
+}
+
+/// Count and noun, agreeing. This document is read by the person receiving the
+/// delivery, and "1 operations could not be copied" is the kind of seam that
+/// invites them to wonder what else was written without being read.
+fn operations(count: u64) -> String {
+    if count == 1 {
+        "1 operation".to_string()
+    } else {
+        format!("{count} operations")
+    }
 }
 
 fn write_delivery_file(directory: &Path, name: &str, contents: &str) -> DfResult<()> {
@@ -4402,11 +4513,26 @@ mod tests {
         // Nothing was excluded here, and the package says so rather than
         // leaving the reader to assume it.
         assert!(summary.contains("Everything in the origin was read"));
+        // Nothing failed either, and that too is stated. An absent section
+        // would read the same whether the run was clean or the question was
+        // never asked, which is the difference this package exists to settle.
+        assert_eq!(package.failed, 0);
+        assert!(
+            summary.contains("No operation failed"),
+            "a clean run must say so in words: {summary}"
+        );
+        assert!(
+            !directory.join("failures.csv").exists(),
+            "with nothing to list, an empty list is a worse artefact than the stated zero"
+        );
 
         // After a real verification the package reports what that run found,
         // read back from the run itself rather than re-derived.
         execute_plan(&req.project_dir, Actor::Test).expect("execute");
         let verify = verify_project_output(&req.project_dir, Actor::Test).expect("verify");
+        // A list left behind by an earlier, worse run would outlive the report
+        // that supersedes it, and the file is what a recipient would believe.
+        std::fs::write(directory.join("failures.csv"), b"stale\n").unwrap();
         let after = export_delivery_package(&req.project_dir).expect("exported again");
         let summary =
             std::fs::read_to_string(std::path::Path::new(&after.directory).join("delivery.md"))
@@ -4415,6 +4541,75 @@ mod tests {
             summary.contains(&verify.verdict),
             "the package must carry the verdict the run produced: {summary}"
         );
+        assert!(
+            !directory.join("failures.csv").exists(),
+            "a package that reports no failures must not ship a list of them"
+        );
+    }
+
+    // Executes, and execution refuses fail-closed off Windows until POSIX
+    // write safety exists (ADR-0017). `df-executor` gates its whole test
+    // module the same way and for the same reason.
+    #[cfg(windows)]
+    #[test]
+    fn a_delivery_package_names_what_the_run_could_not_copy() {
+        // The package was built from the frozen manifest alone, and a manifest
+        // is a record of what was planned. Over ageing media the plan and the
+        // delivery differ by exactly the files nobody could read, and the
+        // recipient — the one party who cannot re-run anything — was the only
+        // one not told.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("bueno.txt"), b"se copia").unwrap();
+        std::fs::write(origin.join("roto.txt"), b"desaparece").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin.clone()];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        // The disk loses one file between approval and the copy. This is what
+        // failing media looks like from the engine's side.
+        std::fs::remove_file(origin.join("roto.txt")).unwrap();
+        execute_plan(&req.project_dir, Actor::Test).expect("execute");
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+        assert_eq!(package.failed, 1, "the count travels with the package");
+
+        let directory = std::path::Path::new(&package.directory);
+        let summary = std::fs::read_to_string(directory.join("delivery.md")).expect("summary");
+        // Count and noun agreeing, because a document a client reads is judged
+        // partly on whether it looks written rather than emitted.
+        assert!(
+            summary.contains("1 operation could not be copied"),
+            "the delivery must say the copy was incomplete: {summary}"
+        );
+        // Named by its cause, not merely counted: a recipient told that one
+        // file is missing can ask for it, and a recipient told why can judge
+        // whether the origin still holds it.
+        assert!(
+            summary.contains("SOURCE_MISSING"),
+            "the delivery must say what stopped it: {summary}"
+        );
+
+        let failures = std::fs::read_to_string(directory.join("failures.csv")).expect("failures");
+        assert_eq!(
+            failures.lines().count(),
+            2,
+            "the header and the one failure"
+        );
+        let header = failures.lines().next().expect("header");
+        let row = failures.lines().nth(1).expect("row");
+        assert!(row.contains("roto.txt"), "the failing file is named: {row}");
+        assert!(row.contains("SOURCE_MISSING"));
+        // A detail carrying a comma must not shift the columns, exactly as in
+        // the traceability map.
+        assert_eq!(csv_columns(row), csv_columns(header));
     }
 
     #[test]

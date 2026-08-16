@@ -1618,10 +1618,12 @@ fn print_deliver(package: &DeliveryPackage) {
     println!("Directory    : {}", package.directory);
     println!("Entries      : {}", package.entries);
     println!("Checksummed  : {}", package.checksummed);
-    // Said even when zero. An entry with no destination is the one thing a
-    // recipient of this package would want flagged, and reporting it only
-    // when convenient is how it stops being reported at all.
+    // Both said even when zero. An entry with no destination, or a file the
+    // run could not copy, is the kind of thing a recipient of this package
+    // would want flagged, and reporting it only when convenient is how it
+    // stops being reported at all.
     println!("No destination: {}", package.without_destination);
+    println!("Failed       : {}", package.failed);
     println!("Bytes        : {}", package.bytes);
 }
 
