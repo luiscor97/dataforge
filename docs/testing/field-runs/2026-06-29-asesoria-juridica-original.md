@@ -193,12 +193,157 @@ probatoria (regla 9, §15.3 `ACROSS_PROTECTED_CONTEXTS`).
 Las dos reglas que DataForge ya afirma por diseño, con datos reales que
 demuestran que ambos casos existen a escala **en el mismo archivo**.
 
+## Los criterios, en forma ejecutable (extraídos 2026-08-16)
+
+Lo anterior explica el trabajo. Esta sección existe para que un agente pueda
+**actuar** sin volver a leer 1.528 mensajes: cada criterio con su cita, la
+acción que le corresponde en el motor, y si hoy se puede o no.
+
+La regla que gobierna la tabla: **se decide lo que el registro decide.** Lo que
+el trabajo original no resolvió se deja pendiente, no se inventa por simetría.
+
+| Criterio | Cita | Acción en el motor | Hoy |
+| --- | --- | --- | --- |
+| Un representante por grupo de clones exactos, elegido por profundidad, nombre, ruta y antigüedad | turno 736 | `plan create --duplicate-policy CONSOLIDATE_ALL` | intención sí, efecto **no** |
+| El destino conserva la estructura relativa del representante | turno 980 | comportamiento por defecto del planner | sí |
+| Un archivo duplicado cuyo uso está dentro de un expediente **no** se consolida | turno 1302 | regla 9, fronteras protegidas | **no dispara** |
+| Media, entretenimiento y material técnico se aíslan, no se borran | turno 272 | perfil + `95_Separated` | sí |
+| Árboles embebidos y parciales: se colocan ambos lados | turnos 736 + 1302 | `review decide-batch` → `COPY_ACTIVE` | sí |
+| Rutas de 240+ caracteres se conservan | informe final | `review decide-batch` → `COPY_ACTIVE` | sí |
+| Estructura por materia, no espejo del origen | estructura entregada | — | **no**, M2.7 |
+| Reglas de conservación por antigüedad | *«no apliqué reglas RGPD automáticas al no tener una política concreta»* (turno 1171) | — | **no se decidió** |
+
+### La pieza que faltaba aislar: el perfil vacío
+
+El criterio del turno 1302 es, palabra por palabra, la regla 9 de RFC-0001. El
+motor **la tiene implementada y nunca la dispara**: el run de campo reportó
+`Protected bounds: 0`, porque el perfil `generic` no marca ninguna carpeta como
+frontera protegida.
+
+Así que las dos mitades del criterio humano faltan a la vez y por causas
+distintas: no puede consolidar —§15.2 se lo prohíbe sin clasificación— y no
+tiene nada que proteger —el perfil está vacío—. No es un fallo de código. Es un
+perfil que nadie ha escrito, y es lo que un perfil `asesoria-juridica` con
+fronteras protegidas y categorías de material no documental resolvería
+(ADR-0026: los perfiles se compilan, así que es un cambio con su ADR).
+
+### El banco: puntuar un criterio sin ejecutar nada
+
+El trabajo original probaba criterios **ejecutando y corrigiendo**: diez días,
+nueve correcciones, cada una descubierta al ver una entrega entera. DataForge
+estaba heredando ese método — llegaron a proponerse runs de quince horas para
+ver qué forma salía.
+
+No hace falta. Ese trabajo dejó su resultado con identidad de contenido, así
+que un criterio candidato se aplica sobre el plan y se cruza contra la verdad
+**en segundos**, sin copiar un byte.
+
+```
+antes : criterio → 15 h de run → mirar la forma → corregir
+ahora : criterio → cruce contra el manifiesto → % de acuerdo → iterar
+```
+
+**Cobertura del plan construido con los criterios de la tabla anterior**
+(decisiones del registro + `CONSOLIDATE_ALL`):
+
+| | Contenidos |
+| --- | ---: |
+| Entregado por la persona | 29.239 |
+| Que el plan coloca en el árbol limpio | **29.227 — 100,0%** |
+| Que caen en revisión | 1 |
+| Que no coloca | 11 — *todos del informe que ella escribió al final* |
+| Que coloca de más | 20.572 (180,3 GB) |
+
+**El desvío es solo por exceso, nunca por omisión.** Para un motor probatorio
+ésa es la única dirección aceptable del error, y ahora está medida en vez de
+supuesta.
+
+**Cuatro criterios candidatos, evaluados en diez minutos:**
+
+| Regla | Árbol limpio | Cubre | Sobran |
+| --- | ---: | ---: | ---: |
+| ninguna (el plan tal cual) | 49.799 | 100,0% | 20.572 |
+| apartar software por extensión | 47.562 | 99,1% | 18.576 |
+| apartar fotografía por extensión | 41.452 | **89,8%** | 15.205 |
+| apartar volcaderos de foto **por carpeta** | 45.379 | **99,5%** | 16.279 |
+
+El resultado que vale es el negativo. La regla obvia —apartar fotografía por
+extensión, que es lo que el turno 272 parece decir— **destruye el 10,2% del
+entregable**, porque las fotos periciales *son* la prueba. La misma intención
+aplicada por ubicación conserva el 99,5%.
+
+**La señal que separa material documental de no documental no es el tipo de
+archivo: es dónde está.** Eso es lo que M2.3 tiene que dar, y deja de ser un
+argumento para ser una medida.
+
+### El criterio de representante, recuperado y contrastado
+
+`decisions` guarda las 47.982 elecciones con su puntuación y **cero
+intervenciones manuales**: no fue un juicio caso a caso, fue una fórmula que
+nadie tuvo que corregir ni una vez.
+
+```
+group_key  : sha256:000290ed…
+auto_score : 105.9
+auto_reason: "depth -8; path_length -1.1; oldest_mtime +15"
+```
+
+| Señal | Trabajo original | DataForge |
+| --- | --- | --- |
+| profundidad | −4 por nivel | sí |
+| longitud de ruta | penalización continua | no |
+| **antigüedad del contenido** | **+15** | **no la mira** |
+| carpeta genérica | no la usa | sí, pero inerte con el perfil vacío |
+| marcador de copia en el nombre | no la usa | sí |
+
+Comparando elección con elección sobre los grupos que ambos ven:
+
+> **20.442 de 27.861 — 73,4% de acuerdo.**
+
+Las discrepancias tienen forma reconocible. El trabajo original prefiere la
+importación original de la cámara; DataForge, la copia dentro del proyecto:
+
+```
+campo     : imagenes\100d5600\dsc_0908.jpg
+dataforge : fotos villar obra\garaje\dsc_0908.jpg
+```
+
+Que es exactamente lo que produce un bonus de antigüedad que uno tiene y el
+otro no.
+
+Ese 73,4% es el número que el hito del criterio tiene que subir, y ahora
+existe.
+
+### Las fuentes, por orden de fuerza
+
+1. **`MANIFIESTO_FINAL_SHA256.csv`** — 29.240 filas: `rel_path, category, size,
+   sha256, path_length, hash_source`. El entregable entero con identidad de
+   contenido. **Es la fuente más fuerte y la que más tarde se usó**: hubo un
+   contraste que rehasheó 86,67 GB durante 26 minutos para reconstruir a mano
+   un subconjunto de lo que este fichero ya tenía. Cruzarlo contra
+   `content_objects` es cuestión de segundos.
+2. **`INFORME_FINAL_ORDENACION_...md`** — los criterios como se entregaron, y
+   los recuentos que permiten dimensionar el hueco.
+3. **La transcripción** — el *porqué* de cada criterio, que es lo que permite
+   aplicarlo a un caso nuevo en vez de copiarlo.
+
+### La validación que da confianza en todo lo anterior
+
+| | Documentos | Únicos |
+| --- | ---: | ---: |
+| Trabajo original | 154.681 no multimedia | **47.982 representantes** |
+| DataForge sobre el mismo origen | 158.219 archivos | **49.916 contenidos distintos** |
+
+Coinciden al 4%. El recuento de representantes de una persona y el de
+contenidos distintos del motor son la misma cifra medida de dos maneras. Lo que
+separa 48.000 de 158.000 en el árbol limpio no es detección: es permiso para
+consolidar, que es M2.3.
+
 ## Qué sigue faltando
 
+- ~~Un extracto de criterios sin nombres.~~ **Hecho**: la sección anterior.
 - **El informe final al asesor** (`INFORME_FINAL_ORDENACION_...docx` y PDF)
-  está en `D:\DataForge_Salida\05_Asesoria_Juridica_v2\00_INFORME_DE_ORGANIZACION\`.
-  Contiene datos del cliente: no debe entrar tal cual, pero un extracto de
-  criterios sin nombres sí valdría.
+  contiene datos del cliente: no debe entrar tal cual.
 - **Conciliar tres recuentos del mismo corpus**: 158.219 (ROADMAP-2.0),
   156.962 (base del trabajo original), 155.906 (medido hoy en disco). Momentos
   de medición distintos es la explicación probable, no la comprobada.
