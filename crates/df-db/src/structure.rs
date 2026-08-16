@@ -523,6 +523,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_repeated_ancestor_name_is_found_with_either_separator() {
+        // The bug this pins: matching only on the backslash made the scar
+        // detector find nothing wherever paths carry `/`, so it reported a
+        // clean tree on the one platform whose CI was blocking. A portability
+        // fault that surfaces as a *passing* check is worse than a crash.
+        for path in [
+            "AGENTES\\AGENTES",
+            "AGENTES/AGENTES",
+            "A\\B\\A",
+            "A/B/A",
+            "banco/AGENTES/agentes",
+        ] {
+            assert!(repeats_an_ancestor_name(path), "{path}");
+        }
+        // A shared prefix is not a repeated name: `A/AB` must not match.
+        for path in ["", "A", "A\\B", "A/B", "A/AB", "AB/A"] {
+            assert!(!repeats_an_ancestor_name(path), "{path}");
+        }
+    }
+
+    #[test]
     fn folder_signature_is_order_independent_and_deterministic() {
         let a = folder_signature(vec!["F\0a.txt\0aa".to_string(), "F\0b.txt\0bb".to_string()]);
         let b = folder_signature(vec!["F\0b.txt\0bb".to_string(), "F\0a.txt\0aa".to_string()]);
@@ -2291,6 +2312,25 @@ pub fn grafted_trees(db: &Db, snapshot_id: SnapshotId) -> DfResult<GraftedTreeRe
     })
 }
 
+/// Does this folder's own name repeat one of its ancestors'?
+///
+/// The shape a bad drag-and-drop leaves behind, and the cheap half of the
+/// scar test. Pulled out as a pure function because the first version matched
+/// on `'\\'` alone: it found nothing wherever paths are recorded with `/`, so
+/// the detector reported a clean tree on precisely the platform whose CI
+/// would have caught it, and the failure surfaced as a passing validation
+/// rather than as an error.
+fn repeats_an_ancestor_name(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    segments
+        .last()
+        .is_some_and(|last| segments.len() >= 2 && segments[..segments.len() - 1].contains(last))
+}
+
 /// A folder whose name repeats an ancestor's and that holds nothing of its own.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DragScar {
@@ -2345,7 +2385,11 @@ pub fn drag_scars(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<DragScar>> {
                 .or_default()
                 .insert(content.clone());
             *counts.entry(path.to_string()).or_default() += 1;
-            match path.rfind('\\') {
+            // Both separators, like `dedup::ancestor_paths`. Matching only on
+            // the backslash made this find nothing wherever paths are recorded
+            // with `/`, so the detector reported a clean tree on exactly the
+            // platform whose CI would have caught it.
+            match path.rfind(['/', '\\']) {
                 Some(cut) => path = &path[..cut],
                 None => break,
             }
@@ -2354,22 +2398,15 @@ pub fn drag_scars(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<DragScar>> {
 
     let mut scars = Vec::new();
     for (path, inside) in &subtree {
-        let segments: Vec<String> = path
-            .split('\\')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_lowercase())
-            .collect();
-        // The last segment repeating an earlier one is what a drag leaves.
-        let repeats = segments.last().is_some_and(|last| {
-            segments.len() >= 2 && segments[..segments.len() - 1].contains(last)
-        });
-        if !repeats || inside.is_empty() {
+        if !repeats_an_ancestor_name(path) || inside.is_empty() {
             continue;
         }
-        let prefix = format!("{path}\\");
+        let descends_from_here = |other: &str| {
+            other.starts_with(&format!("{path}\\")) || other.starts_with(&format!("{path}/"))
+        };
         let holds_something_of_its_own = inside.iter().any(|content| {
             !subtree.iter().any(|(other, theirs)| {
-                other != path && !other.starts_with(&prefix) && theirs.contains(content)
+                other != path && !descends_from_here(other) && theirs.contains(content)
             })
         });
         if !holds_something_of_its_own {
