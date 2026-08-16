@@ -419,6 +419,11 @@ pub fn validate_plan(db: &Db) -> DfResult<PlanValidationReport> {
     let occurrences = plans::planning_occurrences(db, plan.snapshot_id)?;
     let mut problems = problems;
     problems.extend(occurrence_coverage_problems(&occurrences, &operations));
+    problems.extend(drag_scars_placed_in_the_active_tree(
+        db,
+        &plan,
+        &operations,
+    )?);
     Ok(PlanValidationReport {
         plan_id: plan.id.to_string(),
         version: plan.version,
@@ -427,6 +432,61 @@ pub fn validate_plan(db: &Db) -> DfResult<PlanValidationReport> {
         ok: problems.is_empty(),
         problems,
     })
+}
+
+/// Branches that are drag-and-drop scars and that this plan would nonetheless
+/// place in the active tree.
+///
+/// The invariant exists because of a run that failed it. An agent decided
+/// `COPY_ACTIVE` on 3.702 embedded-tree review items, reasoning that both
+/// sides would be placed and the duplicate policy would then reduce them. The
+/// first half happened; the second could not, because §15.2 forbids inferring
+/// redundancy without context. The output reproduced the exact defect the
+/// engine exists to repair — a folder inside a folder of the same name, three
+/// levels deep, 11.816 files holding nothing of their own.
+///
+/// Nothing about that decision was unsafe, and no rule refused it, which is
+/// the point: RFC-0002 has the agent propose and something deterministic
+/// verify. This is that verification, on the object that gets frozen.
+///
+/// A problem, not a refusal. `plan validate` reports; approving anyway stays
+/// the caller's call, and there are corpora where a repeated folder name is
+/// deliberate. What must not happen is approving without being told.
+fn drag_scars_placed_in_the_active_tree(
+    db: &Db,
+    plan: &df_domain::Plan,
+    operations: &[df_domain::PlanOperation],
+) -> DfResult<Vec<String>> {
+    let scars = df_db::structure::drag_scars(db, plan.snapshot_id)?;
+    if scars.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut problems = Vec::new();
+    for scar in scars {
+        // The destination mirrors the source path, so a scar reaches the
+        // active tree when an operation lands inside it without a bucket
+        // prefix. Matching on the destination is deliberate: it is what the
+        // plan actually promises to create.
+        let inside = format!("{}\\", scar.relative_path);
+        let placed = operations
+            .iter()
+            .filter(|op| op.operation_type == OperationType::CopyActive)
+            .filter(|op| {
+                op.destination_relative_path
+                    .as_deref()
+                    .is_some_and(|d| d.contains(&inside))
+            })
+            .count();
+        if placed > 0 {
+            problems.push(format!(
+                "`{}` repeats an ancestor's name and holds no content of its own \
+                 ({} distinct contents, every one present elsewhere), yet {placed} \
+                 file(s) from it are planned into the active tree",
+                scar.relative_path, scar.contents
+            ));
+        }
+    }
+    Ok(problems)
 }
 
 /// Exact §26.2 coverage: every snapshot occurrence appears once, no operation
