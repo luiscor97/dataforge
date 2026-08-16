@@ -148,10 +148,19 @@ fn materialize_analysis_evidence(
     profile_id: &str,
     actor: Actor,
 ) -> DfResult<df_db::analysis::AnalysisCompletionSummary> {
+    // A beat after each stage. They are not uniform in cost -- pairwise tree
+    // relations dominate on a real archive -- so this is not a progress bar,
+    // it is a sign of life between the six things that take minutes each. A
+    // claim that goes silent for the whole stage reads as a dead run to anyone
+    // applying a freshness threshold, which is the case this module's own
+    // documentation names as the one such a threshold gets wrong.
     let duplicate_sets = plans::materialize_duplicate_sets(db, project_id, snapshot_id, actor)?;
+    df_db::liveness::beat(db, project_id)?;
     let structure =
         df_db::structure::compute_folder_signatures(db, project_id, snapshot_id, actor)?;
+    df_db::liveness::beat(db, project_id)?;
     let context = df_db::context::classify_folders(db, project_id, snapshot_id, profile_id, actor)?;
+    df_db::liveness::beat(db, project_id)?;
     // Pairwise relations need the signatures, so they run after them.
     let relations = df_db::structure::compute_tree_relations(
         db,
@@ -160,10 +169,13 @@ fn materialize_analysis_evidence(
         &df_db::structure::TreeRelationOptions::default(),
         actor,
     )?;
+    df_db::liveness::beat(db, project_id)?;
     // Representatives need the context penalties, so this runs last.
     let duplicate_representatives =
         df_db::dedup::score_duplicate_representatives(db, project_id, snapshot_id, actor)?;
+    df_db::liveness::beat(db, project_id)?;
     let rules = df_db::analysis::evaluate_rules(db, project_id, snapshot_id, profile_id, actor)?;
+    df_db::liveness::beat(db, project_id)?;
     let anomalies = df_db::analysis::detect_anomalies(db, project_id, snapshot_id, actor)?;
     Ok(df_db::analysis::AnalysisCompletionSummary {
         duplicate_sets,

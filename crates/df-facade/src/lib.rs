@@ -4147,6 +4147,18 @@ mod tests {
                 text.contains("liveness::release"),
                 "{crate_name} claims the project and never releases it"
             );
+            // The half this test missed the first time. Adding `claim` and
+            // `release` to verify made it pass while the stage still went
+            // silent for two hours on a real output — a claim that stops
+            // speaking reads as a dead run, which is worse than no claim.
+            // Checking two of the three verbs is checking that the claim is
+            // taken and given back, never that it is kept alive.
+            assert!(
+                text.contains("liveness::beat"),
+                "{crate_name} claims the project and never says it is still alive; \
+                 on a real archive this stage runs for hours and its heartbeat \
+                 would go stale while the run is healthy"
+            );
         }
     }
 

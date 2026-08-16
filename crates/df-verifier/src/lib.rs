@@ -247,7 +247,26 @@ pub fn verify_project(
     // Parallel content re-hash of every present file, then emit findings in
     // artefact order.
     let workers = resolve_workers(options.workers);
-    let hashed = hash_artefacts_parallel(&to_hash, workers, options.read_buffer_bytes);
+    // Chunked so the run can say it is alive. Re-hashing a real output takes
+    // hours — measured at 2h20 over 438 GB — and hashing it in one call left
+    // nothing to report progress between: the stage claimed the project and
+    // then said nothing until it finished, which is the stale-heartbeat case
+    // this module's own documentation names as the one a freshness threshold
+    // gets wrong. A claim that goes silent for hours is worse than no claim,
+    // because it reads as a dead run.
+    //
+    // The chunk is large enough that the worker pool still saturates within
+    // it; the beat costs one write per chunk, not per file.
+    const HEARTBEAT_CHUNK: usize = 4096;
+    let mut hashed: Vec<(usize, Result<String, String>)> = Vec::with_capacity(to_hash.len());
+    for lote in to_hash.chunks(HEARTBEAT_CHUNK) {
+        hashed.extend(hash_artefacts_parallel(
+            lote,
+            workers,
+            options.read_buffer_bytes,
+        ));
+        df_db::liveness::beat(db, project.id)?;
+    }
     for (index, actual) in hashed {
         let artefact = &artefacts[index];
         match (&artefact.expected_sha256, actual) {
