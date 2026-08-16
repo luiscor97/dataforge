@@ -4485,10 +4485,22 @@ mod tests {
         // No `create_plan` anywhere above: this is the whole point.
         let report = drag_scar_report(&req.project_dir).expect("report");
         assert_eq!(report.folders, 1, "{:?}", report.scars);
+        // Compared by segments rather than by a literal path, because the
+        // separator is the platform's business and not this assertion's. The
+        // literal version passed on Windows and failed on Linux against a
+        // report that had found the scar and named it correctly — the third
+        // hardcoded backslash in this feature, and the one that made working
+        // code look broken instead of the reverse.
+        let segments = |path: &str| -> Vec<String> {
+            path.split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
         let named = report
             .scars
             .iter()
-            .find(|scar| scar.relative_path.contains("EXPEDIENTES\\EXPEDIENTES"))
+            .find(|scar| segments(&scar.relative_path) == ["EXPEDIENTES", "EXPEDIENTES"])
             .unwrap_or_else(|| panic!("the report must name the branch: {:?}", report.scars));
         assert_eq!(named.contents, 2, "both contents live in the parent too");
         assert_eq!(named.occurrences, 2);
