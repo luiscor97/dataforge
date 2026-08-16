@@ -4230,6 +4230,57 @@ mod tests {
     }
 
     #[test]
+    fn validation_names_a_drag_scar_the_plan_would_place_in_the_active_tree() {
+        // The shape the whole engine exists to repair, and the one a real run
+        // reproduced in its own output: a folder inside a folder of the same
+        // name, holding nothing that is not already outside it.
+        //
+        // An agent decided COPY_ACTIVE on findings exactly like this one,
+        // reasoning the duplicate policy would then reduce them. It could not
+        // (§15.2), and 11,816 files with nothing of their own were copied into
+        // the delivered tree. Nothing about the decision was unsafe and no rule
+        // refused it — RFC-0002 has the agent propose and something
+        // deterministic verify, and this is that verification.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let scar = origin.join("EXPEDIENTES").join("EXPEDIENTES");
+        std::fs::create_dir_all(&scar).unwrap();
+        std::fs::write(origin.join("EXPEDIENTES/uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("EXPEDIENTES/dos.txt"), b"contenido dos").unwrap();
+        // The nested copy holds only what its parent already holds.
+        std::fs::write(scar.join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(scar.join("dos.txt"), b"contenido dos").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+
+        let report = validate_plan(&req.project_dir).expect("validate");
+        assert!(
+            !report.ok,
+            "a plan that places a branch holding nothing of its own must not validate clean"
+        );
+        let named = report
+            .problems
+            .iter()
+            .any(|p| p.contains("EXPEDIENTES") && p.contains("no content of its own"));
+        assert!(
+            named,
+            "the problem must name the branch: {:?}",
+            report.problems
+        );
+
+        // A problem, never a refusal: the plan is still there to approve, and
+        // a repeated folder name is deliberate in some corpora. What must not
+        // happen is approving without being told.
+        approve_plan(&req.project_dir, Actor::Test).expect("approving anyway stays possible");
+    }
+
+    #[test]
     fn a_plan_can_be_discarded_so_another_policy_can_be_tried() {
         // Found on a 444 GB archive: `plan create` produced a tree whose shape
         // was wrong, and there was no way to build a second one. `create_plan`

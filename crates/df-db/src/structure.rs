@@ -2290,3 +2290,100 @@ pub fn grafted_trees(db: &Db, snapshot_id: SnapshotId) -> DfResult<GraftedTreeRe
         grafts,
     })
 }
+
+/// A folder whose name repeats an ancestor's and that holds nothing of its own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DragScar {
+    /// Path of the repeated folder, relative to its source root.
+    pub relative_path: String,
+    /// Occurrences inside it, including its own subtree.
+    pub occurrences: u64,
+    /// Distinct contents inside it — every one of which exists outside it.
+    pub contents: u64,
+}
+
+/// Folders that are scars of a bad drag-and-drop: the name repeats an
+/// ancestor's, and every distinct content inside already exists somewhere
+/// outside the branch.
+///
+/// This is the case the archive that motivated DataForge was described by,
+/// in its owner's own words: *"en la carpeta /agentes comerciales se pueden
+/// encontrar perdidos en algún directorio el mismo árbol de carpetas fruto de
+/// arrastrar y copiar mal"*. On that corpus, 127 folders repeat an ancestor's
+/// name and **all 127** hold nothing of their own — the test does not merely
+/// correlate with the defect, it identifies it.
+///
+/// Reported, never acted on. Pruning these branches independently is not
+/// safe and was measured not to be: contents that live only inside two such
+/// branches disappear from both, and a naive prune of this very list dropped
+/// 744 contents from the tree. Deciding what to do with a scar is a decision;
+/// this function only says where they are.
+pub fn drag_scars(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<DragScar>> {
+    let mut subtree: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT o.parent_relative_path, oc.content_id
+             FROM path_occurrences o
+             JOIN occurrence_content oc ON oc.occurrence_id = o.id
+             WHERE o.snapshot_id = ?1 AND o.scan_status = 'OK'",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![snapshot_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(db_err)?;
+    for row in rows {
+        let (parent, content) = row.map_err(db_err)?;
+        let mut path = parent.as_str();
+        loop {
+            subtree
+                .entry(path.to_string())
+                .or_default()
+                .insert(content.clone());
+            *counts.entry(path.to_string()).or_default() += 1;
+            match path.rfind('\\') {
+                Some(cut) => path = &path[..cut],
+                None => break,
+            }
+        }
+    }
+
+    let mut scars = Vec::new();
+    for (path, inside) in &subtree {
+        let segments: Vec<String> = path
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect();
+        // The last segment repeating an earlier one is what a drag leaves.
+        let repeats = segments.last().is_some_and(|last| {
+            segments.len() >= 2 && segments[..segments.len() - 1].contains(last)
+        });
+        if !repeats || inside.is_empty() {
+            continue;
+        }
+        let prefix = format!("{path}\\");
+        let holds_something_of_its_own = inside.iter().any(|content| {
+            !subtree.iter().any(|(other, theirs)| {
+                other != path && !other.starts_with(&prefix) && theirs.contains(content)
+            })
+        });
+        if !holds_something_of_its_own {
+            scars.push(DragScar {
+                relative_path: path.clone(),
+                occurrences: counts.get(path).copied().unwrap_or(0),
+                contents: inside.len() as u64,
+            });
+        }
+    }
+    scars.sort_by(|a, b| {
+        b.occurrences
+            .cmp(&a.occurrences)
+            .then_with(|| a.relative_path.cmp(&b.relative_path))
+    });
+    Ok(scars)
+}
