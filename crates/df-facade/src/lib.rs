@@ -2758,11 +2758,53 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
     // nothing was lost. An exclusion is a legitimate decision; leaving it out
     // of the delivery would make the claim broader than the evidence, which is
     // the one thing this package must not do.
-    let skipped = match df_db::inventory::latest_complete_snapshot(&db, project.id)? {
+    let snapshot = df_db::inventory::latest_complete_snapshot(&db, project.id)?;
+    let skipped = match &snapshot {
         Some(snapshot) => df_db::inventory::hash_exclusions(&db, snapshot.id)?,
         None => Vec::new(),
     };
-    let not_read = if skipped.is_empty() {
+    // The claim needs its evidence read back, not assumed from the absence of
+    // exclusions. An empty exclusion list is also what a project that
+    // inventoried nothing produces, and a source root pointing at an unmounted
+    // drive inventories nothing while every stage reports success — so the
+    // sentence "everything was read" was reachable by a delivery in which
+    // nothing had been. Whatever else this package gets wrong, it must not
+    // certify work that did not happen.
+    let inventory = match &snapshot {
+        Some(snapshot) => Some(df_db::inventory::inventory_summary(&db, snapshot.id)?),
+        None => None,
+    };
+    let identified = inventory.as_ref().is_some_and(|summary| {
+        summary.files > 0
+            && summary.hash_pending == 0
+            && summary.hash_failed == 0
+            && summary.hash_source_changed == 0
+            && summary.hash_done + skipped.len() as u64 == summary.files
+    });
+    let not_read = if !identified {
+        match &inventory {
+            None => "**No completed scan is recorded for this project.** Nothing here \
+                     states that the origin was read."
+                .to_string(),
+            Some(summary) if summary.files == 0 => "**The origin contributed no files to this \
+                 delivery.** A source root that is registered but empty — an unmounted volume, a \
+                 remapped drive letter, a moved mount point — produces exactly this, and every \
+                 stage still reports success. Confirm the origin before treating this package as \
+                 a record of anything."
+                .to_string(),
+            Some(summary) => format!(
+                "**{} of {} inventoried files carry a hash here**, and {} were deliberately not \
+                 read. The rest are pending ({}), failed ({}) or changed under the scan ({}), so \
+                 this package does not state that the origin was read in full.",
+                summary.hash_done,
+                summary.files,
+                skipped.len(),
+                summary.hash_pending,
+                summary.hash_failed,
+                summary.hash_source_changed
+            ),
+        }
+    } else if skipped.is_empty() {
         "Everything in the origin was read and identified by hash.".to_string()
     } else {
         let mut counts: std::collections::BTreeMap<&str, (u64, &str)> =
@@ -4792,6 +4834,57 @@ mod tests {
         // With the rule's own words, so the reader can judge the decision
         // rather than only learn that one was taken.
         assert!(summary.contains("navigation data, not case material"));
+    }
+
+    #[test]
+    fn a_delivery_from_an_empty_origin_certifies_nothing() {
+        // The failure this exists for is not exotic. A registered source root
+        // that resolves to nothing — an unmounted volume, a drive letter
+        // pointing somewhere else today, a network share remapped to a local
+        // placeholder — is the ordinary accident on the hardware a large
+        // archive lives on. Every stage then succeeds on zero work: the scan
+        // completes, the hash enqueues nothing, the analysis seals a summary
+        // of zeros, the plan holds one directory, verification re-checks that
+        // directory and returns COMPLETED.
+        //
+        // The delivery package used to conclude from an empty exclusion list
+        // that nothing had been skipped, and state that the origin had been
+        // read in full. An empty archive produces the same empty list, so the
+        // strongest claim the document makes was reachable by a run in which
+        // nothing was read at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen-que-no-esta");
+        std::fs::create_dir_all(&origin).unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+        approve_plan(&req.project_dir, Actor::Test).expect("approve");
+
+        let package = export_delivery_package(&req.project_dir).expect("exported");
+        let summary =
+            std::fs::read_to_string(std::path::Path::new(&package.directory).join("delivery.md"))
+                .expect("summary");
+
+        assert!(
+            !summary.contains("Everything in the origin was read"),
+            "a delivery that read nothing must not claim it read everything: {summary}"
+        );
+        assert!(
+            summary.contains("contributed no files"),
+            "the delivery must say the origin gave it nothing: {summary}"
+        );
+        // Naming the cause, because the recipient of this document is not the
+        // person who chose the source root and cannot otherwise tell an empty
+        // archive from a mistyped one.
+        assert!(
+            summary.contains("unmounted volume"),
+            "the delivery must name the likely cause: {summary}"
+        );
     }
 
     /// Count CSV fields honouring quoting.
