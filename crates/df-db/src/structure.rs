@@ -1183,6 +1183,93 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_root_dropped_into_another_tree_is_found_and_the_ancestor_rule_is_blind_to_it() {
+        // The shape is taken from the audited archive, where the human
+        // classification named 131 such groups over 135.378 files and the
+        // largest single one was a top-level `AGENTES COMERCIALES` sitting
+        // inside `BANCO SANTANDER FINANCIACION`: 18.237 files, 16 GB, all but
+        // thirteen of them byte-identical to a copy outside.
+        let mut db = Db::open_in_memory().unwrap();
+        let (_project_id, s) = seed(&mut db);
+        let one = "a".repeat(64);
+        let two = "b".repeat(64);
+
+        // The canonical root, and the same tree grafted into another one. No
+        // ancestor of the graft repeats anything: `BANCO` is not `AGENTES`.
+        add_file(&db, &s, "AGENTES", "contrato.pdf", Some(&one));
+        add_file(&db, &s, "AGENTES", "anexo.pdf", Some(&two));
+        add_file(&db, &s, "BANCO/AGENTES", "contrato.pdf", Some(&one));
+        add_file(&db, &s, "BANCO/AGENTES", "anexo.pdf", Some(&two));
+
+        // A folder that merely shares a name with a top-level one and holds
+        // its own material. Same name signal, opposite conclusion.
+        add_file(&db, &s, "IMAGENES", "foto.jpg", Some(&"c".repeat(64)));
+        add_file(
+            &db,
+            &s,
+            "ABOGADOS/IMAGENES",
+            "pericial.jpg",
+            Some(&"d".repeat(64)),
+        );
+
+        let grafts = grafted_roots(&db, s.snapshot).unwrap();
+        let named = |path: &str| grafts.iter().find(|g| g.relative_path == path);
+
+        let graft = named("BANCO/AGENTES").unwrap_or_else(|| {
+            panic!("the grafted root must be found: {grafts:?}");
+        });
+        assert_eq!(graft.canonical_root, "agentes");
+        assert_eq!(graft.contents, 2);
+        assert_eq!(
+            graft.contents_only_here, 0,
+            "every content under the graft also lives outside it"
+        );
+
+        // Reported, not judged: the coincidence appears too, and the number
+        // that separates it from the graft is the one that matters.
+        let coincidence = named("ABOGADOS/IMAGENES").unwrap_or_else(|| {
+            panic!("a same-named folder must still be reported: {grafts:?}");
+        });
+        assert_eq!(coincidence.contents, 1);
+        assert_eq!(
+            coincidence.contents_only_here, 1,
+            "this branch is the only home of its content and pruning it would lose it"
+        );
+
+        // And the point of the whole detector: the earlier rule sees neither,
+        // because no ancestor of either path repeats a name.
+        let scars = drag_scars(&db, s.snapshot).unwrap();
+        assert!(
+            scars.is_empty(),
+            "the ancestor rule is blind to this shape, which is why it missed \
+             58,7% of the real candidates: {scars:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_outermost_branch_of_a_nested_graft_is_reported() {
+        // Three levels of the same tree, the case the audit recorded verbatim:
+        // `AGENTES COMERCIALES\...`, then again inside itself, then a third
+        // time. It is one accident, and naming each level again buries it.
+        let mut db = Db::open_in_memory().unwrap();
+        let (_project_id, s) = seed(&mut db);
+        let sha = "e".repeat(64);
+        add_file(&db, &s, "AGENTES", "escrito.pdf", Some(&sha));
+        add_file(&db, &s, "AGENTES/AGENTES", "escrito.pdf", Some(&sha));
+        add_file(
+            &db,
+            &s,
+            "AGENTES/AGENTES/AGENTES",
+            "escrito.pdf",
+            Some(&sha),
+        );
+
+        let grafts = grafted_roots(&db, s.snapshot).unwrap();
+        let paths: Vec<&str> = grafts.iter().map(|g| g.relative_path.as_str()).collect();
+        assert_eq!(paths, vec!["AGENTES/AGENTES"], "got {grafts:?}");
+    }
+
+    #[test]
     fn public_relation_summary_and_event_report_a_real_generation_cutoff() {
         let mut db = Db::open_in_memory().unwrap();
         let (project_id, s) = seed(&mut db);
@@ -2321,14 +2408,29 @@ pub fn grafted_trees(db: &Db, snapshot_id: SnapshotId) -> DfResult<GraftedTreeRe
 /// would have caught it, and the failure surfaced as a passing validation
 /// rather than as an error.
 fn repeats_an_ancestor_name(path: &str) -> bool {
-    let segments: Vec<String> = path
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect();
+    let segments = path_segments(path);
     segments
         .last()
         .is_some_and(|last| segments.len() >= 2 && segments[..segments.len() - 1].contains(last))
+}
+
+/// Lowercased segments of a relative path, either separator, no empties.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Whether `path` lies strictly inside `branch`.
+///
+/// Compared segment by segment rather than by string prefix. A prefix test
+/// answers yes for `EXPEDIENTES-2024` inside `EXPEDIENTES`, and a prefix test
+/// that appends a separator answers no wherever paths carry the other one —
+/// both of which have shipped from this file.
+fn lies_inside(path: &str, branch: &str) -> bool {
+    let (path, branch) = (path_segments(path), path_segments(branch));
+    path.len() > branch.len() && path.starts_with(&branch)
 }
 
 /// A folder whose name repeats an ancestor's and that holds nothing of its own.
@@ -2423,4 +2525,135 @@ pub fn drag_scars(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<DragScar>> {
             .then_with(|| a.relative_path.cmp(&b.relative_path))
     });
     Ok(scars)
+}
+
+/// A branch whose name repeats one of the archive's own top-level folders.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraftedRoot {
+    /// Path of the grafted branch, relative to its source root.
+    pub relative_path: String,
+    /// The top-level folder whose name it repeats.
+    pub canonical_root: String,
+    /// Occurrences inside it, including its own subtree.
+    pub occurrences: u64,
+    /// Distinct contents inside it.
+    pub contents: u64,
+    /// Of those, how many exist **nowhere** outside this branch.
+    ///
+    /// This is the number that tells a graft from a coincidence, and it is
+    /// why the detector reports rather than proposes. Zero means every byte
+    /// under here is also somewhere else. Anything above zero means the
+    /// branch is the only home of something.
+    pub contents_only_here: u64,
+}
+
+/// Branches carrying the name of a top-level folder of the same archive.
+///
+/// The other shape of a bad drag-and-drop, and the common one. [`drag_scars`]
+/// finds a folder repeating an **ancestor's** name — `AGENTES COMERCIALES\
+/// AGENTES COMERCIALES`. This finds a whole root dropped inside a different
+/// tree — `BANCO SANTANDER FINANCIACION\AGENTES COMERCIALES` — where no
+/// ancestor repeats anything and the earlier rule is blind.
+///
+/// Measured against the audited human classification of the archive that
+/// motivated DataForge, which labelled 131 such groups over 135.378 files:
+/// the ancestor rule alone finds 18 of the 131 and leaves 79.403 files
+/// unseen, 58,7% of the candidates. Matching against the top-level names
+/// finds all 131.
+///
+/// Name alone is not evidence, so it is not reported alone. A folder called
+/// `img` inside a case folder shares its name with a top-level `img` and is
+/// usually nothing; on that corpus 47 of 179 branches held mostly content of
+/// their own and were coincidences, while 114 held none at all. That is what
+/// `contents_only_here` is for, and why nothing here is a recommendation.
+///
+/// Only the outermost branch of a nest is reported. A graft inside a graft is
+/// one accident, and naming its children again buries the finding.
+pub fn grafted_roots(db: &Db, snapshot_id: SnapshotId) -> DfResult<Vec<GraftedRoot>> {
+    let mut homes: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut occurrences: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut top_level: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut folders: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT o.parent_relative_path, oc.content_id
+             FROM path_occurrences o
+             JOIN occurrence_content oc ON oc.occurrence_id = o.id
+             WHERE o.snapshot_id = ?1 AND o.scan_status = 'OK'",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![snapshot_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(db_err)?;
+    for row in rows {
+        let (parent, content) = row.map_err(db_err)?;
+        homes.entry(content).or_default().insert(parent.clone());
+        // Credit every ancestor, so a branch counts what its subtree holds.
+        let segments = path_segments(&parent);
+        if let Some(first) = segments.first() {
+            top_level.insert(first.clone());
+        }
+        let mut path = parent.as_str();
+        loop {
+            *occurrences.entry(path.to_string()).or_default() += 1;
+            folders.insert(path.to_string());
+            match path.rfind(['/', '\\']) {
+                Some(cut) => path = &path[..cut],
+                None => break,
+            }
+        }
+    }
+
+    let mut candidates: Vec<String> = folders
+        .iter()
+        .filter(|path| {
+            let segments = path_segments(path);
+            segments.len() >= 2 && top_level.contains(&segments[segments.len() - 1])
+        })
+        .cloned()
+        .collect();
+    candidates.sort();
+    let outermost: Vec<String> = candidates
+        .iter()
+        .filter(|path| !candidates.iter().any(|other| lies_inside(path, other)))
+        .cloned()
+        .collect();
+
+    let mut grafts = Vec::new();
+    for branch in outermost {
+        let inside = |path: &str| path == branch || lies_inside(path, &branch);
+        let mut contents = 0u64;
+        let mut only_here = 0u64;
+        for places in homes.values() {
+            if !places.iter().any(|place| inside(place)) {
+                continue;
+            }
+            contents += 1;
+            if places.iter().all(|place| inside(place)) {
+                only_here += 1;
+            }
+        }
+        if contents == 0 {
+            continue;
+        }
+        let segments = path_segments(&branch);
+        grafts.push(GraftedRoot {
+            canonical_root: segments[segments.len() - 1].clone(),
+            occurrences: occurrences.get(&branch).copied().unwrap_or(0),
+            relative_path: branch,
+            contents,
+            contents_only_here: only_here,
+        });
+    }
+    grafts.sort_by(|a, b| {
+        b.contents
+            .cmp(&a.contents)
+            .then_with(|| a.relative_path.cmp(&b.relative_path))
+    });
+    Ok(grafts)
 }
