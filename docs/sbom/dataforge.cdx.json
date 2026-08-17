@@ -23,7 +23,7 @@
       },
       {
         "name": "dataforge:component-count",
-        "value": "794"
+        "value": "795"
       }
     ]
   },
@@ -639,7 +639,7 @@
     {
       "type": "library",
       "name": "arrow-schema",
-      "version": "58.3.0",
+      "version": "58.4.0",
       "scope": "required",
       "description": "Defines the logical types for arrow arrays",
       "licenses": [
@@ -647,7 +647,26 @@
           "expression": "Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/arrow-schema@58.3.0",
+      "purl": "pkg:cargo/arrow-schema@58.4.0",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://crates.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-schema",
+      "version": "59.2.0",
+      "scope": "required",
+      "description": "Defines the logical types for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/arrow-schema@59.2.0",
       "externalReferences": [
         {
           "type": "distribution",
