@@ -446,6 +446,20 @@ pub fn validate_plan(db: &Db) -> DfResult<PlanValidationReport> {
     })
 }
 
+/// Does this planned destination sit inside `folder`?
+///
+/// A pure function with its own test because the first version hardcoded the
+/// backslash, and fixing only the detector moved the fault instead of removing
+/// it: the scar was found and then compared against nothing, so the invariant
+/// still reported a clean plan wherever paths carry `/`. One hardcoded
+/// separator is a bug; the same one twice in the same feature is a habit.
+///
+/// Matched as a path prefix and not as a substring, so `EXPEDIENTES-2024`
+/// never counts as being inside `EXPEDIENTES`.
+fn destination_falls_inside(destination: &str, folder: &str) -> bool {
+    destination.contains(&format!("{folder}\\")) || destination.contains(&format!("{folder}/"))
+}
+
 /// Branches that are drag-and-drop scars and that this plan would nonetheless
 /// place in the active tree.
 ///
@@ -479,14 +493,13 @@ fn drag_scars_placed_in_the_active_tree(
         // active tree when an operation lands inside it without a bucket
         // prefix. Matching on the destination is deliberate: it is what the
         // plan actually promises to create.
-        let inside = format!("{}\\", scar.relative_path);
         let placed = operations
             .iter()
             .filter(|op| op.operation_type == OperationType::CopyActive)
             .filter(|op| {
                 op.destination_relative_path
                     .as_deref()
-                    .is_some_and(|d| d.contains(&inside))
+                    .is_some_and(|d| destination_falls_inside(d, &scar.relative_path))
             })
             .count();
         if placed > 0 {
@@ -1597,6 +1610,32 @@ fn validate_operations(operations: &[PlanOperation]) -> DfResult<()> {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_destination_falls_inside_a_folder_under_either_separator() {
+        // The fault this pins twice over: hardcoding the backslash made the
+        // scar invariant compare a found scar against nothing wherever paths
+        // carry `/`, so a plan full of redundant branches validated clean on
+        // the platform whose CI was blocking.
+        for destination in [
+            "EXPEDIENTES\\EXPEDIENTES\\a.txt",
+            "EXPEDIENTES/EXPEDIENTES/a.txt",
+            "raiz\\EXPEDIENTES\\sub\\a.txt",
+        ] {
+            assert!(
+                super::destination_falls_inside(destination, "EXPEDIENTES"),
+                "{destination}"
+            );
+        }
+        // A prefix of a name is not the name: a sibling folder whose name
+        // merely starts the same must never be reported as inside it.
+        for destination in ["EXPEDIENTES-2024\\a.txt", "EXPEDIENTES", "otra\\a.txt"] {
+            assert!(
+                !super::destination_falls_inside(destination, "EXPEDIENTES"),
+                "{destination}"
+            );
+        }
+    }
 
     use df_domain::{ProfileRef, Project, SnapshotId, SourceRoot};
     use df_hash::{hash_project, HashOptions};
