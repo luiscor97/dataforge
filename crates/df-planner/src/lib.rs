@@ -930,6 +930,7 @@ fn portable_relative_path(
             "inventory path `{relative}` has no usable components"
         )));
     }
+    let components = collapse_adjacent_repeats(components);
     Ok((
         components
             .iter()
@@ -938,6 +939,47 @@ fn portable_relative_path(
             .to_string(),
         encoded,
     ))
+}
+
+/// Drop a path component that only repeats the one immediately before it.
+///
+/// `AGENTES COMERCIALES\AGENTES COMERCIALES\NATALIA\escrito.pdf` becomes
+/// `AGENTES COMERCIALES\NATALIA\escrito.pdf`. The audited archive carries 76
+/// distinct places where this happened and 3.453 paths under them, and the
+/// first thing its owner checked in a delivered tree was whether the doubled
+/// folder had been reproduced. It had.
+///
+/// This is a *rename of the destination*, not a prune of the source, and the
+/// distinction is the whole reason it is safe to do automatically. Pruning a
+/// redundant branch was measured to lose content — 744 contents vanished from
+/// a naive attempt — because two branches can be each other's only copy.
+/// Collapsing a repeated component moves nothing and deletes nothing: the
+/// plan simply writes the same occurrence one level higher in a tree that did
+/// not exist before. Every occurrence still gets exactly one destination, and
+/// when two of them now land on the same path the existing collision handling
+/// gives the second one a suffix rather than overwriting the first.
+///
+/// Runs of any length collapse to one, and the comparison ignores case
+/// because Windows does.
+///
+/// Left alone: components that are numeric or very short. `2020\2020` and
+/// `v2\v2` are how versioned and dated material is legitimately nested, and
+/// the archive's own history includes a repetition that turned out to be a
+/// folder of taxpayers per person rather than an accident. When the signal is
+/// this cheap, the conservative half of it is worth keeping.
+fn collapse_adjacent_repeats(components: Vec<String>) -> Vec<String> {
+    let mut collapsed: Vec<String> = Vec::with_capacity(components.len());
+    for component in components {
+        let repeats_previous = collapsed.last().is_some_and(|previous: &String| {
+            previous.eq_ignore_ascii_case(&component)
+                && component.chars().count() > 2
+                && !component.chars().all(|c| c.is_ascii_digit())
+        });
+        if !repeats_previous {
+            collapsed.push(component);
+        }
+    }
+    collapsed
 }
 
 fn root_destination_dirs(
@@ -1246,7 +1288,19 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
         };
         if let Some(dest) = &destination {
             taken_destinations.insert(dest.to_lowercase());
-            directory_destinations.insert(dest.to_lowercase());
+            // Two source folders can now share one destination, because a
+            // component that only repeats the one before it is collapsed:
+            // `EXPEDIENTES` and `EXPEDIENTES\EXPEDIENTES` both land on
+            // `EXPEDIENTES`. A directory is created once — the second
+            // operation would carry the same idempotency key as the first,
+            // which the database refuses, and rightly: it is the same act.
+            //
+            // Files are unaffected. Each one keeps its own occurrence in the
+            // key, and two colliding files still resolve through the suffix
+            // path rather than through this one.
+            if !directory_destinations.insert(dest.to_lowercase()) {
+                continue;
+            }
         }
         operations.push(PlanOperation {
             id: df_domain::OperationId::new(),
@@ -2258,6 +2312,78 @@ mod tests {
         // Coverage still holds: the blocked occurrence is in the plan.
         let report = validate_plan(&db).unwrap();
         assert!(report.ok, "{:?}", report.problems);
+    }
+
+    #[test]
+    fn a_folder_repeated_in_place_is_not_reproduced_in_the_destination() {
+        // The first thing the archive's owner did with a delivered tree was
+        // open `AGENTES COMERCIALES` and find `AGENTES COMERCIALES` inside it
+        // again, exactly as in the origin. The engine had mirrored the
+        // accident faithfully, which is the one thing a reconstruction should
+        // not be faithful about.
+        let collapse = |parts: &[&str]| -> Vec<String> {
+            collapse_adjacent_repeats(parts.iter().map(|s| s.to_string()).collect())
+        };
+
+        assert_eq!(
+            collapse(&["AGENTES COMERCIALES", "AGENTES COMERCIALES", "NATALIA"]),
+            vec!["AGENTES COMERCIALES", "NATALIA"]
+        );
+        // Three levels of the same tree is one accident, not three.
+        assert_eq!(
+            collapse(&["AGENTES", "AGENTES", "AGENTES", "NATALIA"]),
+            vec!["AGENTES", "NATALIA"]
+        );
+        // Case-insensitive, because the filesystem this runs on is.
+        assert_eq!(
+            collapse(&["Expedientes", "EXPEDIENTES", "1234"]),
+            vec!["Expedientes", "1234"]
+        );
+        // Only *adjacent* repeats. A name reappearing further down is a
+        // grafted root, which is a different finding with its own report and
+        // its own evidence, and is not something a namer may decide.
+        assert_eq!(
+            collapse(&["EXPEDIENTES", "CLIENTE", "EXPEDIENTES"]),
+            vec!["EXPEDIENTES", "CLIENTE", "EXPEDIENTES"]
+        );
+        // Numeric and very short components are how dated and versioned
+        // material nests legitimately.
+        assert_eq!(
+            collapse(&["2020", "2020", "actas"]),
+            vec!["2020", "2020", "actas"]
+        );
+        assert_eq!(collapse(&["v2", "v2", "plano"]), vec!["v2", "v2", "plano"]);
+    }
+
+    #[test]
+    fn collapsing_a_repeated_folder_never_costs_a_content() {
+        // The property that makes this safe to do without asking. Two
+        // occurrences whose destinations now coincide must both survive: one
+        // keeps the path, the other gets a suffix. Nothing is overwritten and
+        // nothing is dropped — which is exactly what a *prune* of the same
+        // branches could not promise, and did not deliver when it was tried.
+        let planned = "salida\\AGENTES\\escrito.pdf";
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            taken.insert(planned.to_lowercase()),
+            "the first occurrence takes the collapsed path"
+        );
+        assert!(
+            !taken.insert(planned.to_lowercase()),
+            "the second one finds it taken rather than silently replacing it"
+        );
+
+        let a = suffixed_destination(planned, &first);
+        let b = suffixed_destination(planned, &second);
+        assert_ne!(a, b, "different content must not share a destination");
+        assert_ne!(a, planned);
+        assert!(
+            a.ends_with(".pdf") && b.ends_with(".pdf"),
+            "the suffix keeps the extension so the delivered file still opens: {a}, {b}"
+        );
     }
 
     #[test]

@@ -4503,13 +4503,24 @@ mod tests {
         // the delivered tree. Nothing about the decision was unsafe and no rule
         // refused it — RFC-0002 has the agent propose and something
         // deterministic verify, and this is that verification.
+        // The branch here is deliberately *not* adjacent to the name it
+        // repeats. The adjacent shape — `EXPEDIENTES\EXPEDIENTES` — no longer
+        // reaches a plan at all: the namer collapses a component that only
+        // repeats the one before it, so there is nothing left for this
+        // invariant to catch. That case is covered where it is now prevented,
+        // in `df-planner`. What survives, and what this guards, is the graft
+        // that lands further down, where collapsing would be a guess about
+        // structure rather than a rename.
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
-        let scar = origin.join("EXPEDIENTES").join("EXPEDIENTES");
+        let scar = origin
+            .join("EXPEDIENTES")
+            .join("CLIENTE")
+            .join("EXPEDIENTES");
         std::fs::create_dir_all(&scar).unwrap();
-        std::fs::write(origin.join("EXPEDIENTES/uno.txt"), b"contenido uno").unwrap();
-        std::fs::write(origin.join("EXPEDIENTES/dos.txt"), b"contenido dos").unwrap();
-        // The nested copy holds only what its parent already holds.
+        std::fs::write(origin.join("EXPEDIENTES").join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("EXPEDIENTES").join("dos.txt"), b"contenido dos").unwrap();
+        // The nested copy holds only what its ancestor already holds.
         std::fs::write(scar.join("uno.txt"), b"contenido uno").unwrap();
         std::fs::write(scar.join("dos.txt"), b"contenido dos").unwrap();
 
@@ -4534,6 +4545,66 @@ mod tests {
             named,
             "the problem must name the branch: {:?}",
             report.problems
+        );
+    }
+
+    #[test]
+    fn the_delivered_tree_does_not_repeat_a_folder_inside_itself() {
+        // The complaint that started this, in the archive owner's words after
+        // opening a delivered tree: "siguen existiendo AGENTES COMERCIALES\
+        // AGENTES COMERCIALES". The engine had mirrored the source faithfully,
+        // including the accident. Its own audit of the archive found 76 places
+        // where a folder sits directly inside a folder of the same name, with
+        // 3.453 paths beneath them.
+        //
+        // Prevented rather than reported, because writing the destination one
+        // level higher is a rename in a tree that does not exist yet — it
+        // moves nothing and deletes nothing, unlike pruning the branch, which
+        // was measured to lose 744 contents when it was tried.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let doubled = origin.join("EXPEDIENTES").join("EXPEDIENTES");
+        std::fs::create_dir_all(&doubled).unwrap();
+        std::fs::write(origin.join("EXPEDIENTES").join("fuera.txt"), b"de fuera").unwrap();
+        // Held only by the doubled branch: it must still arrive, one level up.
+        std::fs::write(doubled.join("dentro.txt"), b"solo aqui dentro").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+
+        let tree = plan_destination_tree(&req.project_dir, 6).expect("tree");
+        // Segment-wise. A substring test would answer yes for `EXPEDIENTES-2024`
+        // inside `EXPEDIENTES`, and a separator-joined one would answer no on
+        // whichever platform spells it the other way — both have shipped from
+        // this repository, in the same week.
+        for node in &tree.nodes {
+            let segments: Vec<String> = node
+                .prefix
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .map(str::to_lowercase)
+                .collect();
+            for pair in segments.windows(2) {
+                assert_ne!(
+                    pair[0], pair[1],
+                    "the delivered tree repeats a folder inside itself: {}",
+                    node.prefix
+                );
+            }
+        }
+
+        // And the content that lived only in the doubled branch is still
+        // planned. Collapsing a name must never cost a file.
+        assert!(
+            tree.files >= 2,
+            "both files must still be planned, got {} in {:?}",
+            tree.files,
+            tree.nodes
         );
 
         // A problem, never a refusal: the plan is still there to approve, and
