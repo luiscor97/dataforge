@@ -206,7 +206,7 @@ el trabajo original no resolvió se deja pendiente, no se inventa por simetría.
 | --- | --- | --- | --- |
 | Un representante por grupo de clones exactos, elegido por profundidad, nombre, ruta y antigüedad | turno 736 | `plan create --duplicate-policy CONSOLIDATE_ALL` | intención sí, efecto **no** |
 | El destino conserva la estructura relativa del representante | turno 980 | comportamiento por defecto del planner | sí |
-| Un archivo duplicado cuyo uso está dentro de un expediente **no** se consolida | turno 1302 | regla 9, fronteras protegidas | **no dispara** |
+| Un archivo duplicado cuyo uso está dentro de un expediente **no** se consolida | turno 1302 | regla 9, fronteras protegidas | implementado y probado; **no se activó** en el run (perfil `generic`) |
 | Media, entretenimiento y material técnico se aíslan, no se borran | turno 272 | perfil + `95_Separated` | sí |
 | Árboles embebidos y parciales: se colocan ambos lados | turnos 736 + 1302 | `review decide-batch` → `COPY_ACTIVE` | sí |
 | Rutas de 240+ caracteres se conservan | informe final | `review decide-batch` → `COPY_ACTIVE` | sí |
@@ -222,10 +222,63 @@ frontera protegida.
 
 Así que las dos mitades del criterio humano faltan a la vez y por causas
 distintas: no puede consolidar —§15.2 se lo prohíbe sin clasificación— y no
-tiene nada que proteger —el perfil está vacío—. No es un fallo de código. Es un
-perfil que nadie ha escrito, y es lo que un perfil `asesoria-juridica` con
-fronteras protegidas y categorías de material no documental resolvería
-(ADR-0026: los perfiles se compilan, así que es un cambio con su ADR).
+tiene nada que proteger —el perfil está vacío—.
+
+#### Corrección del 2026-08-17: el perfil sí estaba escrito
+
+Este apartado decía a continuación que no era un fallo de código sino «un perfil
+que nadie ha escrito». **Es falso, y conviene dejarlo escrito en vez de
+borrarlo,** porque el error que lo produjo es más interesante que el apartado.
+
+`profiles/legal/profile.json` existe en el repositorio y declara exactamente los
+marcadores que este documento pedía: `expediente`, `expedientes`, `exp`,
+`pericial`, `periciales`, con `match: "prefix"` para que `Expediente 1234-2020`
+entre y `expediente` no se coma a otra cosa. `df_domain::Profile::classify()` lo
+consume, `classify_folders()` en `df-db` persiste `is_protected_boundary`, y
+`df-planner` cuenta el resultado en `protected_boundaries`. La cadena entera
+estaba montada.
+
+Y probada de punta a punta:
+`crates/df-planner/tests/m02_legal_profile.rs` monta un corpus, lo escanea, lo
+hashea, lo analiza bajo el perfil `legal`, afirma `protected_boundaries == 2` y
+comprueba que una consolidación agresiva **no** las disuelve, con la evidencia
+de cada frontera. El test se llama, literalmente,
+`legal_boundaries_survive_aggressive_consolidation_with_explainable_evidence`, y
+lleva verde todo este tiempo.
+
+Lo que faltó fue **elegirlo**:
+
+```
+--profile  [default: generic]
+```
+
+El run se lanzó sin `--profile legal`. Quince horas de trabajo con el perfil
+vacío, `Protected bounds: 0`, y ninguna etapa dijo nada: no hubo error, no hubo
+aviso, la verificación pasó limpia y el resultado era estructuralmente
+equivocado. El diagnóstico de este documento —«falta escribir el perfil»— se
+dedujo del síntoma sin abrir `profiles/`.
+
+El fallo real, entonces, no es una pieza que falte. Es que **equivocarse de
+perfil es silencioso**, y ese silencio es lo que impide operar sin humano
+delante: un agente conduciendo DataForge no recibe ninguna señal de que eligió
+mal. Un perfil de dominio más fino sigue teniendo sentido —el `legal` actual no
+cubre las categorías de material no documental— pero es una mejora, no la causa.
+
+Hay una lección de método debajo, y es la que vuelve a aparecer cada vez que
+algo sale mal en este proyecto: **el diagnóstico se dedujo del síntoma sin
+abrir el directorio.** `Protected bounds: 0` admitía dos explicaciones —no hay
+perfil, o no se eligió el perfil— y este documento escogió una y la escribió
+como hecho. Un `ls profiles/` la habría descartado en un segundo.
+
+Es el mismo fallo, en otro plano, que los tres separadores hardcodeados de la
+semana pasada: dos de ellos se «arreglaron» razonando sobre la causa en vez de
+leer el log que ya estaba disponible. Razonar sobre la causa probable es más
+rápido que comprobarla, y por eso se elige; en las tres ocasiones salió más
+caro.
+
+El silencio se persigue como defecto propio, junto con las demás rutas que
+llevan a un resultado equivocado sin queja, en
+[silent-wrongness-audit.md](../silent-wrongness-audit.md).
 
 ### El banco: puntuar un criterio sin ejecutar nada
 
