@@ -420,6 +420,16 @@ pub struct ContentSearchOutcome {
     pub index: SearchIndexView,
     pub query: String,
     pub hits: Vec<SearchHit>,
+    /// Documents matching the query, not the number returned.
+    ///
+    /// Without it a caller asking whether the archive mentions a counterparty
+    /// received the default twenty rows, all from wherever scored highest,
+    /// and could not tell that from the complete answer.
+    pub total: usize,
+    /// Whether anything matched past this window. `df-tools` states the rule
+    /// this restores: a truncation the caller cannot detect is not
+    /// pagination, it is a wrong answer that looks like a right one.
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2040,6 +2050,16 @@ fn resolve_completed_extraction_run(
     Ok(run)
 }
 
+/// Whether the query matched anything past the window just returned.
+///
+/// Its own function because it is the only part of the count that this crate
+/// computes, and an off-by-one here reports a complete answer as partial or,
+/// worse, a partial one as complete. Saturating because `offset` is caller
+/// input and a bounded search must not depend on it being sane.
+fn more_remains(offset: usize, returned: usize, total: usize) -> bool {
+    offset.saturating_add(returned) < total
+}
+
 fn search_index_view(record: &SearchIndexRecord) -> SearchIndexView {
     SearchIndexView {
         id: record.id.to_string(),
@@ -2128,11 +2148,15 @@ pub fn search_project_content(
             "the extraction run has no search index; run `content build` first".to_string(),
         )
     })?;
-    let hits = df_search::search_index(&project_dir, &index, request)?;
+    let results = df_search::search_index(&project_dir, &index, request)?;
+    let has_more = more_remains(request.offset, results.hits.len(), results.total);
+    let hits = results.hits;
     Ok(ContentSearchOutcome {
         run_id: run.id.to_string(),
         index: search_index_view(&index),
         query: request.query.clone(),
+        total: results.total,
+        has_more,
         hits,
     })
 }
@@ -4891,6 +4915,38 @@ mod tests {
         // With the rule's own words, so the reader can judge the decision
         // rather than only learn that one was taken.
         assert!(summary.contains("navigation data, not case material"));
+    }
+
+    #[test]
+    fn a_search_window_says_whether_anything_lies_past_it() {
+        // The defect this restores: `content_search` returned its window and
+        // nothing else, under a default limit of twenty. A question that a
+        // legal archive exists to answer — does this material mention the
+        // counterparty — came back with twenty rows out of three thousand,
+        // all from wherever scored highest, and the caller could not tell
+        // that from the whole answer. `df-tools` already states the rule
+        // this obeys: a truncation the caller cannot detect is not
+        // pagination, it is a wrong answer that looks like a right one.
+        assert!(more_remains(0, 20, 3400), "the truncated case");
+        assert!(!more_remains(0, 20, 20), "an exact window is complete");
+        assert!(!more_remains(0, 7, 7), "a short window is complete");
+        assert!(more_remains(20, 20, 41), "an offset window with one left");
+        assert!(
+            !more_remains(20, 20, 40),
+            "an offset window that ends exactly"
+        );
+        assert!(
+            !more_remains(100, 0, 40),
+            "an offset past the end has nothing after it"
+        );
+        assert!(
+            !more_remains(0, 0, 0),
+            "no matches at all is not a truncation"
+        );
+        // `offset` is caller input, and a bounded search must not depend on
+        // it being sane: overflowing here would wrap to a small number and
+        // report a complete answer as having more.
+        assert!(!more_remains(usize::MAX, 5, 10), "saturating, not wrapping");
     }
 
     #[test]

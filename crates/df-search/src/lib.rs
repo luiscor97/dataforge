@@ -18,7 +18,7 @@ use df_error::{DfError, DfResult};
 use df_fs_safety::{metadata_is_reparse, ReadLease, SafeOutputRoot, SafeRelativePath};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, TantivyDocument, Value, STORED, STRING, TEXT};
 use tantivy::snippet::SnippetGenerator;
@@ -389,11 +389,23 @@ fn registered_index_artifact(
 
 /// Search a registered artifact after verifying its schema, safe path and
 /// complete directory digest.
+/// Hits for one window, and how many documents the query actually matched.
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    /// The window the caller asked for.
+    pub hits: Vec<SearchHit>,
+    /// Documents matching the query across the whole index, which is not the
+    /// number returned. Tantivy knows this and the previous signature threw
+    /// it away, so a caller that asked "does this archive mention X" received
+    /// twenty rows and no way to learn there were three thousand.
+    pub total: usize,
+}
+
 pub fn search_index(
     artifact_root: &Path,
     artifact: &SearchIndexRecord,
     request: &SearchRequest,
-) -> DfResult<Vec<SearchHit>> {
+) -> DfResult<SearchResults> {
     request.validate()?;
     // The directory and every indexed file stay leased for this whole scope.
     // Tantivy may reopen by path, but Windows sharing rules prevent a writer
@@ -424,19 +436,24 @@ pub fn search_index(
     let query = parser
         .parse_query(request.query.trim())
         .map_err(|error| DfError::Validation(format!("invalid search query: {error}")))?;
-    let top_docs = searcher
+    // Counted in the same pass as the window. This is the number that turns a
+    // short answer into an honest one, and the index already had it.
+    let (top_docs, total) = searcher
         .search(
             &query,
-            &TopDocs::with_limit(request.limit)
-                .and_offset(request.offset)
-                .order_by_score(),
+            &(
+                TopDocs::with_limit(request.limit)
+                    .and_offset(request.offset)
+                    .order_by_score(),
+                Count,
+            ),
         )
         .map_err(|error| tantivy_error("query execution", error))?;
     let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, fields.text)
         .map_err(|error| tantivy_error("snippet creation", error))?;
     snippet_generator.set_max_num_chars(request.snippet_chars);
 
-    let hits = top_docs
+    let hits: DfResult<Vec<SearchHit>> = top_docs
         .into_iter()
         .map(|(score, address)| {
             let document = searcher
@@ -467,7 +484,7 @@ pub fn search_index(
         })
         .collect();
     drop(locked);
-    hits
+    Ok(SearchResults { hits: hits?, total })
 }
 
 fn fields_from_schema(schema: &Schema) -> DfResult<SearchFields> {
