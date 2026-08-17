@@ -11,6 +11,10 @@
 //! reviewable data, not code. The `generic` profile declares no protected
 //! markers (§25.4); `legal` declares expedientes and periciales. Entity
 //! anchors and weighted propagation (§18.2–§18.4) are a later slice.
+//!
+//! Because the marker set is a *choice*, this module also reports how well
+//! that choice fits the snapshot: see [`ProfileFitnessSignal`]. Selecting the
+//! wrong profile is otherwise completely silent.
 
 use df_domain::{Actor, ContextKind, ProjectId, SnapshotId};
 use df_error::DfResult;
@@ -23,11 +27,115 @@ use crate::{db_err, Db};
 pub const EVENT_CONTEXTS_CLASSIFIED: &str = "CONTEXTS_CLASSIFIED";
 
 /// Counts returned by [`classify_folders`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ContextSummary {
     pub generic_folders: u64,
     pub protected_boundaries: u64,
     pub neutral_folders: u64,
+    /// Evidence about the *choice of profile*, not about the snapshot. See
+    /// [`ProfileFitnessSignal`].
+    pub profile_fitness: Option<ProfileFitnessSignal>,
+}
+
+/// How well the active profile fits what this snapshot actually contains.
+///
+/// The capability to protect a legal archive was never missing: `legal`
+/// declares `expediente`, `classify()` consumes it, and rule 9 is enforced end
+/// to end. What was missing was a way to notice that `generic` had been
+/// selected instead. Under `generic` nothing is protected, so a legal archive
+/// reports `protected_boundaries: 0`, deduplicates across expedientes and
+/// verifies clean: fifteen hours of correct-looking work over a structurally
+/// wrong result, with no error to read.
+///
+/// This is that missing signal. It names the shipped profile that would have
+/// protected the most folders this run left unprotected, and how many — enough
+/// to act on, which a bare "the profile may be wrong" would not be.
+///
+/// It warns and never refuses. `generic` is frequently the right answer, and
+/// rule 9 places the decision with the operator or the calling agent, never
+/// with the engine.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileFitnessSignal {
+    /// The shipped profile that would protect the most of what this run left
+    /// unprotected.
+    pub profile_id: String,
+    /// How many folders of this snapshot it would classify as `PROTECTED`
+    /// while the active profile did not.
+    pub unprotected_folders: u64,
+}
+
+impl ProfileFitnessSignal {
+    /// The one wording, so the CLI, the report and the tests cannot drift into
+    /// describing the same evidence differently.
+    pub fn message(&self) -> String {
+        format!(
+            "profile \"{}\" would protect {} folders this run leaves unprotected",
+            self.profile_id, self.unprotected_folders
+        )
+    }
+}
+
+/// Compare a finished classification against every profile this build ships.
+///
+/// No profile id appears here. The set comes from the loader
+/// ([`df_domain::Profile::built_in_ids`]), so shipping a new profile is enough
+/// to make this look at it — and the active profile needs no special case,
+/// because every folder it calls `Protected` is already flagged and it
+/// therefore always counts zero.
+///
+/// Ids are visited in sorted order and a strictly greater count wins, so a tie
+/// resolves to the same profile on every run and on every platform.
+fn strongest_alternative(classified: &[(String, bool)]) -> DfResult<Option<ProfileFitnessSignal>> {
+    let mut ids = df_domain::Profile::built_in_ids();
+    ids.sort_unstable();
+    let mut strongest: Option<ProfileFitnessSignal> = None;
+    for id in ids {
+        let candidate = df_domain::Profile::load(id)?;
+        let unprotected_folders = classified
+            .iter()
+            .filter(|(normalized_name, protected)| {
+                !protected && candidate.classify(normalized_name).0 == ContextKind::Protected
+            })
+            .count() as u64;
+        if unprotected_folders == 0 {
+            continue;
+        }
+        if strongest
+            .as_ref()
+            .is_none_or(|best| unprotected_folders > best.unprotected_folders)
+        {
+            strongest = Some(ProfileFitnessSignal {
+                profile_id: id.to_string(),
+                unprotected_folders,
+            });
+        }
+    }
+    Ok(strongest)
+}
+
+/// Recompute the fitness signal from the persisted classification.
+///
+/// Reads the same two facts [`classify_folders`] wrote — the folder's
+/// normalized name and whether it ended up protected — so a signal recovered
+/// from a sealed snapshot is the signal that run produced.
+pub fn profile_fitness(db: &Db, snapshot_id: SnapshotId) -> DfResult<Option<ProfileFitnessSignal>> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT f.normalized_name, fc.is_protected_boundary
+             FROM folder_contexts fc
+             JOIN folders f ON f.id = fc.folder_id
+             WHERE fc.snapshot_id = ?1",
+        )
+        .map_err(db_err)?;
+    let classified = stmt
+        .query_map([snapshot_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? == 1))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    strongest_alternative(&classified)
 }
 
 /// Classify every folder of a snapshot under the given profile and persist
@@ -81,7 +189,12 @@ pub fn classify_folders(
         generic_folders: 0,
         protected_boundaries: 0,
         neutral_folders: 0,
+        profile_fitness: None,
     };
+    // What each folder was called and whether the active profile protected it:
+    // the two facts the fitness signal needs, collected while they are already
+    // in hand rather than read back afterwards.
+    let mut classified: Vec<(String, bool)> = Vec::with_capacity(folders.len());
     for (folder_id, relative_path, normalized_name) in &folders {
         let (kind, penalty, marker, reason) = match profile.classify(normalized_name) {
             (ContextKind::Protected, _, marker) => {
@@ -101,6 +214,7 @@ pub fn classify_folders(
                 (ContextKind::Neutral, 0u32, None, None)
             }
         };
+        classified.push((normalized_name.clone(), kind == ContextKind::Protected));
         tx.execute(
             "INSERT INTO folder_contexts
                 (folder_id, snapshot_id, relative_path, kind,
@@ -123,11 +237,14 @@ pub fn classify_folders(
         .map_err(db_err)?;
     }
 
+    summary.profile_fitness = strongest_alternative(&classified)?;
+
     let payload = serde_json::json!({
         "snapshot_id": snapshot,
         "generic_folders": summary.generic_folders,
         "protected_boundaries": summary.protected_boundaries,
         "neutral_folders": summary.neutral_folders,
+        "profile_fitness": summary.profile_fitness,
     });
     append_event(&tx, project_id, EVENT_CONTEXTS_CLASSIFIED, &payload, actor)?;
     tx.commit().map_err(db_err)?;
@@ -359,6 +476,52 @@ mod tests {
         assert_eq!(generic[0].penalty, 50);
         assert!(generic[1].path.ends_with("Backup"));
         assert_eq!(generic[1].penalty, 40);
+    }
+
+    /// The signal returned by the classification and the one recomputed from
+    /// the rows it wrote have to be the same value. The sealed analysis marker
+    /// compares them column for column and fails closed when they differ, so a
+    /// drift between the two paths would not warn — it would make the snapshot
+    /// unreadable.
+    #[test]
+    fn the_recomputed_signal_matches_the_one_the_classification_returned() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project_id, snapshot, root) = seed(&mut db);
+        add_folder(&db, snapshot, root, "EXPEDIENTES", "EXPEDIENTES");
+        add_folder(&db, snapshot, root, "Descargas", "Descargas");
+
+        let summary =
+            classify_folders(&mut db, project_id, snapshot, "generic", Actor::Test).unwrap();
+        let signal = summary
+            .profile_fitness
+            .clone()
+            .expect("legal would protect");
+        assert_eq!(signal.profile_id, "legal");
+        assert_eq!(signal.unprotected_folders, 1);
+        assert_eq!(profile_fitness(&db, snapshot).unwrap(), Some(signal));
+    }
+
+    /// A profile is never evidence against itself: every folder it protects is
+    /// already flagged, so its own count is zero and the loop needs no special
+    /// case for the active id — which is why no profile name is written down
+    /// in this module.
+    #[test]
+    fn the_active_profile_never_accuses_itself() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (project_id, snapshot, root) = seed(&mut db);
+        add_folder(&db, snapshot, root, "EXPEDIENTES", "EXPEDIENTES");
+        add_folder(
+            &db,
+            snapshot,
+            root,
+            "Pericial Martinez",
+            "Pericial Martinez",
+        );
+
+        let summary =
+            classify_folders(&mut db, project_id, snapshot, "legal", Actor::Test).unwrap();
+        assert_eq!(summary.protected_boundaries, 2);
+        assert_eq!(summary.profile_fitness, None);
     }
 
     #[test]

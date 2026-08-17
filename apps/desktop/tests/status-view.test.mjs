@@ -131,6 +131,45 @@ test("announces completion and renders the REPEATED_COMPONENT_ONLY counter", () 
   assert.match(markup, /Alcanzado — resultados no exhaustivos/);
 });
 
+test("warns which profile would protect what this run left unprotected", () => {
+  // The field-run shape: zero boundaries, and the reason is the profile, not
+  // the archive. The warning has to say which profile and how many folders,
+  // and it must not read as a refusal — the choice belongs to whoever runs it.
+  const diagnostics = {
+    analysis_complete: true,
+    folder_signatures: 3,
+    exact_tree_clone_sets: 0,
+    partial_tree_clones: 0,
+    embedded_trees: 0,
+    repeated_components: 0,
+    candidate_cap_reached: false,
+    generic_folders: 0,
+    protected_boundaries: 0,
+    profile_fitness: { profile_id: "legal", unprotected_folders: 3702 },
+    rule_matches: 0,
+    anomalies: 0,
+    high_anomalies: 0,
+    pending_review: 0,
+  };
+  const markup = renderStatus({
+    ...baseStatus,
+    latest_snapshot_id: "snapshot-1",
+    structural_diagnostics: diagnostics,
+  });
+
+  // No thousands separator at four digits: es-ES groups from five up.
+  assert.match(markup, /Aviso: el perfil «legal» protegería 3702 carpetas/);
+  assert.match(markup, /No bloquea nada/);
+
+  // And it stays quiet when no other shipped profile would protect more.
+  const silent = renderStatus({
+    ...baseStatus,
+    latest_snapshot_id: "snapshot-1",
+    structural_diagnostics: { ...diagnostics, profile_fitness: null },
+  });
+  assert.doesNotMatch(silent, /Aviso: el perfil/);
+});
+
 test("renders sealed M0.3 version evidence without implying an automatic action", () => {
   const markup = renderStatus({
     ...baseStatus,

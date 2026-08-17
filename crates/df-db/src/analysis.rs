@@ -44,7 +44,7 @@ pub struct AnomalySummary {
 ///
 /// This is deliberately typed rather than an open JSON object: phase recovery
 /// must either reproduce the exact public outcome or fail closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisCompletionSummary {
     pub duplicate_sets: u64,
@@ -62,6 +62,15 @@ pub struct AnalysisCompletionSummary {
     pub candidate_cap_reached: bool,
     pub generic_folders: u64,
     pub protected_boundaries: u64,
+    /// Whether another shipped profile would have protected folders this run
+    /// left unprotected. Sealed next to `protected_boundaries` because the
+    /// count is only meaningful together with the choice that produced it.
+    /// Absent from markers written before the signal existed, which is not the
+    /// same as "no other profile fits" — [`sealed_analysis_summary`] recovers
+    /// the honest value from the persisted classification instead of claiming
+    /// silence.
+    #[serde(default)]
+    pub profile_fitness: Option<crate::context::ProfileFitnessSignal>,
     pub duplicate_representatives: u64,
     pub rule_matches: u64,
     pub anomalies: u64,
@@ -207,7 +216,7 @@ pub struct OccurrenceGuidance {
 }
 
 /// Compact diagnostic exposed by both CLI status and the desktop UI.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StructuralDiagnostics {
     pub analysis_complete: bool,
     pub folder_signatures: u64,
@@ -218,6 +227,11 @@ pub struct StructuralDiagnostics {
     pub candidate_cap_reached: bool,
     pub generic_folders: u64,
     pub protected_boundaries: u64,
+    /// Present when another shipped profile would protect folders this
+    /// classification left unprotected. Read it next to
+    /// `protected_boundaries`: a zero there with a signal here is the shape of
+    /// a run made under the wrong profile.
+    pub profile_fitness: Option<crate::context::ProfileFitnessSignal>,
     pub rule_matches: u64,
     pub anomalies: u64,
     pub high_anomalies: u64,
@@ -425,6 +439,7 @@ fn summary_from_immutable_evidence(
             "SELECT COUNT(*) FROM folder_contexts
              WHERE snapshot_id = ?1 AND is_protected_boundary = 1",
         )?,
+        profile_fitness: crate::context::profile_fitness(db, snapshot_id)?,
         duplicate_representatives: scalar(
             "SELECT COUNT(*) FROM duplicate_representatives WHERE snapshot_id = ?1",
         )?,
@@ -519,6 +534,7 @@ pub fn sealed_analysis_summary(
     // typed value would add defaulted fields and falsely reject canonical v1
     // markers written before those counters existed.
     let candidate_cap_was_stored = summary_value.get("candidate_cap_reached").is_some();
+    let profile_fitness_was_stored = summary_value.get("profile_fitness").is_some();
     let mut summary: AnalysisCompletionSummary = serde_json::from_value(summary_value)
         .map_err(|error| DfError::Serialization(format!("stored analysis summary: {error}")))?;
     let materialized = summary_from_immutable_evidence(db, snapshot_id)?;
@@ -527,6 +543,15 @@ pub fn sealed_analysis_summary(
         // from the immutable STRUCTURE_ANALYZED event (`pairs_skipped` in the
         // old payload) instead of claiming the cap was not reached.
         summary.candidate_cap_reached = materialized.candidate_cap_reached;
+    }
+    if !profile_fitness_was_stored {
+        // Same shape, and the one that matters most here: the runs that most
+        // need this signal are exactly the ones sealed before it existed. The
+        // persisted classification still holds the evidence, so recover it
+        // rather than report the silence that caused the defect.
+        summary
+            .profile_fitness
+            .clone_from(&materialized.profile_fitness);
     }
     if materialized != summary {
         return Err(DfError::Conflict(format!(
@@ -2299,6 +2324,7 @@ pub fn diagnostics(db: &Db, snapshot_id: SnapshotId) -> DfResult<StructuralDiagn
             "SELECT COUNT(*) FROM folder_contexts
              WHERE snapshot_id = ?1 AND is_protected_boundary = 1",
         )?,
+        profile_fitness: crate::context::profile_fitness(db, snapshot_id)?,
         rule_matches: count_where(db, "rule_matches", snapshot_id, None)?,
         anomalies: count_where(db, "structural_anomalies", snapshot_id, None)?,
         high_anomalies: count_where(
