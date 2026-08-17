@@ -1,16 +1,46 @@
 version: 2
+
+# One pull request per ecosystem per week instead of one per dependency.
+# Twelve were open at once, nine of them opened the same morning, and the
+# volume is what stops them being read at all — which is the opposite of what
+# a supply-chain alert is for.
+#
+# Majors stay on their own. A major is a decision about behaviour and belongs
+# in a pull request that can be judged, and failed, by itself.
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: npm
     directory: "/apps/desktop"
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    groups:
+      desktop-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Actions are grouped whole, majors included: they are pinned by major tag
+  # and the only question that matters about a bump is whether this workflow
+  # still passes, which one combined pull request answers directly.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+      day: monday
+    groups:
+      workflow-actions:
+        patterns:
+          - "*"
