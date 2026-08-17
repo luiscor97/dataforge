@@ -2231,6 +2231,7 @@ pub fn plan_destination_tree(project_dir: &Path, depth: u32) -> DfResult<PlanDes
         directories: tree.directories,
         bytes: tree.bytes,
         without_destination: tree.without_destination,
+        not_materialised: tree.not_materialised.clone(),
         nodes: tree
             .nodes
             .into_iter()
@@ -2362,8 +2363,12 @@ pub struct PlanDestinationTree {
     pub files: u64,
     pub directories: u64,
     pub bytes: u64,
-    /// Copies with no recorded destination. Surfaced, never hidden.
+    /// Operations that would write and have no recorded destination.
+    /// Surfaced, never hidden — and never mixed with the ones below.
     pub without_destination: u64,
+    /// Operations with no destination because they never had one to record,
+    /// by operation type. Information about a correct plan, not a problem.
+    pub not_materialised: Vec<(String, u64)>,
     pub nodes: Vec<PlanDestinationNode>,
 }
 
@@ -2644,8 +2649,13 @@ pub struct DeliveryPackage {
     pub entries: u64,
     /// Entries carrying an expected SHA-256, and therefore checkable.
     pub checksummed: u64,
-    /// Entries with no destination recorded. Reported, never dropped.
+    /// Entries that would write and have no destination recorded. Reported,
+    /// never dropped, and never conflated with the ones below.
     pub without_destination: u64,
+    /// Entries with no destination because none was ever going to exist:
+    /// consolidated duplicates, operations with nothing to do, blocked rows.
+    /// A correct consolidating plan is mostly these.
+    pub not_materialised: u64,
     /// Operations the run could not copy, final and retryable together. Here
     /// as a number so a caller learns of them without reading the prose, and
     /// stated even when it is zero.
@@ -2712,12 +2722,22 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
     let mut sums = String::new();
     let mut checksummed = 0u64;
     let mut without_destination = 0u64;
+    let mut not_materialised = 0u64;
     let mut bytes = 0u64;
 
     for entry in &entries {
         let destination = entry.destination_relative_path.clone().unwrap_or_default();
         if entry.destination_relative_path.is_none() {
-            without_destination += 1;
+            // Split by whether a destination was ever owed. A consolidated
+            // duplicate has none because it was represented by another copy;
+            // a copy operation with none is a hole in the plan. Reporting one
+            // number for both told the recipient that hundreds of files had
+            // nowhere to land when nothing was wrong.
+            if entry.operation_type.is_executable() {
+                without_destination += 1;
+            } else {
+                not_materialised += 1;
+            }
         }
         bytes += entry.expected_size_bytes.unwrap_or(0);
         let sha = entry.expected_sha256.clone().unwrap_or_default();
@@ -2848,7 +2868,8 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
          ## What this says\n\n\
          - Entries in the frozen manifest: **{}**\n\
          - Of those, carrying a SHA-256 anyone can check: **{}**\n\
-         - Without a recorded destination: **{}**\n\
+         - Represented by another copy, or with nothing to do: **{}**\n\
+         - Would write and have no destination recorded: **{}**\n\
          - Bytes described: **{}**\n\
          - Independent verification: {}\n\n\
          ## What was not read\n\n\
@@ -2869,6 +2890,7 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         plan.version,
         entries.len(),
         checksummed,
+        not_materialised,
         without_destination,
         bytes,
         verdict,
@@ -2912,6 +2934,7 @@ pub fn export_delivery_package(project_dir: &Path) -> DfResult<DeliveryPackage> 
         entries: entries.len() as u64,
         checksummed,
         without_destination,
+        not_materialised,
         failed,
         bytes,
     })

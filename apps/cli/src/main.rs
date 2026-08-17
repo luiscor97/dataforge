@@ -1529,9 +1529,22 @@ fn print_plan_tree(tree: &PlanDestinationTree) {
         tree.directories,
         human_bytes(tree.bytes)
     );
+    // Stated before the warning and never as one: these are the operations
+    // that were never going to write anything, and a plan that consolidates
+    // correctly is full of them.
+    if !tree.not_materialised.is_empty() {
+        let total: u64 = tree.not_materialised.iter().map(|(_, count)| count).sum();
+        let breakdown = tree
+            .not_materialised
+            .iter()
+            .map(|(operation, count)| format!("{count} {operation}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Not written : {total} operation(s) by design ({breakdown})");
+    }
     if tree.without_destination > 0 {
         println!(
-            "WARNING     : {} copy operation(s) have no destination recorded",
+            "WARNING     : {} operation(s) would write and have no destination recorded",
             tree.without_destination
         );
     }
@@ -1633,7 +1646,14 @@ fn print_deliver(package: &DeliveryPackage) {
     // run could not copy, is the kind of thing a recipient of this package
     // would want flagged, and reporting it only when convenient is how it
     // stops being reported at all.
-    println!("No destination: {}", package.without_destination);
+    println!(
+        "Not written   : {} (represented or nothing to do)",
+        package.not_materialised
+    );
+    println!(
+        "No destination: {} (would write, nowhere recorded)",
+        package.without_destination
+    );
     println!("Failed       : {}", package.failed);
     println!("Bytes        : {}", package.bytes);
 }
