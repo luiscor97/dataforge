@@ -1775,6 +1775,43 @@ fn print_drag_scars(report: &DragScarReport) {
         println!("Evidence only: every content above exists outside its branch,");
         println!("but deciding what to do with a scar stays a human decision.");
     }
+
+    // The other shape, and on the archive this was built against, the common
+    // one: a whole top-level folder dropped inside a different tree, where no
+    // ancestor repeats a name and the list above stays empty.
+    println!();
+    println!("Grafted roots   : {}", report.grafted_roots.len());
+    for graft in &report.grafted_roots {
+        println!();
+        println!("  {}", graft.relative_path);
+        println!("    repeats top-level  : {}", graft.canonical_root);
+        println!("    occurrences inside : {}", graft.occurrences);
+        println!("    distinct contents  : {}", graft.contents);
+        // Printed for every row, including the zero, because the zero is the
+        // finding: a branch that holds nothing of its own is redundant, and
+        // one that holds something is a folder that merely shares a name.
+        println!(
+            "    of those, only here: {}{}",
+            graft.contents_only_here,
+            if graft.contents_only_here == 0 {
+                "  (nothing under it is unique)"
+            } else {
+                "  (this branch is their only home)"
+            }
+        );
+    }
+    if report.grafted_roots.is_empty() {
+        println!();
+        println!("No branch in this snapshot carries a top-level folder's name.");
+    } else if report.grafted_contents_only_there > 0 {
+        println!();
+        println!(
+            "{} content(s) under these branches exist nowhere else.",
+            report.grafted_contents_only_there
+        );
+        println!("Sharing a name is not evidence of redundancy, and the count above");
+        println!("is what a decision has to be made against.");
+    }
 }
 
 fn print_name_collisions(report: &NameCollisionReport) {

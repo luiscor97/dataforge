@@ -48,7 +48,7 @@ mod secrets;
 pub use df_db::assistance::AssistanceAuditView;
 pub use df_db::inventory::{NameCollision, NameCollisionReport};
 pub use df_db::liveness::{RunLiveness, RunStage};
-pub use df_db::structure::{DragScar, GraftMatch, GraftedPrefix, GraftedTreeReport};
+pub use df_db::structure::{DragScar, GraftMatch, GraftedPrefix, GraftedRoot, GraftedTreeReport};
 pub use df_media::{MediaLimits, MediaOutcome, MediaProjectOptions, MediaSidecars};
 pub use df_planner::{
     AnalyzeOutcome, ApproveOutcome, DiscardOutcome, PlanOutcome, PlanValidationReport,
@@ -3177,6 +3177,17 @@ pub struct DragScarReport {
     /// was proven to exist somewhere outside its branch.
     pub contents: u64,
     pub scars: Vec<DragScar>,
+    /// Branches carrying the name of one of the archive's own top-level
+    /// folders — a whole root dropped into another tree, which no ancestor
+    /// rule can see. On the audited archive the human classification named
+    /// 131 such groups over 135.378 files, of which the ancestor rule finds
+    /// 18: this is 58,7% of the real candidates that had no detector.
+    pub grafted_roots: Vec<GraftedRoot>,
+    /// Of the contents under those branches, how many exist nowhere else.
+    /// Zero across the report means every branch is redundant material; above
+    /// zero it names how much would be lost by treating them as such, which
+    /// is why neither this report nor the engine proposes removing any.
+    pub grafted_contents_only_there: u64,
 }
 
 /// Report the folders that are scars of a bad drag-and-drop.
@@ -3206,6 +3217,7 @@ pub fn drag_scar_report(project_dir: &Path) -> DfResult<DragScarReport> {
     // right one.
     ensure_snapshot_analysis_complete(&db, &project, snapshot.id)?;
     let scars = df_db::structure::drag_scars(&db, snapshot.id)?;
+    let grafted_roots = df_db::structure::grafted_roots(&db, snapshot.id)?;
 
     Ok(DragScarReport {
         snapshot_id: snapshot.id.to_string(),
@@ -3213,6 +3225,11 @@ pub fn drag_scar_report(project_dir: &Path) -> DfResult<DragScarReport> {
         occurrences: scars.iter().map(|scar| scar.occurrences).sum(),
         contents: scars.iter().map(|scar| scar.contents).sum(),
         scars,
+        grafted_contents_only_there: grafted_roots
+            .iter()
+            .map(|graft| graft.contents_only_here)
+            .sum(),
+        grafted_roots,
     })
 }
 
