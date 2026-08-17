@@ -182,8 +182,17 @@ jobs:
   supply-chain:
     name: Dependency audit
     runs-on: windows-latest
+    # Write access only so a Dependabot branch can regenerate its own SBOM
+    # below. Every other branch keeps the read-only default of this workflow.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The regeneration step pushes back to the branch it came from, so
+          # it needs the branch and not the detached merge commit.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -205,13 +214,35 @@ jobs:
       # release at all. Same check, moved to where it can still be cheap to fix.
       - name: SBOM matches Cargo.lock
         shell: bash
+        env:
+          # Dependabot edits Cargo.lock and cannot edit anything else, so every
+          # dependency bump it opened was born failing this check and could not
+          # be made to pass without a human running one command. Twelve such
+          # pull requests were open at once. On those branches, and only those,
+          # the check regenerates the file it is about to complain about.
+          IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' && startsWith(github.head_ref, 'dependabot/') }}
         run: |
           python scripts/generate-sbom.py > /tmp/fresh.cdx.json
-          if ! diff -q docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json > /dev/null; then
+          if diff -q docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json > /dev/null; then
+            echo "SBOM is current"
+            exit 0
+          fi
+          if [ "$IS_DEPENDABOT" != "true" ]; then
             echo "::error::The committed SBOM does not match Cargo.lock."
             echo "Regenerate it in the same commit that changes dependencies:"
             echo "  python scripts/generate-sbom.py > docs/sbom/dataforge.cdx.json"
             diff docs/sbom/dataforge.cdx.json /tmp/fresh.cdx.json | head -40
             exit 1
           fi
-          echo "SBOM is current"
+          cp /tmp/fresh.cdx.json docs/sbom/dataforge.cdx.json
+          # Exactly one path, staged by name. A step that can write to the
+          # branch must be unable to carry anything else along with it.
+          git add docs/sbom/dataforge.cdx.json
+          if [ -n "$(git diff --cached --name-only | grep -v '^docs/sbom/dataforge.cdx.json$')" ]; then
+            echo "::error::refusing to push: something other than the SBOM is staged"
+            git diff --cached --name-only
+            exit 1
+          fi
+          git -c user.name='github-actions[bot]'               -c user.email='41898282+github-actions[bot]@users.noreply.github.com'               commit -m 'chore(sbom): regenerate for this dependency bump'
+          git push origin HEAD:"$GITHUB_HEAD_REF"
+          echo "SBOM regenerated and pushed; the audit passes on the content it just wrote"
