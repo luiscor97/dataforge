@@ -1530,10 +1530,19 @@ pub struct DestinationTree {
     pub files: u64,
     pub directories: u64,
     pub bytes: u64,
-    /// Copy operations whose destination is not recorded. Reported rather
-    /// than hidden: a plan that cannot say where something lands is exactly
-    /// what this view exists to surface.
+    /// Operations that were going to materialise something and have no
+    /// destination recorded. Reported rather than hidden: a plan that cannot
+    /// say where something lands is exactly what this view exists to surface.
+    ///
+    /// Only executable operations count here. `SKIP_REPRESENTED`, `NO_ACTION`
+    /// and `BLOCKED` have no destination *by design*, and counting them
+    /// alongside a real gap made every correct consolidating plan raise the
+    /// warning — which teaches the reader to skip past the one line that would
+    /// have named a copy with nowhere to land.
     pub without_destination: u64,
+    /// Operations with no destination because they were never going to have
+    /// one, by operation type, ordered by type. Information, not a problem.
+    pub not_materialised: Vec<(String, u64)>,
     /// Nodes from depth 1 up to the requested depth, ordered by prefix.
     pub nodes: Vec<DestinationNode>,
 }
@@ -1576,13 +1585,24 @@ pub fn destination_tree(db: &Db, plan_id: PlanId, depth: u32) -> DfResult<Destin
         std::collections::BTreeMap::new();
     let mut counters: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
         std::collections::BTreeMap::new();
+    let mut not_materialised: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
 
     for row in rows {
         let (operation_type, destination, size) = row.map_err(db_err)?;
         let is_directory = operation_type == "CREATE_DIRECTORY";
         let Some(destination) = destination else {
             if !is_directory {
-                tree.without_destination += 1;
+                // An unparsable type counts as a gap: a row this build cannot
+                // name is not a row it may vouch for.
+                match OperationType::parse(&operation_type) {
+                    Ok(operation) if !operation.is_executable() => {
+                        *not_materialised
+                            .entry(operation.as_str().to_string())
+                            .or_insert(0) += 1;
+                    }
+                    _ => tree.without_destination += 1,
+                }
             }
             continue;
         };
@@ -1642,6 +1662,7 @@ pub fn destination_tree(db: &Db, plan_id: PlanId, depth: u32) -> DfResult<Destin
         }
     }
     tree.nodes = nodes.into_values().collect();
+    tree.not_materialised = not_materialised.into_iter().collect();
     Ok(tree)
 }
 
@@ -1982,6 +2003,61 @@ mod tests {
         let tree = destination_tree(&db, plan.id, 2).unwrap();
         assert_eq!(tree.without_destination, 1);
         assert_eq!(tree.files, 0);
+    }
+
+    #[test]
+    fn a_plan_that_consolidates_correctly_raises_no_warning() {
+        // The three operation types below have no destination *by design*:
+        // a represented duplicate was covered by another copy, an operation
+        // with nothing to do writes nothing, and a blocked one was stopped on
+        // purpose. Counting them as copies with nowhere to land made every
+        // correct consolidating plan print a warning and exit 3, which trains
+        // the reader — and any agent keying on the exit code — to skip the one
+        // line that would have named a real hole in the plan.
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+        for (sequence, operation) in [
+            (11, "SKIP_REPRESENTED"),
+            (12, "SKIP_REPRESENTED"),
+            (13, "NO_ACTION"),
+            (14, "BLOCKED"),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO plan_operations
+                        (id, plan_id, sequence, operation_type,
+                         destination_relative_path, confidence, risk, approval,
+                         execution_state, idempotency_key, reason, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, 1.0, 'LOW', 'PENDING',
+                             'PENDING', ?5, 'test', ?6, ?6)",
+                    params![
+                        OperationId::new().to_string(),
+                        plan.id.to_string(),
+                        sequence,
+                        operation,
+                        format!("{sequence:064}"),
+                        to_stored_timestamp(chrono::Utc::now()),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let tree = destination_tree(&db, plan.id, 2).unwrap();
+        assert_eq!(
+            tree.without_destination, 0,
+            "nothing here was ever going to write: {:?}",
+            tree.not_materialised
+        );
+        // Still reported, because a plan that skips four occurrences should
+        // say so — as information, and with the reason implied by the type.
+        assert_eq!(
+            tree.not_materialised,
+            vec![
+                ("BLOCKED".to_string(), 1),
+                ("NO_ACTION".to_string(), 1),
+                ("SKIP_REPRESENTED".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
