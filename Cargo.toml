@@ -128,7 +128,7 @@ tantivy = { version = "=0.26.1", default-features = false, features = ["mmap"] }
 datafusion = { version = "=54.0.0", default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 arrow-array = "=58.3.0"
 arrow-schema = "=58.3.0"
-parquet = { version = "=58.3.0", default-features = false, features = ["arrow", "zstd"] }
+parquet = { version = "=59.2.0", default-features = false, features = ["arrow", "zstd"] }
 tokio = { version = "1", features = ["rt", "time"] }
 # M0.7 BYOK: API keys live in the OS credential store (Windows Credential
 # Manager), never in SQLite, config files or the ledger.
