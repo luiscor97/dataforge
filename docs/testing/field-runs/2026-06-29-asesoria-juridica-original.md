@@ -276,6 +276,10 @@ leer el log que ya estaba disponible. Razonar sobre la causa probable es más
 rápido que comprobarla, y por eso se elige; en las tres ocasiones salió más
 caro.
 
+El silencio se persigue como defecto propio, junto con las demás rutas que
+llevan a un resultado equivocado sin queja, en
+[silent-wrongness-audit.md](../silent-wrongness-audit.md).
+
 ### El banco: puntuar un criterio sin ejecutar nada
 
 El trabajo original probaba criterios **ejecutando y corrigiendo**: diez días,
