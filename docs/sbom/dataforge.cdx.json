@@ -23,7 +23,7 @@
       },
       {
         "name": "dataforge:component-count",
-        "value": "794"
+        "value": "796"
       }
     ]
   },
@@ -5537,7 +5537,7 @@
     {
       "type": "library",
       "name": "hashlink",
-      "version": "0.10.0",
+      "version": "0.12.1",
       "scope": "required",
       "description": "HashMap-like containers that hold their key-value pairs in a user controllable order",
       "licenses": [
@@ -5545,7 +5545,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/hashlink@0.10.0",
+      "purl": "pkg:cargo/hashlink@0.12.1",
       "externalReferences": [
         {
           "type": "distribution",
@@ -6867,7 +6867,7 @@
     {
       "type": "library",
       "name": "libsqlite3-sys",
-      "version": "0.35.0",
+      "version": "0.38.2",
       "scope": "required",
       "description": "Native bindings to the libsqlite3 library",
       "licenses": [
@@ -6875,7 +6875,7 @@
           "expression": "MIT"
         }
       ],
-      "purl": "pkg:cargo/libsqlite3-sys@0.35.0",
+      "purl": "pkg:cargo/libsqlite3-sys@0.38.2",
       "externalReferences": [
         {
           "type": "distribution",
@@ -9545,6 +9545,25 @@
     },
     {
       "type": "library",
+      "name": "rsqlite-vfs",
+      "version": "0.1.1",
+      "scope": "required",
+      "description": "Helping to implement SQLite VFS.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/rsqlite-vfs@0.1.1",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://crates.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "rubato",
       "version": "0.16.2",
       "scope": "required",
@@ -9565,7 +9584,7 @@
     {
       "type": "library",
       "name": "rusqlite",
-      "version": "0.37.0",
+      "version": "0.40.2",
       "scope": "required",
       "description": "Ergonomic wrapper for SQLite",
       "licenses": [
@@ -9573,7 +9592,7 @@
           "expression": "MIT"
         }
       ],
-      "purl": "pkg:cargo/rusqlite@0.37.0",
+      "purl": "pkg:cargo/rusqlite@0.40.2",
       "externalReferences": [
         {
           "type": "distribution",
@@ -10505,6 +10524,25 @@
         }
       ],
       "purl": "pkg:cargo/spki@0.7.3",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://crates.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "sqlite-wasm-rs",
+      "version": "0.5.5",
+      "scope": "required",
+      "description": "`wasm32-unknown-unknown` bindings to the libsqlite3 library.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/sqlite-wasm-rs@0.5.5",
       "externalReferences": [
         {
           "type": "distribution",
