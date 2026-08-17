@@ -1298,6 +1298,12 @@ fn print_status(status: &ProjectStatus) {
             diagnostic.high_anomalies,
             diagnostic.pending_review
         );
+        // Deliberately not folded into the `Profile` line above: the answer
+        // depends on what was scanned, and a project with no snapshot has no
+        // opinion about its own profile yet.
+        if let Some(signal) = &diagnostic.profile_fitness {
+            println!("Profile fit: WARNING {}", signal.message());
+        }
         if diagnostic.candidate_cap_reached {
             println!(
                 "Relation cap: REACHED â€” structural relations are conservative but not exhaustive"
@@ -1359,6 +1365,14 @@ fn print_analyze(outcome: &AnalyzeOutcome) {
     );
     println!("Generic folders  : {}", outcome.generic_folders);
     println!("Protected bounds : {}", outcome.protected_boundaries);
+    // A warning, not a refusal (RFC-0001 rule 9): the engine is not the
+    // authority on which profile is right, but staying silent about the
+    // question is what let a legal archive run for fifteen hours under
+    // `generic` and finish looking clean.
+    match &outcome.profile_fitness {
+        Some(signal) => println!("Profile fitness  : WARNING {}", signal.message()),
+        None => println!("Profile fitness  : no shipped profile would protect more"),
+    }
     println!("Representatives  : {}", outcome.duplicate_representatives);
     println!("Rule matches     : {}", outcome.rule_matches);
     println!(

@@ -43,6 +43,16 @@ export interface InventorySummary {
   hash_source_changed: number;
 }
 
+/**
+ * Otro perfil de los que se distribuyen protegería carpetas que esta
+ * ejecución deja sin proteger. Es un aviso, nunca un bloqueo: `generic` puede
+ * ser la elección correcta y quien decide es quien opera (regla 9).
+ */
+export interface ProfileFitnessSignal {
+  profile_id: string;
+  unprotected_folders: number;
+}
+
 /** Compact M0.2 evidence summary for the latest complete snapshot. */
 export interface StructuralDiagnostics {
   analysis_complete: boolean;
@@ -54,6 +64,7 @@ export interface StructuralDiagnostics {
   candidate_cap_reached: boolean;
   generic_folders: number;
   protected_boundaries: number;
+  profile_fitness?: ProfileFitnessSignal | null;
   rule_matches: number;
   anomalies: number;
   high_anomalies: number;

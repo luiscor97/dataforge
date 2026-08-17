@@ -46,6 +46,11 @@ mod ai_transport;
 mod secrets;
 
 pub use df_db::assistance::AssistanceAuditView;
+/// Re-exported for the same reason as [`StructuralDiagnostics`]: it is carried
+/// inside the analysis outcome and the project status, and a client that could
+/// not name it could not read the one piece of evidence that says the profile
+/// may be wrong.
+pub use df_db::context::ProfileFitnessSignal;
 pub use df_db::inventory::{NameCollision, NameCollisionReport};
 pub use df_db::liveness::{RunLiveness, RunStage};
 pub use df_db::structure::{DragScar, GraftMatch, GraftedPrefix, GraftedTreeReport};

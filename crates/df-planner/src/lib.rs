@@ -45,6 +45,10 @@ pub struct AnalyzeOutcome {
     pub generic_folders: u64,
     /// Profile-defined protected boundaries that no duplicate policy crosses.
     pub protected_boundaries: u64,
+    /// Warning, never a refusal: another shipped profile would protect folders
+    /// this run leaves unprotected. `generic` may still be the right choice —
+    /// the signal informs, the operator or the calling agent decides.
+    pub profile_fitness: Option<df_db::context::ProfileFitnessSignal>,
     /// Duplicate sets that got a logical representative (RFC-0001 §15.5).
     pub duplicate_representatives: u64,
     /// Occurrences classified by a versioned declarative rule (§25.1).
@@ -132,6 +136,7 @@ fn analyze_outcome_from_summary(
         candidate_cap_reached: summary.candidate_cap_reached,
         generic_folders: summary.generic_folders,
         protected_boundaries: summary.protected_boundaries,
+        profile_fitness: summary.profile_fitness,
         duplicate_representatives: summary.duplicate_representatives,
         rule_matches: summary.rule_matches,
         anomalies: summary.anomalies,
@@ -187,6 +192,7 @@ fn materialize_analysis_evidence(
         candidate_cap_reached: relations.candidate_cap_reached,
         generic_folders: context.generic_folders,
         protected_boundaries: context.protected_boundaries,
+        profile_fitness: context.profile_fitness,
         duplicate_representatives,
         rule_matches: rules.matches,
         anomalies: anomalies.anomalies,

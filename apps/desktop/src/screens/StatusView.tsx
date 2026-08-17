@@ -352,6 +352,20 @@ export function StatusView({
                   <dt>Fronteras protegidas</dt>
                   <dd>{formatCount(diagnostics.protected_boundaries)}</dd>
                 </dl>
+                {diagnostics.profile_fitness ? (
+                  <p
+                    className="diagnostic-status diagnostic-pending"
+                    role="status"
+                  >
+                    Aviso: el perfil «{diagnostics.profile_fitness.profile_id}»
+                    protegería{" "}
+                    {formatCount(
+                      diagnostics.profile_fitness.unprotected_folders,
+                    )}{" "}
+                    carpetas que esta ejecución deja sin proteger. No bloquea
+                    nada: el perfil lo elige quien opera, no el motor.
+                  </p>
+                ) : null}
               </section>
 
               <section
