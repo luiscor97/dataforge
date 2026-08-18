@@ -44,6 +44,7 @@
 | [ADR-0047](ADR-0047-bounded-parallel-hash-and-verify.md) | Hash y verificación paralelos acotados (M1.0.1) | Aceptada |
 | [ADR-0048](ADR-0048-strict-parallel-execution.md) | Ejecución estricta paralela (M1.0.1) | Aceptada |
 | [ADR-0049](ADR-0049-engine-identity-in-the-ledger.md) | Qué motor produjo cada resultado | Propuesta |
+| [ADR-0050](ADR-0050-a-drag-scar-is-a-decidable-finding.md) | Una cicatriz de arrastre es un hallazgo decidible | Propuesta |
 
 Los números 0001–0010 corresponden a las decisiones arquitectónicas de
 RFC-0001 §6; 0011+ a decisiones de entorno y desarrollo (RFC-0001 §0.1.11).
