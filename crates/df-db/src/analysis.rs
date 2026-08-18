@@ -613,7 +613,7 @@ pub fn evaluate_rules(
             .rules
             .iter()
             .enumerate()
-            .filter(|(_, rule)| rule.matches_file_name(&occurrence.file_name))
+            .filter(|(_, rule)| rule.matches(&occurrence.file_name, &occurrence.relative_path))
             .collect();
         for (selection_index, (priority, rule)) in matching.into_iter().enumerate() {
             let selected = selection_index == 0;
