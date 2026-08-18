@@ -1041,7 +1041,18 @@ fn route_destination(
 /// 8 hex chars of the content SHA-256 before the extension. The file component
 /// is bounded by UTF-16 units exactly like the executor's runtime collision
 /// path, so a valid 255-unit source name cannot make the plan invalid.
-fn suffixed_destination(destination: &str, sha256: &str) -> String {
+/// A deterministic suffix that separates two occurrences landing on one
+/// destination (§27.3).
+///
+/// `discriminator` is what makes the suffix unique, and it must identify the
+/// *occurrence*, not its content. Deriving it from the SHA-256 alone was
+/// enough while only different contents could collide. Collapsing a repeated
+/// path component changed that: two copies of the same bytes, previously kept
+/// apart by a doubled folder, now aim at one path, and a content-derived
+/// suffix gave them the same second path too. A real plan over 158.219 files
+/// failed validation on exactly that, and the failure was two operations
+/// colliding on a name that already carried a suffix.
+fn suffixed_destination(destination: &str, discriminator: &str) -> String {
     let separator = destination
         .rfind('/')
         .into_iter()
@@ -1050,7 +1061,12 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
     let (prefix, file_name) = separator.map_or(("", destination), |index| {
         (&destination[..=index], &destination[index + 1..])
     });
-    let file_name = df_fs_safety::deterministic_collision_file_name(file_name, sha256);
+    // Hashed here rather than passed through: the helper takes the leading
+    // hex of what it is given, so a discriminator that merely *starts* with a
+    // shared SHA-256 would produce the same suffix again — which is precisely
+    // the collision this parameter exists to break.
+    let digest = hex::encode(sha2::Sha256::digest(discriminator.as_bytes()));
+    let file_name = df_fs_safety::deterministic_collision_file_name(file_name, &digest);
     format!("{prefix}{file_name}")
 }
 
@@ -1435,7 +1451,14 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                 if taken_destinations.insert(routed.to_lowercase()) {
                                     (routed.clone(), false)
                                 } else {
-                                    let suffixed = suffixed_destination(&routed, sha256);
+                                    // The source path, not just the hash: two
+                                    // occurrences of one content can now aim at
+                                    // the same destination, and only where they
+                                    // came from tells them apart.
+                                    let suffixed = suffixed_destination(
+                                        &routed,
+                                        &format!("{sha256}:{}", occurrence.relative_path),
+                                    );
                                     taken_destinations.insert(suffixed.to_lowercase());
                                     (suffixed, true)
                                 };
@@ -2393,14 +2416,48 @@ mod tests {
     }
 
     #[test]
+    fn two_copies_of_one_content_landing_together_keep_two_names() {
+        // The failure this closes, from a real plan over 158.219 files:
+        //
+        //   operations #38977 and #38997 collide on destination
+        //   `...\AGENTES COMERCIALES30321...pdf~df-95a89991.pdf`
+        //
+        // Both had already collided once and both received the same suffix,
+        // because the suffix was derived from the content and the content was
+        // identical. Before a repeated path component was collapsed this
+        // could not happen: two copies of one file were kept apart by the
+        // folder that doubled. Collapsing it aimed them at one path, and the
+        // discriminator has to identify the occurrence, not the bytes.
+        let planned = r"salida\AGENTES\escrito.pdf";
+        let sha = "a".repeat(64);
+        let one = suffixed_destination(planned, &format!("{sha}:AGENTES/escrito.pdf"));
+        let two = suffixed_destination(planned, &format!("{sha}:AGENTES/AGENTES/escrito.pdf"));
+        assert_ne!(
+            one, two,
+            "same bytes, different origins: two destinations or one of them is lost"
+        );
+        assert!(one.ends_with(".pdf") && two.ends_with(".pdf"));
+        // Still deterministic: the same occurrence always lands on the same
+        // name, which is what §27.3 asks for.
+        assert_eq!(
+            one,
+            suffixed_destination(planned, &format!("{sha}:AGENTES/escrito.pdf"))
+        );
+    }
+
+    #[test]
     fn suffixed_destination_is_deterministic_and_keeps_the_extension() {
+        // The suffix is the leading hex of a digest *of the discriminator*,
+        // not of the discriminator's own leading characters: two occurrences
+        // whose discriminators share a prefix — the same SHA-256 followed by
+        // different source paths — have to end up with different names.
         assert_eq!(
             suffixed_destination("dir/doc.pdf", "abcdef1234567890"),
-            "dir/doc~df-abcdef12.pdf"
+            "dir/doc~df-840881e1.pdf"
         );
         assert_eq!(
             suffixed_destination("dir/no-extension", "abcdef1234567890"),
-            "dir/no-extension~df-abcdef12"
+            "dir/no-extension~df-840881e1"
         );
     }
 
@@ -2410,7 +2467,7 @@ mod tests {
         let suffixed = suffixed_destination(&destination, "abcdef1234567890");
         let file_name = Path::new(&suffixed).file_name().unwrap().to_string_lossy();
         assert_eq!(file_name.encode_utf16().count(), 255);
-        assert!(file_name.ends_with("~df-abcdef12.txt"), "{file_name}");
+        assert!(file_name.ends_with("~df-840881e1.txt"), "{file_name}");
         assert!(df_fs_safety::SafeRelativePath::parse(Path::new(&suffixed)).is_ok());
     }
 
