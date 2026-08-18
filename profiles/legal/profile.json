@@ -95,6 +95,160 @@
       },
       "action": "COPY_ACTIVE",
       "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.node_modules",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "node_modules"
+      },
+      "classification": {
+        "category": "arbol de dependencias de un programa, no material del despacho",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.locale",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "locale"
+      },
+      "classification": {
+        "category": "recursos de idioma de un programa instalado",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.locales",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "locales"
+      },
+      "classification": {
+        "category": "recursos de idioma de un programa instalado",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.bin",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "bin"
+      },
+      "classification": {
+        "category": "binarios de un programa instalado",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.lib",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "lib"
+      },
+      "classification": {
+        "category": "bibliotecas de un programa instalado",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.plugins",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "plugins"
+      },
+      "classification": {
+        "category": "extensiones de un programa instalado",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.redist",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "redist"
+      },
+      "classification": {
+        "category": "redistribuibles de un instalador",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.system32",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "system32"
+      },
+      "classification": {
+        "category": "carpeta de sistema de Windows",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.syswow64",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "syswow64"
+      },
+      "classification": {
+        "category": "carpeta de sistema de Windows",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.pycache",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "__pycache__"
+      },
+      "classification": {
+        "category": "cache de compilacion de Python",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.software-tree.site-packages",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*",
+        "ancestor_folder": "site-packages"
+      },
+      "classification": {
+        "category": "dependencias de Python instaladas",
+        "confidence": 0.95
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
     }
   ],
   "destination_roots": [
