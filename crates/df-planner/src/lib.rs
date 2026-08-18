@@ -930,6 +930,7 @@ fn portable_relative_path(
             "inventory path `{relative}` has no usable components"
         )));
     }
+    let components = collapse_adjacent_repeats(components);
     Ok((
         components
             .iter()
@@ -938,6 +939,48 @@ fn portable_relative_path(
             .to_string(),
         encoded,
     ))
+}
+
+/// Drop a path component that only repeats the one immediately before it.
+///
+/// `AGENTES COMERCIALES\AGENTES COMERCIALES\NATALIA\escrito.pdf` becomes
+/// `AGENTES COMERCIALES\NATALIA\escrito.pdf`. The audited archive carries 76
+/// distinct places where this happened and 3.453 paths under them, and the
+/// first thing its owner checked in a delivered tree was whether the doubled
+/// folder had been reproduced. It had.
+///
+/// This is a *rename of the destination*, not a prune of the source, and the
+/// distinction is the whole reason it is safe to do automatically. Pruning a
+/// redundant branch was measured to lose content — 744 contents vanished from
+/// a naive attempt — because two branches can be each other's only copy.
+/// Collapsing a repeated component moves nothing and deletes nothing: the
+/// plan simply writes the same occurrence one level higher in a tree that did
+/// not exist before. Every occurrence still gets exactly one destination, and
+/// when two of them now land on the same path the existing collision handling
+/// gives the second one a suffix rather than overwriting the first.
+///
+/// Runs of any length collapse to one, and the comparison ignores case
+/// because Windows does.
+///
+/// The shape of the name is deliberately not consulted. An earlier version
+/// skipped numeric and very short components, reasoning that `2020\2020`
+/// and `v2\v2` were how dated and versioned material nests legitimately.
+/// That was the wrong counterexample: dates nest as `2020\03`, never as
+/// `2020\2020`, and this fires only on two *equal* adjacent names, which is
+/// an accident whether they are digits or letters. The real archive settled
+/// it — ten branches under `FORMULARIOS...\rtf\N\N` held nothing of their
+/// own and were refusing a whole plan for the sake of that exemption.
+fn collapse_adjacent_repeats(components: Vec<String>) -> Vec<String> {
+    let mut collapsed: Vec<String> = Vec::with_capacity(components.len());
+    for component in components {
+        let repeats_previous = collapsed
+            .last()
+            .is_some_and(|previous: &String| previous.eq_ignore_ascii_case(&component));
+        if !repeats_previous {
+            collapsed.push(component);
+        }
+    }
+    collapsed
 }
 
 fn root_destination_dirs(
@@ -998,7 +1041,18 @@ fn route_destination(
 /// 8 hex chars of the content SHA-256 before the extension. The file component
 /// is bounded by UTF-16 units exactly like the executor's runtime collision
 /// path, so a valid 255-unit source name cannot make the plan invalid.
-fn suffixed_destination(destination: &str, sha256: &str) -> String {
+/// A deterministic suffix that separates two occurrences landing on one
+/// destination (§27.3).
+///
+/// `discriminator` is what makes the suffix unique, and it must identify the
+/// *occurrence*, not its content. Deriving it from the SHA-256 alone was
+/// enough while only different contents could collide. Collapsing a repeated
+/// path component changed that: two copies of the same bytes, previously kept
+/// apart by a doubled folder, now aim at one path, and a content-derived
+/// suffix gave them the same second path too. A real plan over 158.219 files
+/// failed validation on exactly that, and the failure was two operations
+/// colliding on a name that already carried a suffix.
+fn suffixed_destination(destination: &str, discriminator: &str) -> String {
     let separator = destination
         .rfind('/')
         .into_iter()
@@ -1007,7 +1061,12 @@ fn suffixed_destination(destination: &str, sha256: &str) -> String {
     let (prefix, file_name) = separator.map_or(("", destination), |index| {
         (&destination[..=index], &destination[index + 1..])
     });
-    let file_name = df_fs_safety::deterministic_collision_file_name(file_name, sha256);
+    // Hashed here rather than passed through: the helper takes the leading
+    // hex of what it is given, so a discriminator that merely *starts* with a
+    // shared SHA-256 would produce the same suffix again — which is precisely
+    // the collision this parameter exists to break.
+    let digest = hex::encode(sha2::Sha256::digest(discriminator.as_bytes()));
+    let file_name = df_fs_safety::deterministic_collision_file_name(file_name, &digest);
     format!("{prefix}{file_name}")
 }
 
@@ -1246,7 +1305,19 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
         };
         if let Some(dest) = &destination {
             taken_destinations.insert(dest.to_lowercase());
-            directory_destinations.insert(dest.to_lowercase());
+            // Two source folders can now share one destination, because a
+            // component that only repeats the one before it is collapsed:
+            // `EXPEDIENTES` and `EXPEDIENTES\EXPEDIENTES` both land on
+            // `EXPEDIENTES`. A directory is created once — the second
+            // operation would carry the same idempotency key as the first,
+            // which the database refuses, and rightly: it is the same act.
+            //
+            // Files are unaffected. Each one keeps its own occurrence in the
+            // key, and two colliding files still resolve through the suffix
+            // path rather than through this one.
+            if !directory_destinations.insert(dest.to_lowercase()) {
+                continue;
+            }
         }
         operations.push(PlanOperation {
             id: df_domain::OperationId::new(),
@@ -1346,7 +1417,10 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                     ),
                                 )
                             } else {
-                                let suffixed = suffixed_destination(&planned, sha256);
+                                let suffixed = suffixed_destination(
+                                    &planned,
+                                    &format!("{sha256}:{}", occurrence.relative_path),
+                                );
                                 taken_destinations.insert(suffixed.to_lowercase());
                                 (
                                     OperationType::CopyWithSuffix,
@@ -1380,7 +1454,14 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                 if taken_destinations.insert(routed.to_lowercase()) {
                                     (routed.clone(), false)
                                 } else {
-                                    let suffixed = suffixed_destination(&routed, sha256);
+                                    // The source path, not just the hash: two
+                                    // occurrences of one content can now aim at
+                                    // the same destination, and only where they
+                                    // came from tells them apart.
+                                    let suffixed = suffixed_destination(
+                                        &routed,
+                                        &format!("{sha256}:{}", occurrence.relative_path),
+                                    );
                                     taken_destinations.insert(suffixed.to_lowercase());
                                     (suffixed, true)
                                 };
@@ -1467,7 +1548,10 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                             },
                         ),
                         _ => {
-                            let suffixed = suffixed_destination(&planned, sha256);
+                            let suffixed = suffixed_destination(
+                                &planned,
+                                &format!("{sha256}:{}", occurrence.relative_path),
+                            );
                             taken_destinations.insert(suffixed.to_lowercase());
                             (
                                 OperationType::CopyWithSuffix,
@@ -2261,14 +2345,125 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_repeated_in_place_is_not_reproduced_in_the_destination() {
+        // The first thing the archive's owner did with a delivered tree was
+        // open `AGENTES COMERCIALES` and find `AGENTES COMERCIALES` inside it
+        // again, exactly as in the origin. The engine had mirrored the
+        // accident faithfully, which is the one thing a reconstruction should
+        // not be faithful about.
+        let collapse = |parts: &[&str]| -> Vec<String> {
+            collapse_adjacent_repeats(parts.iter().map(|s| s.to_string()).collect())
+        };
+
+        assert_eq!(
+            collapse(&["AGENTES COMERCIALES", "AGENTES COMERCIALES", "NATALIA"]),
+            vec!["AGENTES COMERCIALES", "NATALIA"]
+        );
+        // Three levels of the same tree is one accident, not three.
+        assert_eq!(
+            collapse(&["AGENTES", "AGENTES", "AGENTES", "NATALIA"]),
+            vec!["AGENTES", "NATALIA"]
+        );
+        // Case-insensitive, because the filesystem this runs on is.
+        assert_eq!(
+            collapse(&["Expedientes", "EXPEDIENTES", "1234"]),
+            vec!["Expedientes", "1234"]
+        );
+        // Only *adjacent* repeats. A name reappearing further down is a
+        // grafted root, which is a different finding with its own report and
+        // its own evidence, and is not something a namer may decide.
+        assert_eq!(
+            collapse(&["EXPEDIENTES", "CLIENTE", "EXPEDIENTES"]),
+            vec!["EXPEDIENTES", "CLIENTE", "EXPEDIENTES"]
+        );
+        // Digits are not an exemption, and believing they were cost a real
+        // plan: ten branches under one folder of forms, spelled `rtf\N\N`,
+        // held nothing of their own and refused it. Dated material nests as
+        // `2020\03`; `2020\2020` is the same accident as any other.
+        assert_eq!(collapse(&["2020", "2020", "actas"]), vec!["2020", "actas"]);
+        assert_eq!(collapse(&["rtf", "9", "9"]), vec!["rtf", "9"]);
+        // A different value is left alone — which is what that exemption was
+        // really protecting, and what this rule never touched anyway.
+        assert_eq!(
+            collapse(&["2020", "03", "actas"]),
+            vec!["2020", "03", "actas"]
+        );
+    }
+
+    #[test]
+    fn collapsing_a_repeated_folder_never_costs_a_content() {
+        // The property that makes this safe to do without asking. Two
+        // occurrences whose destinations now coincide must both survive: one
+        // keeps the path, the other gets a suffix. Nothing is overwritten and
+        // nothing is dropped — which is exactly what a *prune* of the same
+        // branches could not promise, and did not deliver when it was tried.
+        let planned = "salida\\AGENTES\\escrito.pdf";
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            taken.insert(planned.to_lowercase()),
+            "the first occurrence takes the collapsed path"
+        );
+        assert!(
+            !taken.insert(planned.to_lowercase()),
+            "the second one finds it taken rather than silently replacing it"
+        );
+
+        let a = suffixed_destination(planned, &first);
+        let b = suffixed_destination(planned, &second);
+        assert_ne!(a, b, "different content must not share a destination");
+        assert_ne!(a, planned);
+        assert!(
+            a.ends_with(".pdf") && b.ends_with(".pdf"),
+            "the suffix keeps the extension so the delivered file still opens: {a}, {b}"
+        );
+    }
+
+    #[test]
+    fn two_copies_of_one_content_landing_together_keep_two_names() {
+        // The failure this closes, from a real plan over 158.219 files:
+        //
+        //   operations #38977 and #38997 collide on destination
+        //   `...\AGENTES COMERCIALES30321...pdf~df-95a89991.pdf`
+        //
+        // Both had already collided once and both received the same suffix,
+        // because the suffix was derived from the content and the content was
+        // identical. Before a repeated path component was collapsed this
+        // could not happen: two copies of one file were kept apart by the
+        // folder that doubled. Collapsing it aimed them at one path, and the
+        // discriminator has to identify the occurrence, not the bytes.
+        let planned = r"salida\AGENTES\escrito.pdf";
+        let sha = "a".repeat(64);
+        let one = suffixed_destination(planned, &format!("{sha}:AGENTES/escrito.pdf"));
+        let two = suffixed_destination(planned, &format!("{sha}:AGENTES/AGENTES/escrito.pdf"));
+        assert_ne!(
+            one, two,
+            "same bytes, different origins: two destinations or one of them is lost"
+        );
+        assert!(one.ends_with(".pdf") && two.ends_with(".pdf"));
+        // Still deterministic: the same occurrence always lands on the same
+        // name, which is what §27.3 asks for.
+        assert_eq!(
+            one,
+            suffixed_destination(planned, &format!("{sha}:AGENTES/escrito.pdf"))
+        );
+    }
+
+    #[test]
     fn suffixed_destination_is_deterministic_and_keeps_the_extension() {
+        // The suffix is the leading hex of a digest *of the discriminator*,
+        // not of the discriminator's own leading characters: two occurrences
+        // whose discriminators share a prefix — the same SHA-256 followed by
+        // different source paths — have to end up with different names.
         assert_eq!(
             suffixed_destination("dir/doc.pdf", "abcdef1234567890"),
-            "dir/doc~df-abcdef12.pdf"
+            "dir/doc~df-840881e1.pdf"
         );
         assert_eq!(
             suffixed_destination("dir/no-extension", "abcdef1234567890"),
-            "dir/no-extension~df-abcdef12"
+            "dir/no-extension~df-840881e1"
         );
     }
 
@@ -2278,7 +2473,7 @@ mod tests {
         let suffixed = suffixed_destination(&destination, "abcdef1234567890");
         let file_name = Path::new(&suffixed).file_name().unwrap().to_string_lossy();
         assert_eq!(file_name.encode_utf16().count(), 255);
-        assert!(file_name.ends_with("~df-abcdef12.txt"), "{file_name}");
+        assert!(file_name.ends_with("~df-840881e1.txt"), "{file_name}");
         assert!(df_fs_safety::SafeRelativePath::parse(Path::new(&suffixed)).is_ok());
     }
 

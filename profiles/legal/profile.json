@@ -249,6 +249,292 @@
       },
       "action": "COPY_SEPARATED",
       "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.mp3",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mp3"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.wma",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.wma"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.m4a",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.m4a"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.wav",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.wav"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.flac",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.flac"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.ogg",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.ogg"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.aac",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.aac"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.mp2",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mp2"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.aiff",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.aiff"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.audio.opus",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.opus"
+      },
+      "classification": {
+        "category": "audio: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.mp4",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mp4"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.avi",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.avi"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.mkv",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mkv"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.wmv",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.wmv"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.mov",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mov"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.m4v",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.m4v"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.mpg",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mpg"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.mpeg",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.mpeg"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.3gp",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.3gp"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.vob",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.vob"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.flv",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.flv"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
+    },
+    {
+      "id": "separate.media.video.webm",
+      "version": 1,
+      "match": {
+        "file_name_glob": "*.webm"
+      },
+      "classification": {
+        "category": "video: se aparta antes de decidir, se revisa despues",
+        "confidence": 0.9
+      },
+      "action": "COPY_SEPARATED",
+      "risk": "LOW"
     }
   ],
   "destination_roots": [

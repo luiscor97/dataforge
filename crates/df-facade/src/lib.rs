@@ -1025,10 +1025,28 @@ pub fn project_integrity(project_dir: &Path) -> DfResult<ProjectStatus> {
 /// Validate (if needed) and scan the source roots into a fresh snapshot
 /// (RFC-0001 §12.1–§12.2). Ends in `SCANNED`.
 pub fn scan_project(project_dir: &Path, actor: Actor) -> DfResult<ScanOutcome> {
+    scan_project_with(project_dir, actor, false)
+}
+
+/// Scan, optionally closing a run that died without pausing.
+///
+/// `resume_interrupted` is the scan half of a recovery the hash stage has had
+/// since M0.8. A killed scan leaves the project in `SCANNING`, which nothing
+/// else accepts, and until now there was no command that could move it: the
+/// project was stranded by a closed window.
+pub fn scan_project_with(
+    project_dir: &Path,
+    actor: Actor,
+    resume_interrupted: bool,
+) -> DfResult<ScanOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_scan::scan_project(&mut db, actor, &df_scan::ScanOptions::default(), None)
+    let options = df_scan::ScanOptions {
+        resume_interrupted,
+        ..df_scan::ScanOptions::default()
+    };
+    df_scan::scan_project(&mut db, actor, &options, None)
 }
 
 /// Live scan counters (files, folders, bytes seen so far) of the latest run.
@@ -4503,13 +4521,24 @@ mod tests {
         // the delivered tree. Nothing about the decision was unsafe and no rule
         // refused it — RFC-0002 has the agent propose and something
         // deterministic verify, and this is that verification.
+        // The branch here is deliberately *not* adjacent to the name it
+        // repeats. The adjacent shape — `EXPEDIENTES\EXPEDIENTES` — no longer
+        // reaches a plan at all: the namer collapses a component that only
+        // repeats the one before it, so there is nothing left for this
+        // invariant to catch. That case is covered where it is now prevented,
+        // in `df-planner`. What survives, and what this guards, is the graft
+        // that lands further down, where collapsing would be a guess about
+        // structure rather than a rename.
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origen");
-        let scar = origin.join("EXPEDIENTES").join("EXPEDIENTES");
+        let scar = origin
+            .join("EXPEDIENTES")
+            .join("CLIENTE")
+            .join("EXPEDIENTES");
         std::fs::create_dir_all(&scar).unwrap();
-        std::fs::write(origin.join("EXPEDIENTES/uno.txt"), b"contenido uno").unwrap();
-        std::fs::write(origin.join("EXPEDIENTES/dos.txt"), b"contenido dos").unwrap();
-        // The nested copy holds only what its parent already holds.
+        std::fs::write(origin.join("EXPEDIENTES").join("uno.txt"), b"contenido uno").unwrap();
+        std::fs::write(origin.join("EXPEDIENTES").join("dos.txt"), b"contenido dos").unwrap();
+        // The nested copy holds only what its ancestor already holds.
         std::fs::write(scar.join("uno.txt"), b"contenido uno").unwrap();
         std::fs::write(scar.join("dos.txt"), b"contenido dos").unwrap();
 
@@ -4534,6 +4563,66 @@ mod tests {
             named,
             "the problem must name the branch: {:?}",
             report.problems
+        );
+    }
+
+    #[test]
+    fn the_delivered_tree_does_not_repeat_a_folder_inside_itself() {
+        // The complaint that started this, in the archive owner's words after
+        // opening a delivered tree: "siguen existiendo AGENTES COMERCIALES\
+        // AGENTES COMERCIALES". The engine had mirrored the source faithfully,
+        // including the accident. Its own audit of the archive found 76 places
+        // where a folder sits directly inside a folder of the same name, with
+        // 3.453 paths beneath them.
+        //
+        // Prevented rather than reported, because writing the destination one
+        // level higher is a rename in a tree that does not exist yet — it
+        // moves nothing and deletes nothing, unlike pruning the branch, which
+        // was measured to lose 744 contents when it was tried.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        let doubled = origin.join("EXPEDIENTES").join("EXPEDIENTES");
+        std::fs::create_dir_all(&doubled).unwrap();
+        std::fs::write(origin.join("EXPEDIENTES").join("fuera.txt"), b"de fuera").unwrap();
+        // Held only by the doubled branch: it must still arrive, one level up.
+        std::fs::write(doubled.join("dentro.txt"), b"solo aqui dentro").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+        scan_project(&req.project_dir, Actor::Test).expect("scan");
+        hash_project(&req.project_dir, Actor::Test).expect("hash");
+        analyze_project(&req.project_dir, Actor::Test).expect("analyze");
+        create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
+
+        let tree = plan_destination_tree(&req.project_dir, 6).expect("tree");
+        // Segment-wise. A substring test would answer yes for `EXPEDIENTES-2024`
+        // inside `EXPEDIENTES`, and a separator-joined one would answer no on
+        // whichever platform spells it the other way — both have shipped from
+        // this repository, in the same week.
+        for node in &tree.nodes {
+            let segments: Vec<String> = node
+                .prefix
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .map(str::to_lowercase)
+                .collect();
+            for pair in segments.windows(2) {
+                assert_ne!(
+                    pair[0], pair[1],
+                    "the delivered tree repeats a folder inside itself: {}",
+                    node.prefix
+                );
+            }
+        }
+
+        // And the content that lived only in the doubled branch is still
+        // planned. Collapsing a name must never cost a file.
+        assert!(
+            tree.files >= 2,
+            "both files must still be planned, got {} in {:?}",
+            tree.files,
+            tree.nodes
         );
 
         // A problem, never a refusal: the plan is still there to approve, and
@@ -4891,6 +4980,47 @@ mod tests {
         // With the rule's own words, so the reader can judge the decision
         // rather than only learn that one was taken.
         assert!(summary.contains("navigation data, not case material"));
+    }
+
+    #[test]
+    fn a_scan_killed_mid_run_does_not_strand_the_project() {
+        // Found by killing one. A scan of 158.219 files was stopped at the
+        // ten-minute mark and the project stayed in `SCANNING` — a state
+        // `scan` refused, `hash` refused, `plan discard` refused. There was
+        // no command that could move it, and the only way out would have been
+        // editing the database by hand. The hash stage has carried this
+        // recovery since M0.8; the scan stage had never needed it until a run
+        // was long enough to interrupt.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"material").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+
+        // The state a killed scan leaves, reached the way the scan itself
+        // reaches it: validate to READY, step into SCANNING, and then stop
+        // existing. Nothing writes the cancellation that `SCAN_PAUSED` would
+        // carry, because the process that owed it is gone.
+        {
+            let marker = read_marker(&req.project_dir).unwrap();
+            let mut db = open_db(&req.project_dir, &marker).unwrap();
+            df_scan::validate_project(&mut db, Actor::Test).unwrap();
+            repository::update_project_state(&mut db, ProjectState::Scanning, Actor::Test).unwrap();
+        }
+
+        let refused = scan_project(&req.project_dir, Actor::Test);
+        assert!(
+            matches!(&refused, Err(DfError::Validation(message))
+                if message.contains("SCANNING") && message.contains("resume_interrupted")),
+            "a plain scan must refuse and say how to recover, got {refused:?}"
+        );
+
+        let resumed = scan_project_with(&req.project_dir, Actor::Test, true)
+            .expect("the stranded project must be recoverable");
+        assert_eq!(resumed.files, 1, "the fresh snapshot still sees the origin");
     }
 
     #[test]
