@@ -230,6 +230,15 @@ pub enum AnomalyKind {
     ExtremePath,
     PartialTreeUniqueContent,
     EmbeddedTree,
+    /// A folder repeating an ancestor's name that holds nothing of its own.
+    ///
+    /// Detected since M2.x and reported ever since, but never decidable: the
+    /// plan invariant refused to place one in the active tree and there was
+    /// no item anyone could answer. On the real archive that left a plan
+    /// unapprovable over `ESCANER\DOCUMENTOS ESCANER\ESCANER`, a folder
+    /// whose owner had said in so many words to leave exactly as it was.
+    /// Both were right; only one of them could be written down.
+    DragScar,
 }
 
 impl AnomalyKind {
@@ -241,6 +250,7 @@ impl AnomalyKind {
             Self::ExtremePath => "EXTREME_PATH",
             Self::PartialTreeUniqueContent => "PARTIAL_TREE_UNIQUE_CONTENT",
             Self::EmbeddedTree => "EMBEDDED_TREE",
+            Self::DragScar => "DRAG_SCAR",
         }
     }
 }

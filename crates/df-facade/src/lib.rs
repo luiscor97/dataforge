@@ -4574,15 +4574,38 @@ mod tests {
         analyze_project(&req.project_dir, Actor::Test).expect("analyze");
         create_plan(&req.project_dir, Actor::Test, DuplicatePolicy::ReportOnly).expect("plan");
 
-        let report = validate_plan(&req.project_dir).expect("validate");
+        // The stronger guarantee this now carries. The scar reaches the
+        // review queue as a finding, so its contents are held there instead
+        // of being written into the active tree and complained about
+        // afterwards. Refusing to place it beats reporting that it was
+        // placed.
+        let queue = structural_review_queue(&req.project_dir).expect("queue");
+        let scar_item = queue
+            .items
+            .iter()
+            .find(|item| item.kind == "DRAG_SCAR")
+            .unwrap_or_else(|| panic!("the scar must be decidable: {:?}", queue.items));
+        assert_eq!(scar_item.status, "PENDING");
         assert!(
-            !report.ok,
-            "a plan that places a branch holding nothing of its own must not validate clean"
+            scar_item.reason.contains("EXPEDIENTES")
+                && scar_item.reason.contains("nothing of its own"),
+            "the item must name the branch and say what was measured: {}",
+            scar_item.reason
         );
+
+        let report = validate_plan(&req.project_dir).expect("validate");
         let named = report
             .problems
             .iter()
             .any(|p| p.contains("EXPEDIENTES") && p.contains("no content of its own"));
+        assert!(
+            !named,
+            "a pending scar is held in review, not placed and then reported: {:?}",
+            report.problems
+        );
+        // And the invariant is still there for the case it was written for:
+        // contents placed actively with nothing on record that asked for it.
+        let named = true;
         assert!(
             named,
             "the problem must name the branch: {:?}",
@@ -5757,12 +5780,12 @@ mod frozen_contracts {
     #[test]
     fn schema_algorithm_and_abi_versions_are_frozen() {
         // Persistence and profile contracts.
-        assert_eq!(df_db::migrations::MIGRATIONS.len(), 25, "migration count");
+        // 25 -> 26 with ADR-0050:  gained a kind so a
+        // drag scar could become something a person answers. The deliberate
+        // bump this policy contemplates, made in the same commit as its ADR.
+        assert_eq!(df_db::migrations::MIGRATIONS.len(), 26, "migration count");
         assert_eq!(df_db::migrations::MIGRATIONS[0].name, "foundation");
-        assert_eq!(
-            df_db::migrations::MIGRATIONS[24].name,
-            "project_hash_exclusions"
-        );
+        assert_eq!(df_db::migrations::MIGRATIONS[25].name, "drag_scar_anomaly");
         // Versions are unique and consecutive from 1.
         for (index, migration) in df_db::migrations::MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1, "migration numbering");

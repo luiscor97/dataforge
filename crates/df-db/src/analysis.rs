@@ -1217,6 +1217,65 @@ pub fn detect_anomalies(
         }
     }
 
+    // Drag scars, as items somebody can answer.
+    //
+    // They were detected and reported from the day the detector shipped, and
+    // that was the whole problem: the plan invariant refuses to place one in
+    // the active tree, and there was no item to decide, so a plan could be
+    // refused over a branch whose owner had already said what to do with it.
+    // A hard boundary with no way to record consent is not a boundary, it is
+    // a dead end.
+    //
+    // `requires_review` is true and the recommendation stays `COPY_REVIEW`:
+    // the engine still refuses to decide this by itself, it just stops
+    // refusing to be told.
+    let folder_ids: std::collections::HashMap<String, String> = {
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT relative_path, id FROM folders WHERE snapshot_id = ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![snapshot_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (path, id) = row.map_err(db_err)?;
+            map.insert(path, id);
+        }
+        map
+    };
+    for scar in crate::structure::drag_scars(db, snapshot_id)? {
+        // A scar is a folder, and the anomaly has to point at something.
+        // Without the id the row would be an accusation with no subject.
+        let Some(folder_id) = folder_ids.get(&scar.relative_path).cloned() else {
+            continue;
+        };
+        candidates.push(AnomalyCandidate {
+            id: stable_id(
+                "drag-scar",
+                &[&snapshot_id.to_string(), &scar.relative_path],
+            ),
+            occurrence_id: None,
+            folder_a: Some(folder_id),
+            folder_b: None,
+            kind: AnomalyKind::DragScar,
+            severity: AnomalySeverity::Warning,
+            requires_review: true,
+            summary: format!(
+                "`{}` repeats an ancestor's name and holds nothing of its own: {}                  occurrence(s), {} distinct content(s), every one of them present                  outside this branch",
+                scar.relative_path, scar.occurrences, scar.contents
+            ),
+            evidence: canonical_json(&serde_json::json!({
+                "relative_path": scar.relative_path,
+                "occurrences": scar.occurrences,
+                "contents": scar.contents,
+                "contents_unique_to_this_branch": 0,
+            })),
+        });
+    }
+
     candidates.sort_by(|a, b| a.id.cmp(&b.id));
     candidates.dedup_by(|a, b| a.id == b.id);
     let now = to_stored_timestamp(chrono::Utc::now());

@@ -484,6 +484,17 @@ fn destination_falls_inside(destination: &str, folder: &str) -> bool {
 /// A problem, not a refusal. `plan validate` reports; approving anyway stays
 /// the caller's call, and there are corpora where a repeated folder name is
 /// deliberate. What must not happen is approving without being told.
+/// The path a drag-scar review item is about, read back from its summary.
+///
+/// The summary is written by this crate's sibling in `df-db` and opens with
+/// the path in backticks. Parsed rather than re-derived so the two never
+/// disagree about which branch an item answered.
+fn scar_path_from_summary(summary: &str) -> Option<String> {
+    let rest = summary.strip_prefix('`')?;
+    let (path, _) = rest.split_once('`')?;
+    Some(path.to_string())
+}
+
 fn drag_scars_placed_in_the_active_tree(
     db: &Db,
     plan: &df_domain::Plan,
@@ -493,8 +504,39 @@ fn drag_scars_placed_in_the_active_tree(
     if scars.is_empty() {
         return Ok(Vec::new());
     }
+    // A scar somebody has already answered is not a surprise, and repeating
+    // the warning is how a check teaches people to skip it. The archive's
+    // owner said of one folder, in so many words, that it was to be left
+    // exactly as it was; the branch does hold nothing of its own, and both of
+    // those are true at once. Until the finding could be decided there was
+    // nowhere to write that down, and a plan stayed unapprovable over a
+    // question that had already been settled out loud.
+    //
+    // Only a *decided* item silences it. Pending ones still raise the
+    // problem, which is the whole point of raising it.
+    let decided: std::collections::HashSet<String> =
+        df_db::analysis::review_queue(db, plan.snapshot_id)?
+            .items
+            .into_iter()
+            .filter(|item| item.kind == "DRAG_SCAR" && item.decision.is_some())
+            .filter_map(|item| {
+                serde_json::from_str::<serde_json::Value>(&item.reason)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("relative_path")
+                            .and_then(|p| p.as_str())
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| scar_path_from_summary(&item.reason))
+            })
+            .collect();
+
     let mut problems = Vec::new();
     for scar in scars {
+        if decided.contains(&scar.relative_path) {
+            continue;
+        }
         // The destination mirrors the source path, so a scar reaches the
         // active tree when an operation lands inside it without a bucket
         // prefix. Matching on the destination is deliberate: it is what the
