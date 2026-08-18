@@ -1485,7 +1485,17 @@ fn print_content_search(outcome: &ContentSearchOutcome) {
     println!("Extraction run : {}", outcome.run_id);
     println!("Search index   : {}", outcome.index.id);
     println!("Query          : {}", outcome.query);
-    println!("Hits           : {}", outcome.hits.len());
+    // Shown against the total, always, including when they are equal. A
+    // count on its own reads as the answer, and on this surface it was the
+    // answer to a different question.
+    println!(
+        "Hits           : {} of {} matching",
+        outcome.hits.len(),
+        outcome.total
+    );
+    if outcome.has_more {
+        println!("                 more remain past this window; raise --limit or --offset");
+    }
     for hit in &outcome.hits {
         println!();
         println!("  {:.4} â€” {}", hit.score, hit.representative_path);
