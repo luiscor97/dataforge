@@ -29,12 +29,22 @@ use sha2::Digest;
 pub struct ScanOptions {
     /// Entries accumulated before a transactional flush (1 000–10 000).
     pub batch_entries: usize,
+    /// Accept a project left in `SCANNING` by a run that died without
+    /// reaching its cancellation path — a kill, a power cut, a closed
+    /// window. `SCAN_PAUSED` is only ever written by the cooperative cancel
+    /// check, so an abrupt death strands the project in a state nothing else
+    /// accepts, and there was no way out of it: the hash stage has carried
+    /// this exact recovery since M0.8 and the scan stage never learned it.
+    /// Off by default, because if a scan really is running, a second one
+    /// must not join it.
+    pub resume_interrupted: bool,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             batch_entries: 1_000,
+            resume_interrupted: false,
         }
     }
 }
@@ -143,6 +153,13 @@ pub fn scan_project(
         | ProjectState::Analyzed
         | ProjectState::Completed
         | ProjectState::CompletedWithWarnings => {}
+        ProjectState::Scanning if options.resume_interrupted => {}
+        ProjectState::Scanning => {
+            return Err(DfError::Validation(
+                "the project is in state SCANNING: either a scan run is active, or one                  died without pausing. If no run is active, re-run with                  `resume_interrupted` (CLI: `--resume-interrupted`) to close the                  interrupted run and start a fresh snapshot"
+                    .to_string(),
+            ));
+        }
         other => {
             return Err(DfError::Validation(format!(
                 "cannot scan a project in state {other} \
@@ -153,6 +170,14 @@ pub fn scan_project(
     }
 
     let roots = repository::load_source_roots(db, project.id)?;
+    // Close the dead run on the record before opening a new one: `SCANNING ->
+    // SCANNING` is not a legal transition (§11). The stale liveness claim
+    // needs no clearing — `claim` upserts, so the new run's heartbeat
+    // replaces the dead one's, and `release` only ever drops a claim held by
+    // the calling process.
+    if matches!(project.state, ProjectState::Scanning) {
+        repository::update_project_state(db, ProjectState::ScanPaused, actor)?;
+    }
     repository::update_project_state(db, ProjectState::Scanning, actor)?;
     // Without this a scan of a large archive runs for minutes while
     // `project_status` reports `active_run: null` — not "no information", but
@@ -932,7 +957,10 @@ mod tests {
     fn small_batches_flush_correctly() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut db, _origin) = project_with_origin(tmp.path());
-        let options = ScanOptions { batch_entries: 1 };
+        let options = ScanOptions {
+            batch_entries: 1,
+            resume_interrupted: false,
+        };
         let outcome = scan_project(&mut db, Actor::Test, &options, None).unwrap();
         assert_eq!(outcome.files, 3);
         assert_eq!(outcome.folders, 4);
@@ -1067,7 +1095,10 @@ mod tests {
             // One entry per batch: the counters are committed once per batch,
             // so this is the setting under which a mid-scan reader would see
             // the most intermediate states.
-            &ScanOptions { batch_entries: 1 },
+            &ScanOptions {
+                batch_entries: 1,
+                resume_interrupted: false,
+            },
             None,
         )
         .unwrap();

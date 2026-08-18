@@ -112,6 +112,14 @@ enum Command {
         /// Project directory.
         #[arg(long)]
         path: PathBuf,
+        /// Continue a project stranded in `SCANNING` by a run that died
+        /// without pausing (a kill, a power cut, a closed window). Only pass
+        /// this when no other scan run is active; `project status` shows
+        /// `active_run` — who claimed the project, from where, and how long
+        /// since it last reported — so the assertion can be an informed one.
+        /// The interrupted run is closed before a fresh snapshot starts.
+        #[arg(long)]
+        resume_interrupted: bool,
     },
     /// Compute BLAKE3 + SHA-256 for every scanned file. Resumable.
     Hash {
@@ -839,7 +847,10 @@ fn run(cli: &Cli) -> DfResult<Output> {
                 .map(Box::new)
                 .map(Output::Status),
         },
-        Command::Scan { path } => df_facade::scan_project(path, actor).map(Output::Scan),
+        Command::Scan {
+            path,
+            resume_interrupted,
+        } => df_facade::scan_project_with(path, actor, *resume_interrupted).map(Output::Scan),
         Command::Hash {
             path,
             incremental,
