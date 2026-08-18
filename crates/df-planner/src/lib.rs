@@ -962,19 +962,20 @@ fn portable_relative_path(
 /// Runs of any length collapse to one, and the comparison ignores case
 /// because Windows does.
 ///
-/// Left alone: components that are numeric or very short. `2020\2020` and
-/// `v2\v2` are how versioned and dated material is legitimately nested, and
-/// the archive's own history includes a repetition that turned out to be a
-/// folder of taxpayers per person rather than an accident. When the signal is
-/// this cheap, the conservative half of it is worth keeping.
+/// The shape of the name is deliberately not consulted. An earlier version
+/// skipped numeric and very short components, reasoning that `2020\2020`
+/// and `v2\v2` were how dated and versioned material nests legitimately.
+/// That was the wrong counterexample: dates nest as `2020\03`, never as
+/// `2020\2020`, and this fires only on two *equal* adjacent names, which is
+/// an accident whether they are digits or letters. The real archive settled
+/// it — ten branches under `FORMULARIOS...\rtf\N\N` held nothing of their
+/// own and were refusing a whole plan for the sake of that exemption.
 fn collapse_adjacent_repeats(components: Vec<String>) -> Vec<String> {
     let mut collapsed: Vec<String> = Vec::with_capacity(components.len());
     for component in components {
-        let repeats_previous = collapsed.last().is_some_and(|previous: &String| {
-            previous.eq_ignore_ascii_case(&component)
-                && component.chars().count() > 2
-                && !component.chars().all(|c| c.is_ascii_digit())
-        });
+        let repeats_previous = collapsed
+            .last()
+            .is_some_and(|previous: &String| previous.eq_ignore_ascii_case(&component));
         if !repeats_previous {
             collapsed.push(component);
         }
@@ -2346,13 +2347,18 @@ mod tests {
             collapse(&["EXPEDIENTES", "CLIENTE", "EXPEDIENTES"]),
             vec!["EXPEDIENTES", "CLIENTE", "EXPEDIENTES"]
         );
-        // Numeric and very short components are how dated and versioned
-        // material nests legitimately.
+        // Digits are not an exemption, and believing they were cost a real
+        // plan: ten branches under one folder of forms, spelled `rtf\N\N`,
+        // held nothing of their own and refused it. Dated material nests as
+        // `2020\03`; `2020\2020` is the same accident as any other.
+        assert_eq!(collapse(&["2020", "2020", "actas"]), vec!["2020", "actas"]);
+        assert_eq!(collapse(&["rtf", "9", "9"]), vec!["rtf", "9"]);
+        // A different value is left alone — which is what that exemption was
+        // really protecting, and what this rule never touched anyway.
         assert_eq!(
-            collapse(&["2020", "2020", "actas"]),
-            vec!["2020", "2020", "actas"]
+            collapse(&["2020", "03", "actas"]),
+            vec!["2020", "03", "actas"]
         );
-        assert_eq!(collapse(&["v2", "v2", "plano"]), vec!["v2", "v2", "plano"]);
     }
 
     #[test]
