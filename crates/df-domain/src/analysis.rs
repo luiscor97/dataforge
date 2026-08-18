@@ -59,6 +59,24 @@ pub struct RuleMatch {
     /// more Unicode scalar values and `?` exactly one. Path separators are
     /// rejected so a rule cannot escape its declared subject.
     pub file_name_glob: String,
+    /// Optional folder name that must appear somewhere above the file.
+    ///
+    /// A **name**, never a path: separators are rejected for the same reason
+    /// they are above, and the comparison is segment by segment rather than a
+    /// substring, so `lib` never matches `libreria` and the answer does not
+    /// depend on which separator the platform writes.
+    ///
+    /// It exists because the file name alone could not express the criterion
+    /// that works. On the audited archive the human classification separated
+    /// 8.171 files as technical, and the extension is close to useless for
+    /// finding them: `.jpg` appears 578 times among those and 2.523 times
+    /// among the files that were kept, so a rule on the extension would throw
+    /// away the pericial photographs. What separates them is where they live
+    /// — inside `locale`, `bin`, `node_modules`, a plugin tree. Matching the
+    /// containing folder covers 28,4% of those exclusions and touches one
+    /// kept file out of 28.569.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ancestor_folder: Option<String>,
 }
 
 /// Explainable classification emitted by a rule.
@@ -120,11 +138,48 @@ impl RuleDefinition {
                 self.id
             )));
         }
+        if let Some(folder) = &self.match_spec.ancestor_folder {
+            if folder.trim().is_empty() || folder.len() > 255 {
+                return Err(df_error::DfError::Validation(format!(
+                    "rule `{}` ancestor_folder must contain 1..=255 bytes",
+                    self.id
+                )));
+            }
+            if folder.contains(['/', '\\']) {
+                return Err(df_error::DfError::Validation(format!(
+                    "rule `{}` ancestor_folder is a folder name, not a path",
+                    self.id
+                )));
+            }
+        }
         Ok(())
     }
 
     /// Evaluate the rule against a display file name. Raw path identity is
     /// preserved separately; a metadata rule never decides content identity.
+    /// Evaluate the rule against a file name and the relative path it sits
+    /// on. Both halves must hold; a rule with no `ancestor_folder` behaves
+    /// exactly as it did before this existed.
+    pub fn matches(&self, file_name: &str, relative_path: &str) -> bool {
+        if !self.matches_file_name(file_name) {
+            return false;
+        }
+        let Some(folder) = &self.match_spec.ancestor_folder else {
+            return true;
+        };
+        // Segment by segment, both separators, and never the last component:
+        // the subject is a *containing* folder, and the file's own name is
+        // already the business of `file_name_glob`.
+        let mut segments: Vec<&str> = relative_path
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        segments.pop();
+        segments
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case(folder))
+    }
+
     pub fn matches_file_name(&self, file_name: &str) -> bool {
         glob_matches(
             &self.match_spec.file_name_glob.to_lowercase(),
@@ -227,6 +282,7 @@ mod tests {
             version: 1,
             match_spec: RuleMatch {
                 file_name_glob: glob.to_string(),
+                ancestor_folder: None,
             },
             classification: RuleClassification {
                 category: "temporary".to_string(),
@@ -257,6 +313,60 @@ mod tests {
         assert!(rule("*.tmp").matches_file_name("BORRADOR.TMP"));
         assert!(rule("copia-?.txt").matches_file_name("Copia-ñ.TXT"));
         assert!(!rule("*.tmp").matches_file_name("tmp/documento"));
+    }
+
+    #[test]
+    fn a_rule_can_name_the_folder_that_contains_the_file() {
+        // Why this exists, in one number: the human classification of the
+        // audited archive separated 8.171 files as technical, and `.jpg`
+        // appears 578 times among them and 2.523 times among the files it
+        // kept. A rule on the extension would throw away the pericial
+        // photographs. Where the file lives is the signal; what it is called
+        // is not.
+        let inside = |folder: &str, glob: &str| RuleDefinition {
+            id: "separate.software-tree".to_string(),
+            version: 1,
+            match_spec: RuleMatch {
+                file_name_glob: glob.to_string(),
+                ancestor_folder: Some(folder.to_string()),
+            },
+            classification: RuleClassification {
+                category: "programa instalado".to_string(),
+                confidence: 0.95,
+            },
+            action: RuleAction::CopySeparated,
+            risk: RiskLevel::Low,
+        };
+
+        let r = inside("locale", "*");
+        assert!(r.matches("es.pak", "programa/locale/es.pak"));
+        assert!(r.matches("es.pak", r"programa\locale\es.pak"));
+        // The pericial photograph this must never touch.
+        assert!(!r.matches("dni dubitada.jpg", "PERICIALES/asunto 12/dni dubitada.jpg"));
+
+        // A name, compared whole. `lib` is not `libreria`, on either
+        // separator — a substring test says otherwise and has shipped from
+        // this repository more than once.
+        let lib = inside("lib", "*");
+        assert!(lib.matches("x.dll", "app/lib/x.dll"));
+        assert!(!lib.matches("escrito.pdf", "libreria/escrito.pdf"));
+        assert!(!lib.matches("escrito.pdf", "LIBRERIA/sub/escrito.pdf"));
+        // Case-insensitive, because the filesystem is.
+        assert!(lib.matches("x.dll", "app/LIB/x.dll"));
+
+        // The file's own name is never the containing folder: a file called
+        // `lib` is not inside one.
+        assert!(!lib.matches("lib", "app/lib"));
+
+        // Both halves must hold.
+        let only_dll = inside("bin", "*.dll");
+        assert!(only_dll.matches("a.dll", "app/bin/a.dll"));
+        assert!(!only_dll.matches("contrato.pdf", "app/bin/contrato.pdf"));
+
+        // And a folder name is rejected if it is really a path.
+        let mut escaping = inside("bin", "*");
+        escaping.match_spec.ancestor_folder = Some("app/bin".to_string());
+        assert!(escaping.validate().is_err());
     }
 
     #[test]

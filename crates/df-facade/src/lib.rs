@@ -1025,10 +1025,28 @@ pub fn project_integrity(project_dir: &Path) -> DfResult<ProjectStatus> {
 /// Validate (if needed) and scan the source roots into a fresh snapshot
 /// (RFC-0001 §12.1–§12.2). Ends in `SCANNED`.
 pub fn scan_project(project_dir: &Path, actor: Actor) -> DfResult<ScanOutcome> {
+    scan_project_with(project_dir, actor, false)
+}
+
+/// Scan, optionally closing a run that died without pausing.
+///
+/// `resume_interrupted` is the scan half of a recovery the hash stage has had
+/// since M0.8. A killed scan leaves the project in `SCANNING`, which nothing
+/// else accepts, and until now there was no command that could move it: the
+/// project was stranded by a closed window.
+pub fn scan_project_with(
+    project_dir: &Path,
+    actor: Actor,
+    resume_interrupted: bool,
+) -> DfResult<ScanOutcome> {
     let project_dir = absolutize(project_dir)?;
     let marker = read_marker(&project_dir)?;
     let mut db = open_db(&project_dir, &marker)?;
-    df_scan::scan_project(&mut db, actor, &df_scan::ScanOptions::default(), None)
+    let options = df_scan::ScanOptions {
+        resume_interrupted,
+        ..df_scan::ScanOptions::default()
+    };
+    df_scan::scan_project(&mut db, actor, &options, None)
 }
 
 /// Live scan counters (files, folders, bytes seen so far) of the latest run.
@@ -4962,6 +4980,47 @@ mod tests {
         // With the rule's own words, so the reader can judge the decision
         // rather than only learn that one was taken.
         assert!(summary.contains("navigation data, not case material"));
+    }
+
+    #[test]
+    fn a_scan_killed_mid_run_does_not_strand_the_project() {
+        // Found by killing one. A scan of 158.219 files was stopped at the
+        // ten-minute mark and the project stayed in `SCANNING` — a state
+        // `scan` refused, `hash` refused, `plan discard` refused. There was
+        // no command that could move it, and the only way out would have been
+        // editing the database by hand. The hash stage has carried this
+        // recovery since M0.8; the scan stage had never needed it until a run
+        // was long enough to interrupt.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origen");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("uno.txt"), b"material").unwrap();
+
+        let mut req = request(tmp.path());
+        req.source_roots = vec![origin];
+        create_project(&req, Actor::Test).unwrap();
+
+        // The state a killed scan leaves, reached the way the scan itself
+        // reaches it: validate to READY, step into SCANNING, and then stop
+        // existing. Nothing writes the cancellation that `SCAN_PAUSED` would
+        // carry, because the process that owed it is gone.
+        {
+            let marker = read_marker(&req.project_dir).unwrap();
+            let mut db = open_db(&req.project_dir, &marker).unwrap();
+            df_scan::validate_project(&mut db, Actor::Test).unwrap();
+            repository::update_project_state(&mut db, ProjectState::Scanning, Actor::Test).unwrap();
+        }
+
+        let refused = scan_project(&req.project_dir, Actor::Test);
+        assert!(
+            matches!(&refused, Err(DfError::Validation(message))
+                if message.contains("SCANNING") && message.contains("resume_interrupted")),
+            "a plain scan must refuse and say how to recover, got {refused:?}"
+        );
+
+        let resumed = scan_project_with(&req.project_dir, Actor::Test, true)
+            .expect("the stranded project must be recoverable");
+        assert_eq!(resumed.files, 1, "the fresh snapshot still sees the origin");
     }
 
     #[test]
