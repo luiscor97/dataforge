@@ -1417,7 +1417,10 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                                     ),
                                 )
                             } else {
-                                let suffixed = suffixed_destination(&planned, sha256);
+                                let suffixed = suffixed_destination(
+                                    &planned,
+                                    &format!("{sha256}:{}", occurrence.relative_path),
+                                );
                                 taken_destinations.insert(suffixed.to_lowercase());
                                 (
                                     OperationType::CopyWithSuffix,
@@ -1545,7 +1548,10 @@ fn build_operations(db: &Db, plan: &Plan, policy: DuplicatePolicy) -> DfResult<V
                             },
                         ),
                         _ => {
-                            let suffixed = suffixed_destination(&planned, sha256);
+                            let suffixed = suffixed_destination(
+                                &planned,
+                                &format!("{sha256}:{}", occurrence.relative_path),
+                            );
                             taken_destinations.insert(suffixed.to_lowercase());
                             (
                                 OperationType::CopyWithSuffix,
