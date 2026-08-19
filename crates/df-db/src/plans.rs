@@ -578,10 +578,26 @@ pub fn previously_executed_plan(
 ) -> DfResult<Option<(String, u32)>> {
     db.conn()
         .query_row(
+            // Only an operation that *materialises* something is evidence
+            // that a plan wrote. Non-executable coverage entries —
+            // SKIP_REPRESENTED, NO_ACTION — are born `COMPLETED` because
+            // there is nothing to run, and counting those made every
+            // consolidating plan look executed the moment it was created.
+            //
+            // On the real archive that meant a plan with 898 skips and not
+            // one byte written refused the next plan's execution, and the
+            // refusal said the output already held files while the output
+            // directory did not exist.
             "SELECT p.id, p.version FROM plans p
              WHERE p.project_id = ?1 AND p.id <> ?2
                AND EXISTS (SELECT 1 FROM plan_operations op
-                           WHERE op.plan_id = p.id AND op.execution_state = 'COMPLETED')
+                           WHERE op.plan_id = p.id
+                             AND op.execution_state = 'COMPLETED'
+                             AND op.operation_type IN (
+                                 'COPY_ACTIVE', 'COPY_REVIEW', 'COPY_SEPARATED',
+                                 'COPY_TEMPORARY', 'COPY_WITH_SUFFIX',
+                                 'PRESERVE_ACROSS_CONTEXT', 'CREATE_DIRECTORY'
+                             ))
              ORDER BY p.version DESC LIMIT 1",
             params![project_id.to_string(), current.to_string()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32)),
@@ -2057,6 +2073,70 @@ mod tests {
                 ("NO_ACTION".to_string(), 1),
                 ("SKIP_REPRESENTED".to_string(), 2),
             ]
+        );
+    }
+
+    #[test]
+    fn a_plan_that_only_skipped_did_not_write_anything() {
+        // The refusal this closes, from a real project. `execute` stopped
+        // with "plan v5 has already written into D:\df-run3\salida" while
+        // that directory did not exist and nothing had ever been copied.
+        //
+        // Every consolidating plan is born with completed operations:
+        // SKIP_REPRESENTED has nothing to run, so `initial_execution_state`
+        // marks it done. Asking "does any operation say COMPLETED" cannot
+        // tell that apart from a plan that wrote files, and after six
+        // rounds of comparing duplicate policies there were five superseded
+        // plans each holding ~900 of them.
+        let mut db = Db::open_in_memory().unwrap();
+        let (plan, _ops) = project_with_plan(&mut db);
+        let project = crate::repository::load_project(&db).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, 77, 'SKIP_REPRESENTED', NULL, 1.0, 'MEDIUM',
+                         'PENDING', 'COMPLETED', ?3, 'ya representado', ?4, ?4)",
+                params![
+                    OperationId::new().to_string(),
+                    plan.id.to_string(),
+                    format!("{:064}", 77),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+
+        let other = PlanId::new();
+        assert_eq!(
+            previously_executed_plan(&db, project.id, other).unwrap(),
+            None,
+            "a plan whose only completed operation wrote nothing has not written"
+        );
+
+        // And the guard still fires for a plan that did write.
+        db.conn()
+            .execute(
+                "INSERT INTO plan_operations
+                    (id, plan_id, sequence, operation_type,
+                     destination_relative_path, confidence, risk, approval,
+                     execution_state, idempotency_key, reason, created_at, updated_at)
+                 VALUES (?1, ?2, 78, 'COPY_ACTIVE', 'salida/uno.txt', 1.0, 'LOW',
+                         'APPROVED', 'COMPLETED', ?3, 'copiado', ?4, ?4)",
+                params![
+                    OperationId::new().to_string(),
+                    plan.id.to_string(),
+                    format!("{:064}", 78),
+                    to_stored_timestamp(chrono::Utc::now()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            previously_executed_plan(&db, project.id, other)
+                .unwrap()
+                .is_some(),
+            "one materialised copy is what makes an output already written"
         );
     }
 
