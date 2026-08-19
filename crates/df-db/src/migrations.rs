@@ -195,20 +195,60 @@ pub fn apply_migrations(db: &mut Db) -> DfResult<()> {
                 )));
             }
             None => {
-                let tx = db.conn_mut().transaction().map_err(db_err)?;
-                tx.execute_batch(migration.sql).map_err(db_err)?;
-                tx.execute(
-                    "INSERT INTO schema_migrations (version, name, sha256, applied_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        migration.version,
-                        migration.name,
-                        checksum,
-                        df_ledger::canonical_timestamp(chrono::Utc::now()),
-                    ],
-                )
-                .map_err(db_err)?;
-                tx.commit().map_err(db_err)?;
+                // Foreign keys go off for the length of one migration, and
+                // this is the only place it can be done: `PRAGMA
+                // foreign_keys` is a no-op inside a transaction, so a
+                // migration that writes it in its own SQL is writing a
+                // comment.
+                //
+                // It matters for the one thing SQLite cannot do in place —
+                // change a CHECK — which needs the table rebuilt under a new
+                // name and renamed over the old one. `DROP TABLE` on a table
+                // other rows reference runs an implicit delete and trips the
+                // constraint. A fresh database has no such rows, so the
+                // migration passes every test and fails on the first real
+                // archive: 15.984 anomalies with review items pointing at
+                // them, and the whole open refused.
+                //
+                // Restored before the transaction commits, so a failure
+                // cannot leave the connection permissive.
+                let restore = db.conn().pragma_update(None, "foreign_keys", false).is_ok();
+                let applied = (|| -> DfResult<()> {
+                    let tx = db.conn_mut().transaction().map_err(db_err)?;
+                    tx.execute_batch(migration.sql).map_err(db_err)?;
+                    tx.execute(
+                        "INSERT INTO schema_migrations (version, name, sha256, applied_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            migration.version,
+                            migration.name,
+                            checksum,
+                            df_ledger::canonical_timestamp(chrono::Utc::now()),
+                        ],
+                    )
+                    .map_err(db_err)?;
+                    tx.commit().map_err(db_err)
+                })();
+                if restore {
+                    // Back on immediately: a migration is the exception, and
+                    // the connection that outlives it must not inherit it.
+                    db.conn()
+                        .pragma_update(None, "foreign_keys", true)
+                        .map_err(db_err)?;
+                    // And say so rather than trust it. A silently permissive
+                    // connection is the kind of thing that is discovered by
+                    // the damage it allowed.
+                    let on: i64 = db
+                        .conn()
+                        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                        .map_err(db_err)?;
+                    if on != 1 {
+                        return Err(DfError::Database(
+                            "foreign keys stayed disabled after a migration".to_string(),
+                        ));
+                    }
+                }
+                applied?;
             }
         }
     }
@@ -487,6 +527,35 @@ mod tests {
             .unwrap();
         assert_eq!(applied as usize, MIGRATIONS.len());
         verify_applied(&db).expect("a fresh install verifies");
+    }
+
+    #[test]
+    fn foreign_keys_are_on_again_once_migrations_finish() {
+        // They are turned off for the length of each migration, because the
+        // only way to change a CHECK in SQLite is to rebuild the table, and
+        // `DROP TABLE` on something other rows reference trips the
+        // constraint. `PRAGMA foreign_keys` is a no-op inside a transaction,
+        // so a migration cannot do this for itself — the runner has to.
+        //
+        // What must never survive that is the pragma. A connection that stays
+        // permissive is discovered by the damage it allows, months later, in
+        // rows nothing was there to refuse.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("state.sqlite")).unwrap();
+        let on: i64 = db
+            .conn()
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(on, 1, "foreign keys must be back on after migrations");
+
+        // And the database has to be sound, not merely unenforced.
+        let violations: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     #[test]
