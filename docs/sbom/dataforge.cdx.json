@@ -391,25 +391,6 @@
     },
     {
       "type": "library",
-      "name": "arrayref",
-      "version": "0.3.9",
-      "scope": "required",
-      "description": "Macros to take array references of slices",
-      "licenses": [
-        {
-          "expression": "BSD-2-Clause"
-        }
-      ],
-      "purl": "pkg:cargo/arrayref@0.3.9",
-      "externalReferences": [
-        {
-          "type": "distribution",
-          "url": "https://crates.io/"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "name": "arrayvec",
       "version": "0.7.8",
       "scope": "required",
@@ -847,6 +828,25 @@
     },
     {
       "type": "library",
+      "name": "base64",
+      "version": "0.23.1",
+      "scope": "required",
+      "description": "encodes and decodes base64 as bytes or utf8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/base64@0.23.1",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://crates.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "base64ct",
       "version": "1.8.3",
       "scope": "required",
@@ -981,7 +981,7 @@
     {
       "type": "library",
       "name": "blake3",
-      "version": "1.8.5",
+      "version": "1.8.7",
       "scope": "required",
       "description": "the BLAKE3 hash function",
       "licenses": [
@@ -989,7 +989,7 @@
           "expression": "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
         }
       ],
-      "purl": "pkg:cargo/blake3@1.8.5",
+      "purl": "pkg:cargo/blake3@1.8.7",
       "externalReferences": [
         {
           "type": "distribution",
@@ -1627,7 +1627,7 @@
     {
       "type": "library",
       "name": "clap",
-      "version": "4.6.1",
+      "version": "4.6.6",
       "scope": "required",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
@@ -1635,7 +1635,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/clap@4.6.1",
+      "purl": "pkg:cargo/clap@4.6.6",
       "externalReferences": [
         {
           "type": "distribution",
@@ -1646,7 +1646,7 @@
     {
       "type": "library",
       "name": "clap_builder",
-      "version": "4.6.0",
+      "version": "4.6.6",
       "scope": "required",
       "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
       "licenses": [
@@ -1654,7 +1654,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/clap_builder@4.6.0",
+      "purl": "pkg:cargo/clap_builder@4.6.6",
       "externalReferences": [
         {
           "type": "distribution",
@@ -1665,7 +1665,7 @@
     {
       "type": "library",
       "name": "clap_derive",
-      "version": "4.6.1",
+      "version": "4.6.4",
       "scope": "required",
       "description": "Parse command line argument by defining a struct, derive crate.",
       "licenses": [
@@ -1673,7 +1673,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/clap_derive@4.6.1",
+      "purl": "pkg:cargo/clap_derive@4.6.4",
       "externalReferences": [
         {
           "type": "distribution",
@@ -7038,7 +7038,7 @@
     {
       "type": "library",
       "name": "mail-parser",
-      "version": "0.11.5",
+      "version": "0.11.7",
       "scope": "required",
       "description": "Fast and robust e-mail parsing library for Rust",
       "licenses": [
@@ -7046,7 +7046,7 @@
           "expression": "Apache-2.0 OR MIT"
         }
       ],
-      "purl": "pkg:cargo/mail-parser@0.11.5",
+      "purl": "pkg:cargo/mail-parser@0.11.7",
       "externalReferences": [
         {
           "type": "distribution",
@@ -9432,7 +9432,7 @@
     {
       "type": "library",
       "name": "regex",
-      "version": "1.13.0",
+      "version": "1.13.1",
       "scope": "required",
       "description": "An implementation of regular expressions for Rust. This implementation uses\nfinite automata and guarantees linear time matching on all inputs.",
       "licenses": [
@@ -9440,7 +9440,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/regex@1.13.0",
+      "purl": "pkg:cargo/regex@1.13.1",
       "externalReferences": [
         {
           "type": "distribution",
@@ -9451,7 +9451,7 @@
     {
       "type": "library",
       "name": "regex-automata",
-      "version": "0.4.15",
+      "version": "0.4.18",
       "scope": "required",
       "description": "Automata construction and matching using regular expressions.",
       "licenses": [
@@ -9459,7 +9459,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/regex-automata@0.4.15",
+      "purl": "pkg:cargo/regex-automata@0.4.18",
       "externalReferences": [
         {
           "type": "distribution",
@@ -9669,25 +9669,6 @@
         }
       ],
       "purl": "pkg:cargo/rustls@0.23.42",
-      "externalReferences": [
-        {
-          "type": "distribution",
-          "url": "https://crates.io/"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "name": "rustls-pemfile",
-      "version": "2.2.0",
-      "scope": "required",
-      "description": "Basic .pem file parser for keys and certificates",
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR ISC OR MIT"
-        }
-      ],
-      "purl": "pkg:cargo/rustls-pemfile@2.2.0",
       "externalReferences": [
         {
           "type": "distribution",
@@ -9926,7 +9907,7 @@
     {
       "type": "library",
       "name": "semver",
-      "version": "1.0.27",
+      "version": "1.0.28",
       "scope": "required",
       "description": "Parser and evaluator for Cargo's flavor of Semantic Versioning",
       "licenses": [
@@ -9934,7 +9915,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/semver@1.0.27",
+      "purl": "pkg:cargo/semver@1.0.28",
       "externalReferences": [
         {
           "type": "distribution",
@@ -10761,6 +10742,25 @@
     },
     {
       "type": "library",
+      "name": "syn",
+      "version": "3.0.4",
+      "scope": "required",
+      "description": "Parser for Rust source code",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/syn@3.0.4",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://crates.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "sync_wrapper",
       "version": "1.0.2",
       "scope": "required",
@@ -11351,7 +11351,7 @@
     {
       "type": "library",
       "name": "thiserror",
-      "version": "2.0.18",
+      "version": "2.0.20",
       "scope": "required",
       "description": "derive(Error)",
       "licenses": [
@@ -11359,7 +11359,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/thiserror@2.0.18",
+      "purl": "pkg:cargo/thiserror@2.0.20",
       "externalReferences": [
         {
           "type": "distribution",
@@ -11389,7 +11389,7 @@
     {
       "type": "library",
       "name": "thiserror-impl",
-      "version": "2.0.18",
+      "version": "2.0.20",
       "scope": "required",
       "description": "Implementation detail of the `thiserror` crate",
       "licenses": [
@@ -11397,7 +11397,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/thiserror-impl@2.0.18",
+      "purl": "pkg:cargo/thiserror-impl@2.0.20",
       "externalReferences": [
         {
           "type": "distribution",
@@ -11560,7 +11560,7 @@
     {
       "type": "library",
       "name": "tokio",
-      "version": "1.52.3",
+      "version": "1.53.1",
       "scope": "required",
       "description": "An event-driven, non-blocking I/O platform for writing asynchronous I/O\nbacked applications.",
       "licenses": [
@@ -11568,7 +11568,7 @@
           "expression": "MIT"
         }
       ],
-      "purl": "pkg:cargo/tokio@1.52.3",
+      "purl": "pkg:cargo/tokio@1.53.1",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12434,7 +12434,7 @@
     {
       "type": "library",
       "name": "ureq",
-      "version": "3.1.2",
+      "version": "3.4.0",
       "scope": "required",
       "description": "Simple, safe HTTP client",
       "licenses": [
@@ -12442,7 +12442,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/ureq@3.1.2",
+      "purl": "pkg:cargo/ureq@3.4.0",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12453,7 +12453,7 @@
     {
       "type": "library",
       "name": "ureq-proto",
-      "version": "0.5.3",
+      "version": "0.6.1",
       "scope": "required",
       "description": "ureq support crate",
       "licenses": [
@@ -12461,7 +12461,7 @@
           "expression": "MIT OR Apache-2.0"
         }
       ],
-      "purl": "pkg:cargo/ureq-proto@0.5.3",
+      "purl": "pkg:cargo/ureq-proto@0.6.1",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12509,25 +12509,6 @@
     },
     {
       "type": "library",
-      "name": "utf-8",
-      "version": "0.7.6",
-      "scope": "required",
-      "description": "Incremental, zero-copy UTF-8 decoding with error handling",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/utf-8@0.7.6",
-      "externalReferences": [
-        {
-          "type": "distribution",
-          "url": "https://crates.io/"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "name": "utf8-ranges",
       "version": "1.0.5",
       "scope": "required",
@@ -12538,6 +12519,25 @@
         }
       ],
       "purl": "pkg:cargo/utf8-ranges@1.0.5",
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "https://crates.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "utf8-zero",
+      "version": "0.8.1",
+      "scope": "required",
+      "description": "Zero-copy, incremental UTF-8 decoding with error handling",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/utf8-zero@0.8.1",
       "externalReferences": [
         {
           "type": "distribution",
@@ -12586,7 +12586,7 @@
     {
       "type": "library",
       "name": "uuid",
-      "version": "1.24.0",
+      "version": "1.25.0",
       "scope": "required",
       "description": "A library to generate and parse UUIDs.",
       "licenses": [
@@ -12594,7 +12594,7 @@
           "expression": "Apache-2.0 OR MIT"
         }
       ],
-      "purl": "pkg:cargo/uuid@1.24.0",
+      "purl": "pkg:cargo/uuid@1.25.0",
       "externalReferences": [
         {
           "type": "distribution",
@@ -14923,7 +14923,7 @@
     {
       "type": "library",
       "name": "zip",
-      "version": "8.4.0",
+      "version": "8.6.0",
       "scope": "required",
       "description": "Library to support the reading and writing of zip files.",
       "licenses": [
@@ -14931,7 +14931,7 @@
           "expression": "MIT"
         }
       ],
-      "purl": "pkg:cargo/zip@8.4.0",
+      "purl": "pkg:cargo/zip@8.6.0",
       "externalReferences": [
         {
           "type": "distribution",
