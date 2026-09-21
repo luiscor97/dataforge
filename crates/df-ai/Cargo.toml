@@ -11,7 +11,7 @@ rust-version.workspace = true
 df-process-safety.workspace = true
 hex.workspace = true
 jsonschema = { version = "=0.33.0", default-features = false }
-regex = { version = "=1.13.0", default-features = false, features = ["perf", "std", "unicode-perl"] }
+regex = { version = "=1.13.1", default-features = false, features = ["perf", "std", "unicode-perl"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
